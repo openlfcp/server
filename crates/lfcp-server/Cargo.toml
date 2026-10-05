@@ -29,6 +29,9 @@ getrandom = { version = "0.4", default-features = false }
 # which would pull in regex).
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi"] }
+# SQLite for the store (LFCP-045), compiled in ("bundled") so no system
+# library is needed. One connection, owned by one thread.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 # The TOML configuration file.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }

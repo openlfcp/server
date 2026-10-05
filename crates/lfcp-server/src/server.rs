@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use crate::config::Config;
 use crate::http;
 use crate::identity::{ServerId, ServerIdentity};
+use crate::store::Store;
 
 /// How long open connections get to finish after shutdown starts.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -22,22 +23,30 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 pub struct Server {
     listener: TcpListener,
     identity: Arc<dyn ServerIdentity>,
+    store: Arc<Store>,
     config: Config,
 }
 
 impl Server {
-    /// Bind the configured address. The identity is loaded by the caller
-    /// once per process and shared by every connection.
+    /// Bind the configured address. The identity and the store are opened
+    /// by the caller once per process and shared by every connection.
     pub async fn bind(
         config: Config,
         identity: Arc<dyn ServerIdentity>,
+        store: Arc<Store>,
     ) -> std::io::Result<Server> {
         let listener = TcpListener::bind(config.bind).await?;
         Ok(Server {
             listener,
             identity,
+            store,
             config,
         })
+    }
+
+    /// The store.
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 
     /// The bound address (useful with port 0).

@@ -10,6 +10,7 @@ use lfcp_server::config::Config;
 use lfcp_server::http::HEALTH_BODY;
 use lfcp_server::identity::{FileIdentity, ServerIdentity};
 use lfcp_server::server::Server;
+use lfcp_server::store::Store;
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("lfcp-server-it-{name}-{}", std::process::id()));
@@ -47,7 +48,8 @@ async fn started(
         ..Config::default()
     };
     let identity = Arc::new(FileIdentity::load_or_create(&config.state_dir).unwrap());
-    let server = Server::bind(config, identity.clone()).await.unwrap();
+    let store = Arc::new(Store::open(&config.state_dir).unwrap());
+    let server = Server::bind(config, identity.clone(), store).await.unwrap();
     assert_eq!(server.server_id(), identity.server_id());
     let addr = server.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -122,6 +124,7 @@ async fn a_busy_address_fails_to_bind() {
         ..Config::default()
     };
     let identity = Arc::new(FileIdentity::load_or_create(&state).unwrap());
-    assert!(Server::bind(config, identity).await.is_err());
+    let store = Arc::new(Store::open(&state).unwrap());
+    assert!(Server::bind(config, identity, store).await.is_err());
     std::fs::remove_dir_all(&state).unwrap();
 }

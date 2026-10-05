@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lfcp_server::config::Config;
 use lfcp_server::identity::FileIdentity;
 use lfcp_server::server::Server;
+use lfcp_server::store::Store;
 
 fn main() -> ExitCode {
     let config = match Config::from_args(std::env::args().skip(1)) {
@@ -26,6 +27,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let store = match Store::open(&config.state_dir) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::error!(%error, "cannot open the store");
+            return ExitCode::FAILURE;
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -37,7 +45,7 @@ fn main() -> ExitCode {
         }
     };
     runtime.block_on(async {
-        let server = match Server::bind(config, Arc::new(identity)).await {
+        let server = match Server::bind(config, Arc::new(identity), store).await {
             Ok(server) => server,
             Err(error) => {
                 tracing::error!(%error, "cannot bind");

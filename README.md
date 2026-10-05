@@ -13,10 +13,46 @@ dependency tree.
 
 ## Status
 
-Bootstrap (LFCP-044): configuration, the stable server ID, the health
-endpoint and graceful shutdown. Next: the SQLite store (LFCP-045), setup and
-admin HTTP (LFCP-046), the WebSocket transport (LFCP-047) and the LFCP
-session (LFCP-048).
+- Bootstrap (LFCP-044): configuration, the stable server ID, the health
+  endpoint and graceful shutdown.
+- Store (LFCP-045): SQLite persistence of exact LFCP objects.
+
+Next: setup and admin HTTP (LFCP-046), the WebSocket transport (LFCP-047)
+and the LFCP session (LFCP-048).
+
+## Store
+
+`<state_dir>/server.sqlite3`, one connection owned by one thread behind an
+async facade (`store::Store`): operations are serialized and every write is
+acknowledged after its transaction commits.
+
+- Durability: WAL journal with `synchronous = FULL`, so a committed write
+  survives a crash or power loss (on storage that honors fsync). That backs
+  durability level 2, durable local persistence (WIRE-01 §37, §40); the
+  server does not replicate, so it never claims level 3.
+- Exact bytes are authoritative: every Genesis, Control Record, Data Unit,
+  Key Package and Snapshot is stored as received. Index columns (Resource,
+  sequence, actor, epoch, recipient, Control Head, object IDs) are derived
+  from those bytes by the sdk-rs parsers at insert time, never taken from a
+  client separately.
+- Evidence is kept: competing Control Records share a sequence, units with
+  the same (Resource, actor, sequence) and different IDs are all stored
+  (equivocation), and several Key Packages may exist for one (Resource,
+  epoch, recipient). Only object IDs are unique.
+- `commit_control_record` stores a record and moves the Control Head in
+  one transaction, only if the head is the expected one and the record
+  continues it (the compare-and-set that LFCP-049 builds on).
+- Opaque: no table or column holds application data; Data Units and
+  Snapshots are stored as ciphertext. Tests check both.
+- Hosting metadata (who hosted a Resource here, the promised durability)
+  is infrastructure only. Resource authority always comes from the stored
+  Control Chain.
+- Migrations: `schema_version` and an append-only list
+  (`store/schema.rs`), applied in order when the database opens.
+
+The server ID stays in its own file rather than in the database: it keeps
+its create-new and fsync semantics, it is readable by an operator, and
+recreating or restoring the database cannot change the server's identity.
 
 ## Running
 
@@ -54,10 +90,10 @@ proxy in front (LFCP-055).
 | `getrandom` | The server ID; later nonces and session IDs |
 | `tracing`, `tracing-subscriber` | Logs (level from the configuration) |
 | `serde`, `toml` | The configuration file |
+| `rusqlite` (bundled SQLite) | The store |
 
-Coming with their tasks: `tokio-tungstenite` (LFCP-047) and `rusqlite`
-with bundled SQLite (LFCP-045). No web framework, no clap. The normal
-dependency tree has 74 unique crates.
+Coming with its task: `tokio-tungstenite` (LFCP-047). No web framework, no
+ORM, no clap.
 
 ## sdk-rs and the spec
 
