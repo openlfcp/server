@@ -56,6 +56,10 @@ mod tests {
             StatusCode::METHOD_NOT_ALLOWED
         );
         assert_eq!(route(&Method::GET, "/").status(), StatusCode::NOT_FOUND);
-        assert_eq!(route(&Method::GET, "/lfcp").status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            route(&Method::GET, "/v1/ws").status(),
+            StatusCode::NOT_FOUND,
+            "WebSocket is routed before"
+        );
     }
 }

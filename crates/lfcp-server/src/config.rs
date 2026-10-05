@@ -3,9 +3,10 @@
 //!
 //! ```toml
 //! bind = "127.0.0.1:7820"          # HTTP and (from LFCP-047) WebSocket listener
-//! ws_path = "/lfcp"                # WebSocket path (LFCP-047)
+//! ws_path = "/v1/ws"              # WebSocket path (WIRE-01 §30)
 //! state_dir = "state"              # server ID, later the database
 //! max_message_bytes = 8388608      # advertised in READY (WIRE-01 §31, §37)
+//! heartbeat_ms = 30000             # READY heartbeat (§37); 0 disables the idle timeout
 //! log_level = "info"               # error | warn | info | debug | trace
 //! ```
 //!
@@ -31,12 +32,16 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub struct Config {
     /// The listener address.
     pub bind: SocketAddr,
-    /// The WebSocket path, used from LFCP-047.
+    /// The WebSocket path (WIRE-01 §30 reference path `/v1/ws`).
     pub ws_path: String,
     /// The directory for the server's local state.
     pub state_dir: PathBuf,
     /// The maximum LFCP message size the server enforces and advertises.
     pub max_message_bytes: usize,
+    /// The heartbeat interval advertised in READY (§37), in milliseconds; a
+    /// WebSocket connection silent for three intervals is closed. 0
+    /// disables both.
+    pub heartbeat_ms: u64,
     /// The log level.
     pub log_level: tracing::Level,
 }
@@ -45,9 +50,10 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 7820)),
-            ws_path: "/lfcp".into(),
+            ws_path: "/v1/ws".into(),
             state_dir: PathBuf::from("state"),
             max_message_bytes: lfcp::wire::message::DEFAULT_MAX_MESSAGE_BYTES,
+            heartbeat_ms: 30_000,
             log_level: tracing::Level::INFO,
         }
     }
@@ -96,6 +102,7 @@ struct File {
     ws_path: Option<String>,
     state_dir: Option<PathBuf>,
     max_message_bytes: Option<u64>,
+    heartbeat_ms: Option<u64>,
     log_level: Option<String>,
 }
 
@@ -116,6 +123,9 @@ impl Config {
         }
         if let Some(bytes) = file.max_message_bytes {
             config.max_message_bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+        }
+        if let Some(ms) = file.heartbeat_ms {
+            config.heartbeat_ms = ms;
         }
         if let Some(level) = file.log_level {
             config.log_level = parse_level(&level)?;
@@ -181,6 +191,9 @@ impl Config {
         if self.state_dir.as_os_str().is_empty() {
             return invalid("state_dir", "must not be empty");
         }
+        if self.heartbeat_ms > 0 && !(1_000..=3_600_000).contains(&self.heartbeat_ms) {
+            return invalid("heartbeat_ms", "must be 0 or between 1000 and 3600000");
+        }
         if !(MIN_MESSAGE_BYTES..=MAX_MESSAGE_BYTES).contains(&self.max_message_bytes) {
             return invalid("max_message_bytes", "must be between 65536 and 67108864");
         }
@@ -225,13 +238,14 @@ mod tests {
     #[test]
     fn parses_every_field() {
         let config = Config::from_toml(
-            "bind = \"0.0.0.0:9000\"\nws_path = \"/ws\"\nstate_dir = \"/var/lib/lfcp\"\nmax_message_bytes = 1048576\nlog_level = \"debug\"\n",
+            "bind = \"0.0.0.0:9000\"\nws_path = \"/ws\"\nstate_dir = \"/var/lib/lfcp\"\nmax_message_bytes = 1048576\nheartbeat_ms = 0\nlog_level = \"debug\"\n",
         )
         .unwrap();
         assert_eq!(config.bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(config.ws_path, "/ws");
         assert_eq!(config.state_dir, PathBuf::from("/var/lib/lfcp"));
         assert_eq!(config.max_message_bytes, 1 << 20);
+        assert_eq!(config.heartbeat_ms, 0);
         assert_eq!(config.log_level, tracing::Level::DEBUG);
     }
 
@@ -248,6 +262,7 @@ mod tests {
         assert_eq!(field("max_message_bytes = 0"), "max_message_bytes");
         assert_eq!(field("max_message_bytes = 1073741824"), "max_message_bytes");
         assert_eq!(field("log_level = \"loud\""), "log_level");
+        assert_eq!(field("heartbeat_ms = 10"), "heartbeat_ms");
         assert!(matches!(
             Config::from_toml("bind = 7"),
             Err(ConfigError::Syntax(_))

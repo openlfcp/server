@@ -20,9 +20,14 @@ tokio = { version = "1.53", default-features = false, features = ["rt-multi-thre
 # HTTP/1.1 server for the health endpoint (and the WebSocket upgrade in
 # LFCP-047). No TLS: it is terminated by a reverse proxy in front.
 hyper = { version = "1.11", default-features = false, features = ["server", "http1"] }
-# hyper's tokio I/O adapter and graceful connection shutdown.
-hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server", "http1", "server-graceful"] }
+# hyper's tokio I/O adapter.
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 http-body-util = { version = "0.1", default-features = false }
+# WebSocket framing over hyper's upgraded connection (WIRE-01 §30, §31).
+# "handshake" only for the Sec-WebSocket-Accept derivation; no TLS, no
+# client connector.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # OS randomness for the server ID, nonces and session IDs (WIRE-01 §35).
 getrandom = { version = "0.4", default-features = false }
 # Structured logs; the level comes from the configuration (no env-filter,

@@ -53,7 +53,7 @@ async fn started(
     assert_eq!(server.server_id(), identity.server_id());
     let addr = server.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(server.run(async {
+    let task = tokio::spawn(server.run(lfcp_server::ws::PingOnly, async {
         let _ = stopped.await;
     }));
     (addr, identity, stop, task)
