@@ -324,7 +324,9 @@ Pairing binds an LFCP Principal to the administrator role, proven with the
 Principal's own key; there are no passwords.
 
 1. `POST /admin/challenge` answers `{"challenge": <32 bytes hex>}`. A
-   challenge can be used once, within 5 minutes.
+   challenge can be used once, within 5 minutes. At most 1024 are
+   outstanding; past that the endpoint answers 429 until some are used or
+   expire.
 2. `POST /setup/pair` with `{"code", "principal", "challenge", "proof"}`:
    - `principal` is the encoded Principal Descriptor, in hex;
    - `proof` is a COSE_Sign1 by that Principal (hex) over the

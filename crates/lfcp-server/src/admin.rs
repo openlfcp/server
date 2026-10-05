@@ -66,6 +66,9 @@ pub use crate::store::SETUP_ATTEMPTS;
 pub const SETUP_TTL: Duration = Duration::from_secs(60 * 60);
 /// How long a challenge may be answered.
 pub const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
+/// The most challenges outstanding at once; past it `POST /admin/challenge`
+/// gets 429 until some are used or expire (security review M3).
+pub const MAX_CHALLENGES: usize = 1024;
 /// How long an admin session lasts.
 pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 /// The largest request body the API reads.
@@ -169,6 +172,31 @@ struct Session {
     expires: Instant,
 }
 
+/// The outstanding challenges: single use, each valid for
+/// [`CHALLENGE_TTL`], at most [`MAX_CHALLENGES`].
+#[derive(Default)]
+struct Challenges(HashMap<[u8; 32], Instant>);
+
+impl Challenges {
+    /// Record `challenge` as issued at `now`, after dropping expired ones;
+    /// `false` when [`MAX_CHALLENGES`] are still outstanding.
+    fn issue(&mut self, challenge: [u8; 32], now: Instant) -> bool {
+        self.0.retain(|_, expires| *expires > now);
+        if self.0.len() >= MAX_CHALLENGES {
+            return false;
+        }
+        self.0.insert(challenge, now + CHALLENGE_TTL);
+        true
+    }
+
+    /// Consume `challenge`: whether it was issued and is unexpired.
+    fn take(&mut self, challenge: &[u8; 32], now: Instant) -> bool {
+        self.0
+            .remove(challenge)
+            .is_some_and(|expires| expires > now)
+    }
+}
+
 /// The setup/admin HTTP surface.
 pub struct Admin {
     store: Arc<Store>,
@@ -176,7 +204,7 @@ pub struct Admin {
     random: Arc<dyn Random>,
     hosting: Arc<ManagedHosting>,
     status: StatusInfo,
-    challenges: Mutex<HashMap<[u8; 32], Instant>>,
+    challenges: Mutex<Challenges>,
     sessions: Mutex<HashMap<[u8; 32], Session>>,
 }
 
@@ -251,7 +279,7 @@ impl Admin {
                 heartbeat_ms: config.heartbeat_ms,
                 public_urls: config.public_urls.clone(),
             },
-            challenges: Mutex::new(HashMap::new()),
+            challenges: Mutex::default(),
             sessions: Mutex::new(HashMap::new()),
         };
         Ok((Arc::new(admin), code))
@@ -316,10 +344,17 @@ impl Admin {
                 self.random
                     .fill(&mut challenge)
                     .map_err(|_| internal_msg())?;
-                let mut challenges = self.challenges.lock().expect("never poisoned");
-                let now = Instant::now();
-                challenges.retain(|_, expires| *expires > now);
-                challenges.insert(challenge, now + CHALLENGE_TTL);
+                let issued = self
+                    .challenges
+                    .lock()
+                    .expect("never poisoned")
+                    .issue(challenge, Instant::now());
+                if !issued {
+                    return Err(Failure(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "too many outstanding challenges; retry later",
+                    ));
+                }
                 Ok(ok(json!({
                     "challenge": to_hex(&challenge),
                     "expires_in_s": CHALLENGE_TTL.as_secs(),
@@ -365,8 +400,7 @@ impl Admin {
             .challenges
             .lock()
             .expect("never poisoned")
-            .remove(&challenge)
-            .is_some_and(|expires| expires > Instant::now());
+            .take(&challenge, Instant::now());
         let refused = Failure(StatusCode::UNAUTHORIZED, "proof refused");
         if !issued {
             return Err(refused);
@@ -633,6 +667,30 @@ mod tests {
             format!("{:?}", SetupCode("X7KM-P9LA".into())),
             "SetupCode(<redacted>)"
         );
+    }
+
+    #[test]
+    fn challenges_are_single_use_bounded_and_expire() {
+        let mut challenges = Challenges::default();
+        let now = Instant::now();
+        let id = |i: usize| {
+            let mut c = [0u8; 32];
+            c[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            c
+        };
+        for i in 0..MAX_CHALLENGES {
+            assert!(challenges.issue(id(i), now));
+        }
+        assert!(!challenges.issue(id(MAX_CHALLENGES), now), "the cap");
+        // Using one frees its place; it cannot be used twice.
+        assert!(challenges.take(&id(0), now));
+        assert!(!challenges.take(&id(0), now));
+        assert!(challenges.issue(id(MAX_CHALLENGES), now));
+        // Expired challenges are refused and no longer count.
+        let later = now + CHALLENGE_TTL;
+        assert!(!challenges.take(&id(1), later));
+        assert!(challenges.issue(id(0), later));
+        assert_eq!(challenges.0.len(), 1);
     }
 
     #[test]
