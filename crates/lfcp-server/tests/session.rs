@@ -7,16 +7,14 @@ mod support;
 use std::sync::Arc;
 
 use lfcp::base::{ControlRecordId, ResourceId};
-use lfcp::principal::PrincipalKeys;
 use lfcp::wire::control::body::ControlBody;
 use lfcp::wire::control::ReceivedControlRecord;
 use lfcp::wire::message::{Body, ControlHead, HelloBody, HostingCredential, Message};
 use lfcp::wire::session::WIRE_PROFILE;
 use lfcp::wire::snapshot::ReceivedSnapshot;
 use lfcp_server::store::{CasOutcome, Put};
-use serde_json::Value as Json;
 use support::lfcp::{code, start, state_dir, Client, FixedIdentity, Options, Script};
-use support::spec::Spec;
+use support::vectors::Vectors;
 
 const PROTOCOL_UNSUPPORTED: u64 = 1;
 const MALFORMED_MESSAGE: u64 = 2;
@@ -27,74 +25,6 @@ const INVALID_SIGNATURE: u64 = 7;
 const INVALID_CONTROL_CHAIN: u64 = 8;
 const CONTROL_CONFLICT: u64 = 9;
 const HOSTING_DENIED: u64 = 20;
-
-struct Vectors(Json);
-
-impl Vectors {
-    fn load() -> Vectors {
-        Vectors(Spec::open().read_json("test-vectors/lfcp-wire-01/LFCP-TEST-VECTORS-01.json"))
-    }
-    fn case(&self, id: &str) -> &Json {
-        self.0["cases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["id"] == id)
-            .unwrap_or_else(|| panic!("{id}"))
-    }
-    fn hex(&self, id: &str, part: &str, field: &str) -> Vec<u8> {
-        lfcp::base::from_hex(
-            self.case(id)[part][field]["hex"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{id}.{field}")),
-        )
-        .unwrap()
-    }
-    /// A published wire message's exact bytes.
-    fn message(&self, id: &str) -> Vec<u8> {
-        self.hex(id, "expected", "message_cbor")
-    }
-    /// A published Control Record, Data Unit or Snapshot.
-    fn cose(&self, id: &str) -> Vec<u8> {
-        self.hex(id, "expected", "cose_sign1")
-    }
-    /// A published negative object.
-    fn negative(&self, id: &str) -> Vec<u8> {
-        self.hex(id, "inputs", "cose_sign1")
-    }
-    fn session(&self, field: &str) -> Vec<u8> {
-        lfcp::base::from_hex(
-            self.0["fixtures"]["session"][field]["hex"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap()
-    }
-    fn principal(&self, name: &str) -> PrincipalKeys {
-        let inputs = &self.case(&format!("principal_{name}"))["inputs"];
-        let h = |f: &str| -> [u8; 32] {
-            lfcp::base::from_hex(inputs[f]["hex"].as_str().unwrap())
-                .unwrap()
-                .try_into()
-                .unwrap()
-        };
-        PrincipalKeys::from_secrets(&h("ed25519_seed"), h("x25519_private"))
-    }
-    fn resource(&self) -> ResourceId {
-        ResourceId::from_slice(
-            &lfcp::base::from_hex(
-                self.0["fixtures"]["resource"]["id"]["hex"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-    }
-    fn record_id(&self, id: &str) -> ControlRecordId {
-        ControlRecordId::from_slice(&self.hex(id, "expected", "record_id")).unwrap()
-    }
-}
 
 fn id16(bytes: &[u8]) -> [u8; 16] {
     bytes.try_into().unwrap()
