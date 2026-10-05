@@ -41,6 +41,11 @@ not claim full LFCP-WIRE-01 conformance.
 async facade (`store::Store`): operations are serialized and every write is
 acknowledged after its transaction commits.
 
+- Permissions: a state directory the server creates is mode 0700. The
+  database and its `-wal` and `-shm` files are mode 0600, tightened at
+  every start if an older server left them looser. An existing state
+  directory keeps its mode.
+
 - Durability: WAL journal with `synchronous = FULL`, so a committed write
   survives a crash or power loss (on storage that honors fsync). `tests/process_restart.rs` checks this on the real binary: it kills the
   process with SIGKILL right after the last ACK (and, separately, stops it

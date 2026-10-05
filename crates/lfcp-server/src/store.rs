@@ -197,8 +197,19 @@ impl Store {
     /// Open (or create) `<state_dir>/server.sqlite3`, configure it and run
     /// the migrations, on a new connection thread.
     pub fn open(state_dir: &Path) -> Result<Store, StoreError> {
-        std::fs::create_dir_all(state_dir).map_err(|e| StoreError::Sqlite(e.to_string()))?;
         let path = state_dir.join(DATABASE_FILE);
+        // Owner-only (security review L5): SQLite gives the -wal and -shm
+        // files the database file's mode, so the database is created at
+        // 0600 before SQLite opens it; files of an older server are
+        // tightened.
+        let io = |e: std::io::Error| StoreError::Sqlite(e.to_string());
+        crate::private::create_dir(state_dir).map_err(io)?;
+        crate::private::create_file(&path).map_err(io)?;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            crate::private::restrict(Path::new(&file)).map_err(io)?;
+        }
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), StoreError>>();
         let (jobs, inbox) = mpsc::channel::<Job>();
         let db = path.clone();

@@ -105,7 +105,7 @@ impl FileIdentity {
             let path = path.to_path_buf();
             move |error| IdentityError::Io { path, error }
         };
-        std::fs::create_dir_all(state_dir).map_err(io(state_dir))?;
+        crate::private::create_dir(state_dir).map_err(io(state_dir))?;
         let path = state_dir.join(SERVER_ID_FILE);
         match create(&path) {
             Ok(id) => {

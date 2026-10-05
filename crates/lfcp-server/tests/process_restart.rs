@@ -343,3 +343,49 @@ async fn the_setup_code_is_written_to_a_private_file_and_never_logged() {
     std::fs::remove_file(&log).unwrap();
     cleanup(&dir);
 }
+
+/// Security review L5: the state directories the server creates are 0700,
+/// and its files (server ID, setup code, database with its WAL and shared
+/// memory) are 0600. A restart tightens database files an older server
+/// left at the umask default, and keeps an existing directory's mode.
+#[test]
+fn state_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let set = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let root = fresh("owner-only");
+    std::fs::create_dir_all(&root).unwrap();
+    set(&root, 0o755);
+    let state = root.join("state");
+    let database = state.join(DATABASE_FILE);
+    let files = [
+        state.join("server-id"),
+        state.join(lfcp_server::admin::SETUP_CODE_FILE),
+        database.clone(),
+        state.join(format!("{DATABASE_FILE}-wal")),
+        state.join(format!("{DATABASE_FILE}-shm")),
+    ];
+
+    let process = spawn(&state);
+    assert_eq!(mode(&state), 0o700);
+    assert_eq!(mode(&root), 0o755, "an existing directory keeps its mode");
+    for file in &files {
+        assert_eq!(mode(file), 0o600, "{}", file.display());
+    }
+    // SIGKILL leaves the WAL and shared-memory files in place.
+    process.kill();
+
+    for file in &files[2..] {
+        set(file, 0o644);
+    }
+    set(&state, 0o755);
+    let process = spawn(&state);
+    for file in &files {
+        assert_eq!(mode(file), 0o600, "{}", file.display());
+    }
+    assert_eq!(mode(&state), 0o755, "an existing directory keeps its mode");
+    process.terminate();
+    cleanup(&root);
+}

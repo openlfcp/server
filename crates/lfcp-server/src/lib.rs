@@ -8,6 +8,7 @@
 //! | [`config`] | TOML configuration and flags, typed validation | LFCP-044 |
 //! | [`identity`] | the stable server ID (WIRE-01 §35, §37) | LFCP-044 |
 //! | [`rng`] | operating-system randomness | LFCP-044 |
+//! | [`private`] | owner-only state directory and database files | security review L5 |
 //! | [`http`] | the health endpoint | LFCP-044 |
 //! | [`server`] | listener, connections, graceful shutdown | LFCP-044 |
 //! | [`store`] | the SQLite store of exact LFCP objects | LFCP-045 |
@@ -30,6 +31,7 @@ pub mod coordinator;
 pub mod http;
 pub mod identity;
 pub mod ingest;
+pub mod private;
 pub mod rng;
 pub mod server;
 pub mod session;
