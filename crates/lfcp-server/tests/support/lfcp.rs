@@ -78,6 +78,7 @@ pub struct Options {
     pub setup_ttl: Option<Duration>,
     /// Overrides of the configuration defaults.
     pub handshake_timeout_ms: Option<u64>,
+    pub max_connections: Option<usize>,
 }
 
 impl Default for Options {
@@ -91,6 +92,7 @@ impl Default for Options {
             max_message_bytes: None,
             setup_ttl: None,
             handshake_timeout_ms: None,
+            max_connections: None,
         }
     }
 }
@@ -135,6 +137,9 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         handshake_timeout_ms: options
             .handshake_timeout_ms
             .unwrap_or(Config::default().handshake_timeout_ms),
+        max_connections: options
+            .max_connections
+            .unwrap_or(Config::default().max_connections),
         ..Config::default()
     };
     let identity: Arc<dyn ServerIdentity> = match options.identity {

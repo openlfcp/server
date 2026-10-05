@@ -1,6 +1,6 @@
 //! Limits on unauthenticated peers (security review M2, M5): the HTTP
-//! header-read timeout, the handshake deadline, and the pre-READY message
-//! count and size caps.
+//! header-read timeout, the handshake deadline, the pre-READY message
+//! count and size caps, and the connection cap.
 
 mod support;
 
@@ -119,6 +119,66 @@ async fn incomplete_request_headers_time_out() {
     assert!(read.is_ok(), "the server closed the connection");
     let after = started.elapsed();
     assert!(after >= Duration::from_millis(900), "{after:?}");
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A plain HTTP GET on a new connection; the whole answer.
+async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer))
+        .await
+        .expect("answered in time")
+        .unwrap();
+    String::from_utf8(answer).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_past_the_cap_get_503_until_one_closes() {
+    let dir = state_dir("hardening-connections");
+    let server = start(
+        &dir,
+        Options {
+            max_connections: Some(2),
+            ..Options::default()
+        },
+    )
+    .await;
+    // Two WebSocket connections hold both places, after the upgrade too.
+    let mut first = Client::connect(server.addr).await;
+    first.handshake(&keys()).await;
+    let mut second = Client::connect(server.addr).await;
+    second.handshake(&keys()).await;
+    let refused = http_get(server.addr, "/health").await;
+    assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+    assert!(refused.contains("retry-after: 5"), "{refused}");
+
+    // The open sessions are unaffected.
+    second.request(Body::Ping([1; 8])).await;
+    assert!(matches!(second.recv().await.body, Body::Pong(_)));
+
+    // Closing one frees its place.
+    drop(first);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let answer = http_get(server.addr, "/health").await;
+        if answer.starts_with("HTTP/1.1 200 ") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the place was not freed: {answer}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();

@@ -6,6 +6,12 @@
 //! frame (1001) and drains its queue. Every connection task holds a clone of
 //! an `mpsc` sender, so the server knows when the last one has ended, and
 //! waits for that at most [`SHUTDOWN_GRACE`].
+//!
+//! Connection cap (security review M2): each TCP connection holds a permit
+//! of a semaphore of [`Config::max_connections`] for its whole life, a
+//! WebSocket after the upgrade included. A connection accepted past the
+//! cap gets `503 Service Unavailable` with `Retry-After` and is closed,
+//! without its request being read.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -19,8 +25,9 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::Config;
 use crate::http;
@@ -30,6 +37,13 @@ use crate::ws::{self, ConnectionContext, Limits, SessionFactory};
 
 /// How long open connections get to finish after shutdown starts.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// The answer to a connection past [`Config::max_connections`].
+const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 5\r\ncontent-type: text/plain\r\ncontent-length: 19\r\nconnection: close\r\n\r\nserver at capacity\n";
+
+/// How many refused connections may be answering [`BUSY`] at once; past
+/// that they are closed without an answer.
+const BUSY_ANSWERS: usize = 64;
 
 /// A bound, not yet running server.
 pub struct Server {
@@ -47,6 +61,8 @@ struct Shared<F> {
     server_id: ServerId,
     sessions: F,
     next_id: AtomicU64,
+    connections: Arc<Semaphore>,
+    busy_answers: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
     alive: mpsc::Sender<()>,
 }
@@ -107,6 +123,8 @@ impl Server {
             server_id: self.identity.server_id(),
             sessions,
             next_id: AtomicU64::new(1),
+            connections: Arc::new(Semaphore::new(self.config.max_connections)),
+            busy_answers: Arc::new(Semaphore::new(BUSY_ANSWERS)),
             shutdown: stopping,
             alive,
         });
@@ -114,9 +132,17 @@ impl Server {
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => match accepted {
-                    Ok((stream, peer)) => {
-                        tokio::spawn(serve_http(stream, peer, shared.clone()));
-                    }
+                    Ok((stream, peer)) => match shared.connections.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            tokio::spawn(serve_http(stream, peer, shared.clone(), Arc::new(permit)));
+                        }
+                        Err(_) => {
+                            tracing::warn!(%peer, "connection limit reached; refusing");
+                            if let Ok(answering) = shared.busy_answers.clone().try_acquire_owned() {
+                                tokio::spawn(refuse(stream, answering));
+                            }
+                        }
+                    },
                     Err(error) => tracing::warn!(%error, "accept failed"),
                 },
                 () = &mut shutdown => break,
@@ -135,16 +161,32 @@ impl Server {
     }
 }
 
-/// One TCP connection: HTTP/1.1, possibly upgraded to WebSocket.
+/// Answer a connection past the cap with [`BUSY`], then close it. The
+/// request is drained briefly, not parsed, so the close does not reset the
+/// connection before the client reads the answer.
+async fn refuse(mut stream: tokio::net::TcpStream, _answering: OwnedSemaphorePermit) {
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        stream.write_all(BUSY).await?;
+        stream.shutdown().await?;
+        let mut sink = [0u8; 1024];
+        while stream.read(&mut sink).await? > 0 {}
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+}
+
+/// One TCP connection: HTTP/1.1, possibly upgraded to WebSocket. `permit`
+/// is its place under the connection cap, held until it closes.
 async fn serve_http<F: SessionFactory>(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     shared: Arc<Shared<F>>,
+    permit: Arc<OwnedSemaphorePermit>,
 ) {
     let _alive = shared.alive.clone();
     let mut shutdown = shared.shutdown.clone();
     let handler = shared.clone();
-    let service = service_fn(move |request| route(request, peer, handler.clone()));
+    let service = service_fn(move |request| route(request, peer, handler.clone(), permit.clone()));
     // A client must send its request headers within the handshake
     // timeout (security review M2).
     let connection = hyper::server::conn::http1::Builder::new()
@@ -175,6 +217,7 @@ async fn route<F: SessionFactory>(
     request: Request<Incoming>,
     peer: SocketAddr,
     shared: Arc<Shared<F>>,
+    permit: Arc<OwnedSemaphorePermit>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.uri().path() != shared.config.ws_path {
         if let Some(admin) = shared
@@ -202,6 +245,7 @@ async fn route<F: SessionFactory>(
     let shutdown = shared.shutdown.clone();
     tokio::spawn(async move {
         let _alive = alive;
+        let _permit = permit;
         ws::serve(request, connection, session, shutdown).await;
     });
     Ok(response)
