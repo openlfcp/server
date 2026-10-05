@@ -221,11 +221,12 @@ fn the_health_check_mode_reports_the_server_state() {
     cleanup(&dir);
 }
 
-/// LFCP-046: the setup code is printed once, at the first start, and
-/// appears nowhere else in the output, through pairing, an admin session
-/// and a restart.
+/// LFCP-046, security review M6: the setup code goes only to a 0600 file
+/// in the state directory, never to stdout or the log (which `docker logs`
+/// keeps), through pairing, an admin session and a restart. Pairing
+/// removes the file.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_setup_code_is_printed_once_and_never_logged() {
+async fn the_setup_code_is_written_to_a_private_file_and_never_logged() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let v = Vectors::load();
     let dir = fresh("setup-code");
@@ -236,18 +237,31 @@ async fn the_setup_code_is_printed_once_and_never_logged() {
 
     let first = spawn_with_output(&dir, output, "debug");
     let started = Instant::now();
-    let code = loop {
+    let setup_file = dir.join(lfcp_server::admin::SETUP_CODE_FILE);
+    loop {
         let text = std::fs::read_to_string(&log).unwrap();
-        if let Some(rest) = text.split("Admin pairing code:").nth(1) {
-            break rest.split_whitespace().next().unwrap().to_owned();
+        if text.contains("pairing code written to") {
+            break;
         }
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "no code printed"
+            "no pairing code announced"
         );
         std::thread::sleep(Duration::from_millis(20));
-    };
+    }
+    let code = std::fs::read_to_string(&setup_file)
+        .unwrap()
+        .trim_end()
+        .to_owned();
     assert_eq!(code.len(), 9);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&setup_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let announced = std::fs::read_to_string(&log).unwrap();
+    assert!(announced.contains(&format!("pairing code written to {}", setup_file.display())));
 
     async fn http(addr: SocketAddr, method: &str, path: &str, body: String) -> String {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -295,6 +309,7 @@ async fn the_setup_code_is_printed_once_and_never_logged() {
         let reply = http(first.addr, "POST", "/setup/pair", body.to_string()).await;
         assert_eq!(&reply[9..12], expected);
     }
+    assert!(!setup_file.exists(), "pairing removes the code file");
     let c = challenge(http(first.addr, "POST", "/admin/challenge", String::new()).await);
     let reply = http(
         first.addr,
@@ -311,18 +326,18 @@ async fn the_setup_code_is_printed_once_and_never_logged() {
     };
     first.terminate();
 
-    // A paired server prints no code.
+    // A paired server creates no code.
     let second = spawn_with_output(&dir, output, "debug");
     second.terminate();
+    assert!(!setup_file.exists());
 
     let text = std::fs::read_to_string(&log).unwrap();
-    assert_eq!(
-        text.matches(code.as_str()).count(),
-        1,
-        "printed exactly once"
+    assert!(
+        !text.contains(code.as_str()),
+        "the code is never in the output"
     );
     assert!(!text.contains(&code.replace('-', "")));
-    assert_eq!(text.matches("Admin pairing code:").count(), 1);
+    assert_eq!(text.matches("pairing code written to").count(), 1);
     assert!(!text.contains(&token), "the session token is never logged");
     assert!(text.contains("server administrator paired"));
     std::fs::remove_file(&log).unwrap();

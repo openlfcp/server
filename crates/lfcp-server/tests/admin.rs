@@ -103,6 +103,20 @@ async fn pairing_works_once_and_health_stays_minimal() {
     let code = server.setup_code.clone().expect("a first-run code");
     assert_eq!(code.len(), 9);
     assert_eq!(&code[4..5], "-");
+    // The code is in its file only (security review M6); an unpaired
+    // restart replaces it.
+    let setup_file = dir.join(lfcp_server::admin::SETUP_CODE_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&setup_file).unwrap(),
+        format!("{code}\n")
+    );
+    server.stop().await;
+    let server = start(&dir, Options::default()).await;
+    let code = server.setup_code.clone().expect("a new code");
+    assert_eq!(
+        std::fs::read_to_string(&setup_file).unwrap(),
+        format!("{code}\n")
+    );
 
     let (status, body) = http(server.addr, "GET", "/setup", None, None).await;
     assert_eq!((status, &body["paired"]), (200, &json!(false)));
@@ -113,6 +127,7 @@ async fn pairing_works_once_and_health_stays_minimal() {
     let (status, body) = pair(&server, &carol, &code.to_lowercase().replace('-', "")).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["admin"], json!(carol.descriptor().id().to_hex()));
+    assert!(!setup_file.exists(), "pairing removes the code file");
     let (_, body) = http(server.addr, "GET", "/setup", None, None).await;
     assert_eq!(body["paired"], json!(true));
 

@@ -309,17 +309,18 @@ unless the hosting policy allows it. There is no account system and no
 REST access to Resources: they are synchronized over the WebSocket only.
 
 First run (WIRE-01 §92). While no administrator is paired, each start
-creates a one-time pairing code (`XXXX-XXXX`, from the OS random source)
-and prints it to stdout, once:
+creates a one-time pairing code (`XXXX-XXXX`, from the OS random source).
+The code is written to `<state_dir>/setup-code`, mode 0600, replacing the
+previous one. It never goes to stdout, stderr or the log, because
+container runtimes keep those (`docker logs`). The log says only where
+the code is:
 
 ```text
-Admin pairing code:
-
-    X7KM-P9LA
-
-Open /setup and pair an LFCP Principal as server administrator.
+pairing code written to /var/lib/lfcp/setup-code (expires in 60 minutes; pair an LFCP Principal at /setup/pair)
 ```
 
+Read it with `cat <state_dir>/setup-code` as the server's user. The pairing
+removes the file, and so does a start once an administrator is paired.
 The store keeps only its hash. The code expires after an hour (restart
 for a new one), is destroyed after 5 wrong attempts, and is destroyed by
 the pairing. The log never contains the code, proofs or tokens.
@@ -396,8 +397,10 @@ curl --cacert root.crt https://localhost/health
   or to the paths of your own certificate and key mounted into the proxy.
   `LFCP_HTTPS_PORT` and `LFCP_HTTP_PORT` change the published ports.
 - No credentials are baked in or committed. At first start the server
-  prints a one-time admin pairing code: `docker compose -f
-  deploy/compose.yaml logs lfcp-server` shows it, and pairing goes to
+  writes a one-time admin pairing code to `/var/lib/lfcp/setup-code` in
+  the state volume (mode 0600), never to `docker logs`. The image has no
+  shell; read the code with `docker compose -f deploy/compose.yaml cp
+  lfcp-server:/var/lib/lfcp/setup-code - | tar -xO`. Pairing goes to
   `https://<host>/setup/pair` through the proxy (see "Administration").
   Recreating the containers on the same volume keeps the pairing; a new
   volume is a new server with a new code.

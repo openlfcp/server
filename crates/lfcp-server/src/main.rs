@@ -85,12 +85,17 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        // The one place the setup code is shown: stdout, once, never the
-        // log (WIRE-01 §92). Only its hash is stored.
-        if let Some(code) = setup_code {
-            println!(
-                "\nAdmin pairing code:\n\n    {}\n\nOpen /setup and pair an LFCP Principal as server administrator.\nThe code expires in {} minutes; restart the server for a new one.\n",
-                code.expose(),
+        // The setup code goes only to a 0600 file in the state directory,
+        // never to stdout or the log: container runtimes keep both
+        // (`docker logs`; security review M6). Only its hash is stored.
+        if setup_code.is_some() {
+            let path = server
+                .config()
+                .state_dir
+                .join(lfcp_server::admin::SETUP_CODE_FILE);
+            tracing::info!(
+                "pairing code written to {} (expires in {} minutes; pair an LFCP Principal at /setup/pair)",
+                path.display(),
                 lfcp_server::admin::SETUP_TTL.as_secs() / 60
             );
         }

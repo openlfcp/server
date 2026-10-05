@@ -5,7 +5,9 @@
 //!
 //! First run (§92): while no administrator is paired, the server creates a
 //! one-time setup code (8 symbols, `XXXX-XXXX`, from the operating system's
-//! random source), which `main` prints once; the store keeps only its hash.
+//! random source). It is written to [`SETUP_CODE_FILE`] in the state
+//! directory, mode 0600, and never to stdout or the log, which container
+//! runtimes keep (security review M6); the store keeps only its hash.
 //! The operator pairs one LFCP Principal as server administrator by
 //! presenting the code together with a signature of a server challenge by
 //! that Principal's key: no password. Pairing destroys the code. A code
@@ -39,6 +41,8 @@
 //! proofs and tokens are never logged.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -62,6 +66,11 @@ use crate::store::{Pairing, Store, StoreError, DURABILITY};
 
 pub use crate::store::SETUP_ATTEMPTS;
 
+/// The file in the state directory holding the current setup code, mode
+/// 0600. It is removed by the pairing, and at a start when an
+/// administrator is paired.
+pub const SETUP_CODE_FILE: &str = "setup-code";
+
 /// How long a setup code lasts by default.
 pub const SETUP_TTL: Duration = Duration::from_secs(60 * 60);
 /// How long a challenge may be answered.
@@ -78,8 +87,8 @@ const SETUP_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const PROOF_LABEL: &str = "LFCP-ADMIN-v1";
 const HOSTING_SETTING: &str = "hosting_policy";
 
-/// The one-time setup code, for `main` to print once. It redacts itself
-/// in `Debug`.
+/// The one-time setup code, also written to [`SETUP_CODE_FILE`]. It
+/// redacts itself in `Debug`.
 pub struct SetupCode(String);
 
 impl SetupCode {
@@ -200,6 +209,7 @@ impl Challenges {
 /// The setup/admin HTTP surface.
 pub struct Admin {
     store: Arc<Store>,
+    setup_file: PathBuf,
     server_id: ServerId,
     random: Arc<dyn Random>,
     hosting: Arc<ManagedHosting>,
@@ -217,6 +227,8 @@ pub enum AdminError {
     Random(String),
     /// The stored hosting policy does not parse.
     Setting(String),
+    /// The setup code file could not be written or removed.
+    SetupFile(std::io::Error),
 }
 
 impl std::fmt::Display for AdminError {
@@ -225,6 +237,7 @@ impl std::fmt::Display for AdminError {
             AdminError::Store(e) => write!(f, "store: {e}"),
             AdminError::Random(e) => write!(f, "randomness: {e}"),
             AdminError::Setting(e) => write!(f, "stored hosting policy: {e}"),
+            AdminError::SetupFile(e) => write!(f, "setup code file: {e}"),
         }
     }
 }
@@ -240,7 +253,9 @@ impl From<StoreError> for AdminError {
 impl Admin {
     /// Open the admin surface: load the hosting policy, and, while no
     /// administrator is paired, create a new setup code valid for
-    /// `setup_ttl`, returned for the caller to print once.
+    /// `setup_ttl`, written to [`SETUP_CODE_FILE`] in the state directory
+    /// (replacing an older one) and returned. Once paired, a leftover file
+    /// is removed.
     pub async fn open(
         store: Arc<Store>,
         server_id: ServerId,
@@ -254,6 +269,7 @@ impl Admin {
             }
             None => HostingRule::Open,
         };
+        let setup_file = config.state_dir.join(SETUP_CODE_FILE);
         let code = if store.admins().await?.is_empty() {
             let mut bytes = [0u8; 8];
             random.fill(&mut bytes).map_err(AdminError::Random)?;
@@ -264,12 +280,15 @@ impl Admin {
             let code = format!("{}-{}", &symbols[..4], &symbols[4..]);
             let expires = unix_now() + setup_ttl.as_secs().max(1) as i64;
             store.set_setup_code(code_hash(&code), expires).await?;
+            write_setup_file(&setup_file, &code).map_err(AdminError::SetupFile)?;
             Some(SetupCode(code))
         } else {
+            remove_setup_file(&setup_file).map_err(AdminError::SetupFile)?;
             None
         };
         let admin = Admin {
             store,
+            setup_file,
             server_id,
             random,
             hosting: Arc::new(ManagedHosting(RwLock::new(rule))),
@@ -436,6 +455,10 @@ impl Admin {
         match outcome {
             Pairing::Paired => {
                 tracing::info!(admin = %descriptor.id().to_hex(), "server administrator paired");
+                // The code is destroyed; so is its file.
+                if let Err(error) = remove_setup_file(&self.setup_file) {
+                    tracing::warn!(%error, "cannot remove the setup code file");
+                }
                 Ok(ok(json!({ "admin": descriptor.id().to_hex() })))
             }
             Pairing::WrongCode { .. } => Err(Failure(StatusCode::FORBIDDEN, "wrong setup code")),
@@ -618,6 +641,26 @@ enum HostingRequest {
         #[serde(default)]
         credentials: Vec<String>,
     },
+}
+
+/// Write `code` to `path` with mode 0600: any previous file is removed
+/// first, so the new one is created with that mode.
+fn write_setup_file(path: &Path, code: &str) -> std::io::Result<()> {
+    remove_setup_file(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    file.write_all(format!("{code}\n").as_bytes())?;
+    file.sync_all()
+}
+
+fn remove_setup_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Clone, Debug)]

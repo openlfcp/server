@@ -50,6 +50,20 @@ echo "check: health is green"
 [ "$(docker inspect --format '{{.State.Health.Status}}' "$("${compose[@]}" ps -q lfcp-server)")" = healthy ] ||
     fail "container is not healthy"
 
+# Security review M6: the pairing code is in a 0600 file in the state
+# volume, and only its path is in the logs. The code itself is never
+# echoed here.
+echo "check: the pairing code is in its private file, not in the logs"
+code="$("${compose[@]}" cp lfcp-server:/var/lib/lfcp/setup-code - | tar -xO)"
+grep -qxE '[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}' <<<"$code" ||
+    fail "no pairing code in /var/lib/lfcp/setup-code"
+mode="$("${compose[@]}" cp lfcp-server:/var/lib/lfcp/setup-code - | tar -tvf - | awk '{ print $1 }')"
+[ "$mode" = "-rw-------" ] || fail "setup-code has mode $mode, not 0600"
+logs="$("${compose[@]}" logs lfcp-server 2>&1)"
+grep -q 'pairing code written to /var/lib/lfcp/setup-code' <<<"$logs" ||
+    fail "the logs do not say where the pairing code is"
+if grep -qF "$code" <<<"$logs"; then fail "the pairing code is in docker logs"; fi
+
 echo "check: wss through the proxy"
 "${compose[@]}" cp proxy:/data/caddy/pki/authorities/local/root.crt "$work/root.crt"
 curl --fail --silent --show-error --cacert "$work/root.crt" https://localhost:18443/health | grep -q '"ok"' ||
