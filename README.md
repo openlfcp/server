@@ -11,6 +11,14 @@ Automerge: it uses the `lfcp` protocol core without the `shared-objects`
 feature, and `tests/dependency_policy.rs` fails if Automerge appears in its
 dependency tree.
 
+## Scope
+
+The reference server implements the server side of the
+OpenLFCP MVP 0.1 subset of LFCP-WIRE-01 at `mvp-0.1-baseline.6`: one
+coordinator per Resource, one endpoint, no federation, mirror seeding or
+presence. See `.github: docs/release/deferred-wire-01-features.md` (in [openlfcp/.github](https://github.com/openlfcp/.github)). It does
+not claim full LFCP-WIRE-01 conformance.
+
 ## Status
 
 - Bootstrap (LFCP-044): configuration, the stable server ID, the health
