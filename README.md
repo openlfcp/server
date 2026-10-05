@@ -258,6 +258,11 @@ After every Control commit, subscribers that lost read authority are
 dropped from live pushes; their session stays open and its next request
 for the Resource gets `AUTHORIZATION_FAILED`.
 
+Before anything is looked up, a `DATA_GET` with more than 256 ranges
+(WIRE-01 §49) or a `KEY_PACKAGE_GET` with more than 256 distinct epochs
+gets `NACK(MALFORMED_MESSAGE)`. Repeated epochs are looked up once, and
+overlapping ranges of one actor are merged, so no unit is read twice.
+
 The server speaks plain HTTP and WebSocket. Clients use `wss://` except on
 loopback (WIRE-01 §16), so a deployment puts a TLS-terminating reverse
 proxy in front (LFCP-055).

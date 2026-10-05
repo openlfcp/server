@@ -18,7 +18,7 @@
 //! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60 |
 //! | an equivocating Data Unit | only the equivocating units of the request are stored, as evidence; none is accepted or pushed; `NACK(ACTOR_EQUIVOCATION)` | §26.2, §51 |
 //! | DATA_HAVE | the client's Have must normalize; answered with the server's | §48 |
-//! | DATA_GET / KEY_PACKAGE_GET / SNAPSHOT_GET | read authority; Key Packages only to their recipient; size-limited batches; no stored Snapshot is `NACK(MISSING_DEPENDENCY)` | §49, §52, §55 |
+//! | DATA_GET / KEY_PACKAGE_GET / SNAPSHOT_GET | more than 256 ranges or 256 distinct epochs is `NACK(MALFORMED_MESSAGE)` before any lookup, and overlapping ranges are merged; read authority; Key Packages only to their recipient; size-limited batches; no stored Snapshot is `NACK(MISSING_DEPENDENCY)` | §49, §52, §55 |
 //! | CONTROL/DATA/KEY_PACKAGE_BATCH, SNAPSHOT from a client | `NACK(PROTOCOL_UNSUPPORTED)`: mirror seeding (§46) is not offered | §46 |
 //! | live pushes | a committed Control Record (flag bit 1) or newly accepted Data Units (bit 0) to every other subscribed session; after each Control commit, subscribers without read authority are dropped | §41, §69 |
 //!
@@ -816,7 +816,9 @@ impl LfcpSession {
     }
 
     /// DATA_GET (§49): every stored unit in the ranges, equivocating ones
-    /// included, in size-limited DATA_BATCH replies (§50).
+    /// included, in size-limited DATA_BATCH replies (§50). More than
+    /// [`MAX_GET_RANGES`] ranges is refused before anything is loaded, and
+    /// overlapping ranges of one actor are merged, so no unit is read twice.
     async fn on_data_get(
         &mut self,
         request: [u8; 16],
@@ -824,9 +826,10 @@ impl LfcpSession {
         ranges: Vec<DataRange>,
         out: &Outbound,
     ) -> Flow {
-        if ranges.iter().any(|r| r.start == 0 || r.start > r.end) {
+        if ranges.len() > MAX_GET_RANGES || ranges.iter().any(|r| r.start == 0 || r.start > r.end) {
             return self.nack(out, request, WireCode::MalformedMessage);
         }
+        let ranges = merge_ranges(ranges);
         let principal = self.principal();
         if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
             return flow;
@@ -850,15 +853,22 @@ impl LfcpSession {
     }
 
     /// KEY_PACKAGE_GET (§52): every stored package for the requested
-    /// epochs, served only to their recipient.
+    /// epochs, served only to their recipient. Each epoch is looked up
+    /// once; more than [`MAX_GET_EPOCHS`] distinct epochs is refused before
+    /// anything is loaded.
     async fn on_key_package_get(
         &mut self,
         request: [u8; 16],
         resource_id: ResourceId,
         recipient: PrincipalId,
-        epochs: Vec<u64>,
+        mut epochs: Vec<u64>,
         out: &Outbound,
     ) -> Flow {
+        epochs.sort_unstable();
+        epochs.dedup();
+        if epochs.len() > MAX_GET_EPOCHS {
+            return self.nack(out, request, WireCode::MalformedMessage);
+        }
         let principal = self.principal();
         if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
             return flow;
@@ -1107,6 +1117,53 @@ pub fn validate_genesis(genesis: &[u8]) -> Result<ResourceId, Error> {
     }
 }
 
+/// The most ranges a DATA_GET may carry: §49 says a request SHOULD carry
+/// no more than 256; a longer one is `NACK(MALFORMED_MESSAGE)` (§62 code 2).
+pub const MAX_GET_RANGES: usize = 256;
+
+/// The most distinct Data Epochs a KEY_PACKAGE_GET may name. §52 sets no
+/// count; the server applies the §49 range limit, with the same
+/// `NACK(MALFORMED_MESSAGE)`.
+pub const MAX_GET_EPOCHS: usize = 256;
+
+/// Each actor's ranges merged where they overlap or touch, actors in order
+/// of first appearance, ranges ascending.
+fn merge_ranges(ranges: Vec<DataRange>) -> Vec<DataRange> {
+    let mut by_actor: Vec<(PrincipalId, Vec<(u64, u64)>)> = Vec::new();
+    for range in ranges {
+        match by_actor
+            .iter_mut()
+            .find(|(actor, _)| *actor == range.principal)
+        {
+            Some((_, spans)) => spans.push((range.start, range.end)),
+            None => by_actor.push((range.principal, vec![(range.start, range.end)])),
+        }
+    }
+    let mut merged = Vec::new();
+    for (principal, mut spans) in by_actor {
+        spans.sort_unstable();
+        let mut current = spans[0];
+        for (start, end) in spans.into_iter().skip(1) {
+            if start <= current.1.saturating_add(1) {
+                current.1 = current.1.max(end);
+            } else {
+                merged.push(DataRange {
+                    principal,
+                    start: current.0,
+                    end: current.1,
+                });
+                current = (start, end);
+            }
+        }
+        merged.push(DataRange {
+            principal,
+            start: current.0,
+            end: current.1,
+        });
+    }
+    merged
+}
+
 /// Room for the envelope and the CONTROL_BATCH body around the records.
 const BATCH_OVERHEAD: usize = 1024;
 
@@ -1195,6 +1252,45 @@ mod tests {
         let flow = session.handle(Message::new([0; 16], body), out).await;
         assert_eq!(flow, Flow::Continue);
         inbox.recv().await.unwrap().into_message().unwrap()
+    }
+
+    #[test]
+    fn data_ranges_merge_per_actor() {
+        let (a, b) = (
+            PrincipalId::from_bytes([1; 32]),
+            PrincipalId::from_bytes([2; 32]),
+        );
+        let r = |principal, start, end| DataRange {
+            principal,
+            start,
+            end,
+        };
+        let spans = |ranges: Vec<DataRange>| -> Vec<(PrincipalId, u64, u64)> {
+            merge_ranges(ranges)
+                .into_iter()
+                .map(|r| (r.principal, r.start, r.end))
+                .collect()
+        };
+        assert_eq!(
+            spans(vec![
+                r(b, 5, 9),
+                r(a, 10, 20),
+                r(a, 1, 3),
+                r(b, 1, 2),
+                r(a, 4, 4),
+                r(a, 15, 30),
+                r(b, 5, 9),
+                r(a, 40, u64::MAX),
+                r(a, 32, 39),
+            ]),
+            vec![
+                (b, 1, 2),
+                (b, 5, 9),
+                (a, 1, 4),
+                (a, 10, 30),
+                (a, 32, u64::MAX),
+            ]
+        );
     }
 
     #[tokio::test]

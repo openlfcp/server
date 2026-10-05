@@ -587,6 +587,100 @@ async fn key_packages_are_validated_and_served_to_their_recipient() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Security review H4: DATA_GET ranges and KEY_PACKAGE_GET epochs are
+/// counted, deduplicated and merged before anything is loaded.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_requests_are_capped_and_deduplicated_before_loading() {
+    let v = Vectors::load();
+    let (server, dir) = chain_server(&v, "data-get-caps", 10, Options::default()).await;
+    let mut bob = client(&server, &v.principal("bob")).await;
+    bob.request(data_put(
+        &v,
+        vec![v.cose("D1_bob_epoch0_seq1"), v.cose("D2_bob_epoch0_seq2")],
+    ))
+    .await;
+    assert!(matches!(bob.recv().await.body, Body::Ack(_)));
+    bob.request(Body::KeyPackagePut {
+        resource_id: v.resource(),
+        packages: vec![v.cose("KPC_carol_epoch1")],
+    })
+    .await;
+    assert!(matches!(bob.recv().await.body, Body::Ack(_)));
+
+    let actor = *v.principal("bob").descriptor().id();
+    let range = |start, end| DataRange {
+        principal: actor,
+        start,
+        end,
+    };
+    let data_get = |resource_id, ranges| Body::DataGet {
+        resource_id,
+        ranges,
+    };
+    // 256 ranges (§49), overlapping and repeated: each unit once.
+    let mut ranges = vec![range(1, 2); 254];
+    ranges.extend([range(2, 2), range(1, 1)]);
+    let id = bob.request(data_get(v.resource(), ranges)).await;
+    let batch = bob.recv().await;
+    assert_eq!(batch.correlation_id, Some(id));
+    let Body::DataBatch { units, .. } = batch.body else {
+        panic!("expected DATA_BATCH")
+    };
+    assert_eq!(
+        units,
+        vec![v.cose("D1_bob_epoch0_seq1"), v.cose("D2_bob_epoch0_seq2")]
+    );
+    // 257 ranges are refused, on an unknown Resource too: nothing is
+    // looked up first.
+    assert_eq!(
+        reply_code(&mut bob, data_get(v.resource(), vec![range(1, 1); 257])).await,
+        MALFORMED_MESSAGE
+    );
+    assert_eq!(
+        reply_code(
+            &mut bob,
+            data_get(ResourceId::from_bytes([7; 32]), vec![range(1, 1); 257])
+        )
+        .await,
+        MALFORMED_MESSAGE
+    );
+
+    let carol = v.principal("carol");
+    let mut carol_client = client(&server, &carol).await;
+    let key_get = |resource_id, epochs| Body::KeyPackageGet {
+        resource_id,
+        recipient: *carol.descriptor().id(),
+        epochs,
+    };
+    // Repeated epochs are looked up once.
+    let id = carol_client
+        .request(key_get(v.resource(), vec![1; 10_000]))
+        .await;
+    let batch = carol_client.recv().await;
+    assert_eq!(batch.correlation_id, Some(id));
+    assert_eq!(
+        batch.body,
+        Body::KeyPackageBatch {
+            resource_id: v.resource(),
+            packages: vec![v.cose("KPC_carol_epoch1")],
+        }
+    );
+    // More than 256 distinct epochs are refused before any lookup.
+    for resource in [v.resource(), ResourceId::from_bytes([7; 32])] {
+        assert_eq!(
+            reply_code(&mut carol_client, key_get(resource, (0..257).collect())).await,
+            MALFORMED_MESSAGE
+        );
+    }
+    let id = carol_client
+        .request(key_get(v.resource(), (0..256).collect()))
+        .await;
+    assert_eq!(carol_client.recv().await.correlation_id, Some(id));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 fn bob_snapshot(v: &Vectors, epoch: u64, sequence: u64, contiguous: u64) -> Vec<u8> {
     let bob = v.principal("bob");
     let header = SnapshotHeader {
