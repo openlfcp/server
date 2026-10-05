@@ -402,6 +402,84 @@ async fn equivocation_is_stored_as_evidence_and_reported() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_equivocating_data_put_accepts_none_of_its_units() {
+    // §51: a DATA_PUT is all-or-nothing; §26.2: the equivocating units are
+    // kept as evidence, the request is answered NACK(ACTOR_EQUIVOCATION)
+    // without details (§60), and nothing is pushed.
+    let v = Vectors::load();
+    let (server, dir) = chain_server(&v, "data-all-or-nothing", 10, Options::default()).await;
+    let mut bob = client(&server, &v.principal("bob")).await;
+    let mut watcher = client(&server, &v.principal("owner")).await;
+    watcher
+        .request(Body::ResourceOpen {
+            resource_id: v.resource(),
+            control_heads: vec![],
+            have: vec![],
+            grant_ids: None,
+            flags: Some(1),
+        })
+        .await;
+    assert!(matches!(
+        watcher.recv().await.body,
+        Body::ResourceOpened { .. }
+    ));
+    let bob_id = *v.principal("bob").descriptor().id();
+    let stored = |id: Hash32| {
+        let store = server.store.clone();
+        async move { store.data_unit(id).await.unwrap().is_some() }
+    };
+    let id_of =
+        |bytes: &[u8]| Hash32::from_bytes(*ReceivedDataUnit::parse(bytes).unwrap().id().as_bytes());
+
+    bob.request(data_put(&v, vec![v.cose("D1_bob_epoch0_seq1")]))
+        .await;
+    assert!(matches!(bob.recv().await.body, Body::Ack(_)));
+    assert!(matches!(watcher.recv().await.body, Body::DataBatch { .. }));
+
+    // D2 is fine, but the request also carries a second sequence 1.
+    let d2 = v.cose("D2_bob_epoch0_seq2");
+    let twin = v.negative("actor_seq1_prev_not_null_D1");
+    let id = bob
+        .request(data_put(&v, vec![d2.clone(), twin.clone()]))
+        .await;
+    let reply = bob.recv().await;
+    assert_eq!(reply.correlation_id, Some(id));
+    let Body::Nack(nack) = &reply.body else {
+        panic!("expected NACK, got {:?}", reply.body)
+    };
+    assert_eq!(nack.code, ACTOR_EQUIVOCATION);
+    assert_eq!(nack.details, None, "Data Plane NACKs carry no details");
+    assert!(!stored(id_of(&d2)).await, "D2 not accepted");
+    assert!(stored(id_of(&twin)).await, "the twin kept as evidence");
+
+    // Two different units for one slot in the same request: both are
+    // evidence, neither is accepted.
+    let conflicting = v.hex("actor_equivocation", "inputs", "conflicting_D2_cose");
+    assert_eq!(
+        reply_code(
+            &mut bob,
+            data_put(&v, vec![d2.clone(), conflicting.clone()])
+        )
+        .await,
+        ACTOR_EQUIVOCATION
+    );
+    let at2 = server
+        .store
+        .data_units_at(v.resource(), bob_id, 2)
+        .await
+        .unwrap();
+    assert_eq!(at2.len(), 2, "both kept as evidence");
+
+    // Nothing of either request reached the subscriber: the PONG to its
+    // PING is the next message it sees.
+    watcher.request(Body::Ping([5; 8])).await;
+    assert!(matches!(watcher.recv().await.body, Body::Pong(_)));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn key_packages_are_validated_and_served_to_their_recipient() {
     let v = Vectors::load();
     let (server, dir) = chain_server(&v, "data-kp", 10, Options::default()).await;

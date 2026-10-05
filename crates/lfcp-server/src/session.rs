@@ -15,8 +15,8 @@
 //! | CONTROL_PUT | [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
 //! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows | §44 |
 //! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)` | §45, §46 |
-//! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57 |
-//! | an equivocating Data Unit | stored as evidence; `NACK(ACTOR_EQUIVOCATION)` | §26.2 |
+//! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60 |
+//! | an equivocating Data Unit | only the equivocating units of the request are stored, as evidence; none is accepted or pushed; `NACK(ACTOR_EQUIVOCATION)` | §26.2, §51 |
 //! | DATA_HAVE | the client's Have must normalize; answered with the server's | §48 |
 //! | DATA_GET / KEY_PACKAGE_GET / SNAPSHOT_GET | read authority; Key Packages only to their recipient; size-limited batches; no stored Snapshot is `NACK(MISSING_DEPENDENCY)` | §49, §52, §55 |
 //! | CONTROL/DATA/KEY_PACKAGE_BATCH, SNAPSHOT from a client | `NACK(PROTOCOL_UNSUPPORTED)`: mirror seeding (§46) is not offered | §46 |
@@ -36,6 +36,7 @@
 //! Logs carry the connection number, message types, codes and public
 //! identifiers; never credentials, proofs or payloads.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -626,12 +627,14 @@ impl LfcpSession {
         )
     }
 
-    /// DATA_PUT (§51): every unit validated, then stored, then `ACK`
-    /// (type 33, every unit ID, durable). A unit that equivocates (another
-    /// signature-valid unit at its actor and sequence) is stored as
-    /// evidence and the request is answered `NACK(ACTOR_EQUIVOCATION)`
-    /// (§26.2: a server reports it). New, non-equivocating units are
-    /// pushed to live Data subscribers.
+    /// DATA_PUT (§51): all-or-nothing. Every unit is validated, then
+    /// checked for equivocation (another signature-valid unit at its actor
+    /// and sequence, stored or in the same request, §26.2). If any unit
+    /// equivocates, only the equivocating units are stored, as evidence,
+    /// nothing is pushed and the request is answered
+    /// `NACK(ACTOR_EQUIVOCATION)`. Otherwise every unit is stored in one
+    /// transaction, `ACK` (type 33, every unit ID, durable) follows, and new
+    /// units are pushed to live Data subscribers.
     async fn on_data_put(
         &mut self,
         request: [u8; 16],
@@ -654,31 +657,53 @@ impl LfcpSession {
             Err(flow) => return flow,
         };
         let store = self.shared.coordinator.store();
-        let mut fresh = Vec::new();
-        let mut equivocated = false;
-        for (bytes, unit) in units.into_iter().zip(&valid) {
-            let put = match store.put_data_unit(bytes.clone()).await {
-                Ok(put) => put,
-                Err(error) => return self.internal(out, request, &error),
+        // Every unit ID per (actor, sequence) slot: stored, then requested.
+        let mut slots: HashMap<(PrincipalId, u64), HashSet<Hash32>> = HashMap::new();
+        for unit in &valid {
+            let ids = match slots.entry((unit.actor, unit.sequence)) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => match store
+                    .data_units_at(resource_id, unit.actor, unit.sequence)
+                    .await
+                {
+                    Ok(ids) => entry.insert(ids.into_iter().collect()),
+                    Err(error) => return self.internal(out, request, &error),
+                },
             };
-            match store
-                .data_units_at(resource_id, unit.actor, unit.sequence)
-                .await
-            {
-                Ok(ids) if ids.len() > 1 => {
-                    tracing::warn!(
-                        conn = self.conn,
-                        actor = %unit.actor.to_hex(),
-                        seq = unit.sequence,
-                        "actor equivocation stored as evidence"
-                    );
-                    equivocated = true;
-                }
-                Ok(_) if put == Put::Inserted => fresh.push(bytes),
-                Ok(_) => {}
-                Err(error) => return self.internal(out, request, &error),
-            }
+            ids.insert(Hash32::from_bytes(*unit.id.as_bytes()));
         }
+        let equivocates = |unit: &ingest::ValidUnit| slots[&(unit.actor, unit.sequence)].len() > 1;
+        if valid.iter().any(equivocates) {
+            let evidence: Vec<Vec<u8>> = units
+                .into_iter()
+                .zip(&valid)
+                .filter(|(_, unit)| equivocates(unit))
+                .map(|(bytes, _)| bytes)
+                .collect();
+            for unit in valid.iter().filter(|u| equivocates(u)) {
+                tracing::warn!(
+                    conn = self.conn,
+                    actor = %unit.actor.to_hex(),
+                    seq = unit.sequence,
+                    "actor equivocation stored as evidence"
+                );
+            }
+            if let Err(error) = store.put_data_units(evidence).await {
+                return self.internal(out, request, &error);
+            }
+            drop(locked);
+            return self.nack(out, request, WireCode::ActorEquivocation);
+        }
+        let puts = match store.put_data_units(units.clone()).await {
+            Ok(puts) => puts,
+            Err(error) => return self.internal(out, request, &error),
+        };
+        let fresh: Vec<Vec<u8>> = units
+            .into_iter()
+            .zip(puts)
+            .filter(|(_, put)| *put == Put::Inserted)
+            .map(|(bytes, _)| bytes)
+            .collect();
         drop(locked);
         self.shared.coordinator.hub().push_data(
             resource_id,
@@ -686,9 +711,6 @@ impl LfcpSession {
             &fresh,
             &*self.shared.random,
         );
-        if equivocated {
-            return self.nack(out, request, WireCode::ActorEquivocation);
-        }
         let ids = valid
             .iter()
             .map(|u| Hash32::from_bytes(*u.id.as_bytes()))

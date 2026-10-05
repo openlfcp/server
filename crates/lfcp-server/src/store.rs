@@ -455,29 +455,44 @@ impl Store {
     /// (resource, actor, sequence) and another ID is stored too: it is
     /// equivocation evidence ([`Store::data_units_at`]).
     pub async fn put_data_unit(&self, bytes: Vec<u8>) -> Result<Put, StoreError> {
-        let unit = ReceivedDataUnit::parse(&bytes).map_err(StoreError::Malformed)?;
-        let h = unit.header().clone();
-        let id = unit.id();
-        let (seq, epoch) = (i64_of(h.sequence)?, i64_of(h.data_epoch)?);
+        let mut puts = self.put_data_units(vec![bytes]).await?;
+        Ok(puts.pop().expect("one unit, one result"))
+    }
+
+    /// Store Data Units of hosted Resources in one transaction: all of
+    /// them or, on any failure, none (WIRE-01 §51). One [`Put`] per unit,
+    /// in order.
+    pub async fn put_data_units(&self, units: Vec<Vec<u8>>) -> Result<Vec<Put>, StoreError> {
+        let mut rows = Vec::with_capacity(units.len());
+        for bytes in units {
+            let unit = ReceivedDataUnit::parse(&bytes).map_err(StoreError::Malformed)?;
+            let h = unit.header().clone();
+            let (seq, epoch) = (i64_of(h.sequence)?, i64_of(h.data_epoch)?);
+            rows.push((unit.id(), h, seq, epoch, bytes));
+        }
         self.call(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            require_resource(&tx, &h.resource_id)?;
-            let n = tx.execute(
-                "INSERT OR IGNORE INTO data_units (unit_id, resource_id, actor, seq, epoch, previous_id, control_head, bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    id.as_bytes().as_slice(),
-                    h.resource_id.as_bytes().as_slice(),
-                    h.actor.as_bytes().as_slice(),
-                    seq,
-                    epoch,
-                    h.previous.map(|p| p.as_bytes().to_vec()),
-                    h.control_head.as_bytes().as_slice(),
-                    bytes
-                ],
-            )?;
+            let mut puts = Vec::with_capacity(rows.len());
+            for (id, h, seq, epoch, bytes) in rows {
+                require_resource(&tx, &h.resource_id)?;
+                let n = tx.execute(
+                    "INSERT OR IGNORE INTO data_units (unit_id, resource_id, actor, seq, epoch, previous_id, control_head, bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        id.as_bytes().as_slice(),
+                        h.resource_id.as_bytes().as_slice(),
+                        h.actor.as_bytes().as_slice(),
+                        seq,
+                        epoch,
+                        h.previous.map(|p| p.as_bytes().to_vec()),
+                        h.control_head.as_bytes().as_slice(),
+                        bytes
+                    ],
+                )?;
+                puts.push(if n == 1 { Put::Inserted } else { Put::Duplicate });
+            }
             tx.commit()?;
-            Ok(if n == 1 { Put::Inserted } else { Put::Duplicate })
+            Ok(puts)
         })
         .await
     }
