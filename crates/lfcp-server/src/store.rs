@@ -702,6 +702,184 @@ fn open_connection(path: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
+/// What the setup code check found ([`Store::pair_admin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pairing {
+    /// The code matched: it is destroyed and the Principal is an admin.
+    Paired,
+    /// The code did not match; `remaining` attempts are left (0: the code
+    /// is destroyed).
+    WrongCode {
+        /// Attempts left.
+        remaining: u32,
+    },
+    /// The code expired; it is destroyed.
+    Expired,
+    /// There is no setup code (never created, used, or destroyed).
+    NoCode,
+}
+
+/// The sizes of one hosted Resource, for the admin API: counts and bytes,
+/// never contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceSize {
+    /// The Resource.
+    pub resource_id: ResourceId,
+    /// The accepted Control Head's sequence.
+    pub control_head_seq: u64,
+    /// Stored Control Records (fork evidence included).
+    pub control_records: u64,
+    /// Stored Data Units (equivocation evidence included).
+    pub data_units: u64,
+    /// Stored Key Packages.
+    pub key_packages: u64,
+    /// Stored Snapshots.
+    pub snapshots: u64,
+    /// The total size of every stored object's bytes.
+    pub bytes: u64,
+}
+
+/// Failed setup code attempts after which the code is destroyed.
+pub const SETUP_ATTEMPTS: u32 = 5;
+
+impl Store {
+    /// Replace the setup code with one whose hash is `code_hash`, valid
+    /// until `expires_at` (Unix seconds).
+    pub async fn set_setup_code(
+        &self,
+        code_hash: [u8; 32],
+        expires_at: i64,
+    ) -> Result<(), StoreError> {
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO admin_setup (id, code_hash, expires_at, failures) VALUES (1, ?1, ?2, 0)
+                 ON CONFLICT (id) DO UPDATE SET code_hash = ?1, expires_at = ?2, failures = 0",
+                params![code_hash.as_slice(), expires_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Check a setup code and, if it matches and has not expired, destroy
+    /// it and pair `principal` as an administrator, in one transaction:
+    /// a code pairs at most once. A wrong code counts an attempt; after
+    /// [`SETUP_ATTEMPTS`] the code is destroyed.
+    pub async fn pair_admin(
+        &self,
+        code_hash: [u8; 32],
+        principal: PrincipalId,
+        descriptor: Vec<u8>,
+        now: i64,
+    ) -> Result<Pairing, StoreError> {
+        self.call(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row: Option<(Vec<u8>, i64, i64)> = tx
+                .query_row(
+                    "SELECT code_hash, expires_at, failures FROM admin_setup WHERE id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((stored, expires_at, failures)) = row else {
+                return Ok(Pairing::NoCode);
+            };
+            let outcome = if now >= expires_at {
+                tx.execute("DELETE FROM admin_setup", [])?;
+                Pairing::Expired
+            } else if stored != code_hash {
+                let failures = failures as u32 + 1;
+                if failures >= SETUP_ATTEMPTS {
+                    tx.execute("DELETE FROM admin_setup", [])?;
+                } else {
+                    tx.execute("UPDATE admin_setup SET failures = ?1", [failures])?;
+                }
+                Pairing::WrongCode {
+                    remaining: SETUP_ATTEMPTS.saturating_sub(failures),
+                }
+            } else {
+                tx.execute("DELETE FROM admin_setup", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO admins (principal, descriptor, paired_at) VALUES (?1, ?2, ?3)",
+                    params![principal.as_bytes().as_slice(), descriptor, now],
+                )?;
+                Pairing::Paired
+            };
+            tx.commit()?;
+            Ok(outcome)
+        })
+        .await
+    }
+
+    /// The paired administrators.
+    pub async fn admins(&self) -> Result<Vec<PrincipalId>, StoreError> {
+        self.call(|conn| {
+            let mut stmt = conn.prepare("SELECT principal FROM admins ORDER BY principal")?;
+            let rows = stmt.query_map([], |row| {
+                Ok(PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    /// A server setting.
+    pub async fn setting(&self, key: &'static str) -> Result<Option<String>, StoreError> {
+        self.call(move |conn| {
+            Ok(conn
+                .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                    row.get(0)
+                })
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Set a server setting.
+    pub async fn set_setting(&self, key: &'static str, value: String) -> Result<(), StoreError> {
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
+                params![key, value],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every hosted Resource's sizes.
+    pub async fn resource_sizes(&self) -> Result<Vec<ResourceSize>, StoreError> {
+        self.call(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT r.resource_id, h.seq,
+                   (SELECT COUNT(*) FROM control_records c WHERE c.resource_id = r.resource_id),
+                   (SELECT COUNT(*) FROM data_units d WHERE d.resource_id = r.resource_id),
+                   (SELECT COUNT(*) FROM key_packages k WHERE k.resource_id = r.resource_id),
+                   (SELECT COUNT(*) FROM snapshots s WHERE s.resource_id = r.resource_id),
+                   (SELECT COALESCE(SUM(length(bytes)), 0) FROM control_records c WHERE c.resource_id = r.resource_id)
+                 + (SELECT COALESCE(SUM(length(bytes)), 0) FROM data_units d WHERE d.resource_id = r.resource_id)
+                 + (SELECT COALESCE(SUM(length(bytes)), 0) FROM key_packages k WHERE k.resource_id = r.resource_id)
+                 + (SELECT COALESCE(SUM(length(bytes)), 0) FROM snapshots s WHERE s.resource_id = r.resource_id)
+                 FROM resources r JOIN control_head h ON h.resource_id = r.resource_id
+                 ORDER BY r.resource_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(ResourceSize {
+                    resource_id: ResourceId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                    control_head_seq: row.get::<_, i64>(1)? as u64,
+                    control_records: row.get::<_, i64>(2)? as u64,
+                    data_units: row.get::<_, i64>(3)? as u64,
+                    key_packages: row.get::<_, i64>(4)? as u64,
+                    snapshots: row.get::<_, i64>(5)? as u64,
+                    bytes: row.get::<_, i64>(6)? as u64,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+}
+
 fn require_resource(conn: &Connection, resource: &ResourceId) -> Result<(), StoreError> {
     let known: Option<i64> = conn
         .query_row(

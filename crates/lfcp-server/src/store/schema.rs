@@ -92,6 +92,32 @@ pub const MIGRATIONS: &[&str] = &[
         durability    INTEGER NOT NULL CHECK (durability BETWEEN 0 AND 3)
     ) STRICT;
     "#,
+    // 2: server administration (LFCP-046). Infrastructure only: nothing
+    // here is LFCP Resource authority.
+    r#"
+    -- The one-time setup code while no administrator is paired: only its
+    -- hash, its expiry (Unix seconds) and the failed attempts.
+    CREATE TABLE admin_setup (
+        id            INTEGER PRIMARY KEY CHECK (id = 1),
+        code_hash     BLOB NOT NULL CHECK (length(code_hash) = 32),
+        expires_at    INTEGER NOT NULL,
+        failures      INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+
+    -- The LFCP Principals paired as server administrators.
+    CREATE TABLE admins (
+        principal     BLOB PRIMARY KEY CHECK (length(principal) = 32),
+        descriptor    BLOB NOT NULL,
+        paired_at     INTEGER NOT NULL
+    ) STRICT;
+
+    -- Server settings changed through the admin API, such as the hosting
+    -- policy (JSON).
+    CREATE TABLE settings (
+        key           TEXT PRIMARY KEY,
+        value         TEXT NOT NULL
+    ) STRICT;
+    "#,
 ];
 
 /// The schema version a fully migrated database has.
