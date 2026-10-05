@@ -20,6 +20,33 @@ pub async fn handle(request: Request<Incoming>) -> Result<Response<Full<Bytes>>,
     Ok(route(request.method(), request.uri().path()))
 }
 
+/// Probe a running server's health endpoint over plain HTTP/1.1, for a
+/// container health check (the runtime image has no curl). An unspecified
+/// bind address (`0.0.0.0`, `::`) is probed on loopback. True only for a
+/// `200` answer within `timeout`.
+pub fn probe(bind: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+    use std::io::{Read, Write};
+    let mut addr = bind;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(match addr {
+            std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request =
+        format!("GET {HEALTH_PATH} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut status = [0u8; 12];
+    stream.read_exact(&mut status).is_ok() && &status == b"HTTP/1.1 200"
+}
+
 /// The response for a method and path.
 pub fn route(method: &Method, path: &str) -> Response<Full<Bytes>> {
     let respond = |status, content_type, body: &'static str| {

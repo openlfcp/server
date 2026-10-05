@@ -98,8 +98,10 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// The command-line help.
-pub const USAGE: &str =
-    "usage: lfcp-server [--config FILE] [--bind ADDR:PORT] [--state-dir DIR] [--log-level LEVEL]";
+pub const USAGE: &str = "usage: lfcp-server [--health-check] [--config FILE] [--bind ADDR:PORT] [--state-dir DIR] [--log-level LEVEL]
+
+  --health-check  probe GET /health of the server this configuration
+                  describes and exit 0 if it answers 200 (for containers)";
 
 /// The configuration file as written: every field optional.
 #[derive(Debug, Default, Deserialize)]

@@ -80,6 +80,18 @@ async fn serves_health_and_shuts_down_gracefully() {
         .unwrap();
     assert!(response.starts_with("HTTP/1.1 404"), "{response}");
 
+    // The container probe: on the address, and on an unspecified bind.
+    let probed = tokio::task::spawn_blocking(move || {
+        let any: std::net::SocketAddr = format!("0.0.0.0:{}", addr.port()).parse().unwrap();
+        (
+            lfcp_server::http::probe(addr, Duration::from_secs(2)),
+            lfcp_server::http::probe(any, Duration::from_secs(2)),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(probed, (true, true));
+
     // An idle keep-alive connection must not hold the shutdown up.
     let idle = TcpStream::connect(addr).unwrap();
 
@@ -89,6 +101,7 @@ async fn serves_health_and_shuts_down_gracefully() {
         .expect("shut down in time")
         .unwrap();
     assert!(TcpStream::connect(addr).is_err(), "no longer listening");
+    assert!(!lfcp_server::http::probe(addr, Duration::from_secs(1)));
     drop(idle);
     std::fs::remove_dir_all(&state).unwrap();
 }

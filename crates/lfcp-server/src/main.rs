@@ -1,4 +1,5 @@
-//! `lfcp-server`: run the reference server until SIGINT or SIGTERM.
+//! `lfcp-server`: run the reference server until SIGINT or SIGTERM, or, with
+//! `--health-check`, probe a running one (exit status 0 when healthy).
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -9,13 +10,25 @@ use lfcp_server::server::Server;
 use lfcp_server::store::Store;
 
 fn main() -> ExitCode {
-    let config = match Config::from_args(std::env::args().skip(1)) {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let health_check = args.first().map(String::as_str) == Some("--health-check");
+    if health_check {
+        args.remove(0);
+    }
+    let config = match Config::from_args(args) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("lfcp-server: {error}");
             return ExitCode::from(2);
         }
     };
+    if health_check {
+        return if lfcp_server::http::probe(config.bind, std::time::Duration::from_secs(3)) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     tracing_subscriber::fmt()
         .with_max_level(config.log_level)
         .init();

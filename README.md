@@ -81,7 +81,10 @@ cargo run -- --config server.toml
 | `heartbeat_ms` | | `30000` | READY heartbeat (§37); a connection silent for three is closed. `0` disables, else 1000–3600000 |
 | `log_level` | `--log-level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 
-`GET /health` answers `{"status":"ok"}` and nothing else. SIGINT or
+`GET /health` answers `{"status":"ok"}` and nothing else.
+`lfcp-server --health-check [--config FILE]` probes it for the configured
+`bind` address (loopback when `bind` is unspecified) and exits 0 when it
+answers 200: a container health check without curl. SIGINT or
 SIGTERM stops accepting connections and gives open ones 10 seconds.
 
 The server ID (WIRE-01 §35, §37) is 32 random bytes created on first start

@@ -562,3 +562,21 @@ async fn a_gracefully_stopped_server_keeps_its_state() {
     inspect_store(&v, &dir).await;
     cleanup(&dir);
 }
+
+#[test]
+fn the_health_check_mode_reports_the_server_state() {
+    let dir = fresh("health-check");
+    let process = spawn(&dir);
+    let config = dir.with_extension("toml");
+    let check = || {
+        Command::new(env!("CARGO_BIN_EXE_lfcp-server"))
+            .args(["--health-check", "--config", config.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(check(), "healthy while running");
+    process.kill();
+    assert!(!check(), "unhealthy once killed");
+    cleanup(&dir);
+}
