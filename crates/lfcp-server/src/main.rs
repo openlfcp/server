@@ -57,10 +57,8 @@ fn main() -> ExitCode {
             server_id = %server.server_id().to_hex(),
             "listening"
         );
-        // LFCP-048 replaces the PING-only session with the LFCP session.
-        server
-            .run(lfcp_server::ws::PingOnly, shutdown_signal())
-            .await;
+        let sessions = lfcp_server::session::Lfcp::new(server.store().clone(), server.config());
+        server.run(sessions, shutdown_signal()).await;
         ExitCode::SUCCESS
     })
 }

@@ -16,10 +16,11 @@ dependency tree.
 - Bootstrap (LFCP-044): configuration, the stable server ID, the health
   endpoint and graceful shutdown.
 - Store (LFCP-045): SQLite persistence of exact LFCP objects.
-- WebSocket transport (LFCP-047): framing, limits and shutdown; the only
-  session so far answers PING.
+- WebSocket transport (LFCP-047): framing, limits and shutdown.
+- Session (LFCP-048): HELLO / CHALLENGE / AUTH / READY, and
+  RESOURCE_HOST, RESOURCE_OPEN and RESOURCE_CLOSE.
 
-Next: setup and admin HTTP (LFCP-046) and the LFCP session (LFCP-048).
+Next: setup and admin HTTP (LFCP-046) and the Control Plane (LFCP-049).
 
 ## Store
 
@@ -87,9 +88,8 @@ WebSocket version 426.
 - One binary WebSocket message is one LFCP message, decoded by sdk-rs
   (`Message::decode_frame`). The transport adds no protocol semantics: it
   hands each decoded message to the connection's session (`ws::Session`,
-  created per connection by a `ws::SessionFactory`). LFCP-048 supplies the
-  real session; until then `ws::PingOnly` answers PING with PONG, which
-  WIRE-01 allows before READY (§64).
+  created per connection by a `ws::SessionFactory`); the server runs the
+  LFCP session below.
 - A text frame gets `ERROR(MALFORMED_MESSAGE)` and close 1002 (§31).
 - A message over `max_message_bytes` is refused from its frame header,
   before the payload is read or decoded: `ERROR(MESSAGE_TOO_LARGE)` and
@@ -109,6 +109,52 @@ WebSocket version 426.
   within the same 10-second grace as HTTP connections.
 - Logs carry the connection number, message types and error codes; never
   payloads.
+
+## Session
+
+`session::Lfcp` runs the WIRE-01 §64 server session with sdk-rs
+(`select_wire_profile`, `verify_auth`, `server_accepts`, the
+`ServerSession` machine). Nonces, session IDs and message IDs come from the
+server's random source; the server ID from `<state_dir>/server-id`.
+
+| Situation | Answer |
+| --- | --- |
+| HELLO with an invalid descriptor or an ID that is not its keys' hash | `ERROR(AUTH_FAILED)`, close |
+| HELLO with no wire profile in common | `ERROR(PROTOCOL_UNSUPPORTED)`, close |
+| AUTH proof that fails in any way | `ERROR(AUTH_FAILED)`, close |
+| Resource, Control, Data, Key or Snapshot message before READY | `NACK(AUTHORIZATION_FAILED)`, stays open |
+| PING / PONG / ERROR before READY | allowed |
+| a handshake message out of order, anything else before READY, or an undecodable message before READY | `ERROR(MALFORMED_MESSAGE)`, close |
+| READY | the profile, server ID, `max_message_bytes`, durability 2, `heartbeat_ms`, no extensions |
+
+After READY:
+
+- `RESOURCE_HOST`: sdk-rs validates the Genesis (sequence 0, signed by the
+  owner in its body, ws/wss URLs), the hosting policy is applied, the
+  Genesis is committed to the store, and only then `RESOURCE_HOSTED`
+  (durability 2) is sent. Hosting the same Genesis again succeeds; another
+  Genesis for the same Resource is `NACK(CONTROL_CONFLICT)`.
+- `RESOURCE_OPEN`: a Resource this server does not host is
+  `NACK(RESOURCE_NOT_HOSTED)`. The server validates the stored chain up to
+  its accepted head with the sdk-rs capability engine (a chain with a
+  Coordinator Recovery or Tombstone is refused in MVP) and requires the
+  session Principal to hold `data/read` there, or to be the subject of an
+  invitation grant that still confers `invite/claim` (WIRE-01 §84, §41,
+  §73); otherwise `NACK(AUTHORIZATION_FAILED)`. `RESOURCE_OPENED` carries
+  every Control Head the server knows (a fork is not hidden), its Have, a
+  summary of the newest stored Snapshot, the route version and the
+  coordinator.
+- `RESOURCE_CLOSE`: drops the session's subscription and answers `ACK`;
+  stored data is untouched.
+- Control, Data, Key, Snapshot and presence messages: `NACK(PROTOCOL_UNSUPPORTED)`
+  until LFCP-049 onward.
+
+Authority: AUTH proves possession of the session key and nothing more. The
+hosting credential (in AUTH or RESOURCE_HOST) is server policy only
+(`session::HostingPolicy`); the self-hosted default, `OpenHosting`, lets any
+authenticated Principal host, with or without one. Neither a credential nor
+the hosting row ever grants a Resource ability: authority always comes from
+the Control Chain. Credentials and proofs are never logged.
 
 The server speaks plain HTTP and WebSocket. Clients use `wss://` except on
 loopback (WIRE-01 §16), so a deployment puts a TLS-terminating reverse

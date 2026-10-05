@@ -517,6 +517,27 @@ impl Store {
         .await
     }
 
+    /// Every stored (actor, sequence) of a Resource's Data Units, in
+    /// order, each once: the server's Have (WIRE-01 §28, §42).
+    pub async fn data_sequences(
+        &self,
+        resource: ResourceId,
+    ) -> Result<Vec<(PrincipalId, u64)>, StoreError> {
+        self.call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT actor, seq FROM data_units WHERE resource_id = ?1 ORDER BY actor, seq",
+            )?;
+            let rows = stmt.query_map([resource.as_bytes().as_slice()], |row| {
+                Ok((
+                    PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                    row.get::<_, i64>(1)? as u64,
+                ))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
     /// Store a Key Package of a hosted Resource. Several packages for one
     /// (resource, epoch, recipient) are all kept (WIRE-01 §25.2).
     pub async fn put_key_package(&self, bytes: Vec<u8>) -> Result<Put, StoreError> {

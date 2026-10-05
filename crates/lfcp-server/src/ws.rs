@@ -6,10 +6,10 @@
 //! | binary only | a text message is `ERROR(MALFORMED_MESSAGE)`, then close | §31, G-MSG7 |
 //! | one message per WebSocket message | each binary message is decoded with sdk-rs's codec | §31, §32 |
 //! | size limit | checked from the frame header before the payload is read; `ERROR(MESSAGE_TOO_LARGE)`, then close (the unread payload leaves the stream unusable) | §31 |
-//! | undecodable message | `ERROR` with the error's code; the connection closes only for errors that §31/§34/§64 make fatal | §31–§33 |
+//! | undecodable message | handed to [`Session::rejected`]; by default `ERROR` with the error's code, closing only for errors that §31/§34/§64 make fatal | §31–§33 |
 //!
 //! Everything else is the session's: each decoded message goes to a
-//! per-connection [`Session`] (LFCP-048 provides the real one), which
+//! per-connection [`Session`] ([`crate::session`] is the LFCP one), which
 //! answers through a bounded [`Outbound`] queue. The transport keeps no
 //! application data and logs connection IDs and message types, never
 //! payloads.
@@ -122,15 +122,48 @@ impl Outbound {
 }
 
 #[derive(Debug)]
-enum Out {
+pub(crate) enum Out {
     Lfcp(Box<Message>),
     Close(CloseFrame),
+}
+
+/// An [`Outbound`] whose messages a unit test reads back.
+#[cfg(test)]
+pub(crate) fn test_outbound(capacity: usize) -> (Outbound, mpsc::Receiver<Out>) {
+    let (queue, inbox) = mpsc::channel(capacity);
+    (Outbound { queue }, inbox)
+}
+
+#[cfg(test)]
+impl Out {
+    /// The LFCP message, if this is one.
+    pub(crate) fn into_message(self) -> Option<Message> {
+        match self {
+            Out::Lfcp(message) => Some(*message),
+            Out::Close(_) => None,
+        }
+    }
 }
 
 /// The per-connection protocol logic the transport hands messages to.
 pub trait Session: Send + 'static {
     /// Handle one decoded message.
     fn handle(&mut self, message: Message, out: &Outbound) -> impl Future<Output = Flow> + Send;
+    /// A WebSocket message that did not decode (a text frame included).
+    /// By default: `ERROR` with the error's wire code, closing the
+    /// connection when the error is fatal (§31, §34). A session overrides
+    /// this where its state changes the code or the outcome, such as a
+    /// malformed descriptor in `HELLO` (`AUTH_FAILED`, §7).
+    fn rejected(&mut self, error: Error, out: &Outbound) -> Flow {
+        if let Some(message) = error_message(&error) {
+            let _ = out.send(message);
+        }
+        if error.closes_connection() {
+            Flow::Close
+        } else {
+            Flow::Continue
+        }
+    }
     /// The connection has ended; release whatever the session holds.
     fn closed(&mut self) {}
 }
@@ -143,8 +176,9 @@ pub trait SessionFactory: Send + Sync + 'static {
     fn open(&self, connection: &ConnectionContext) -> Self::Session;
 }
 
-/// The LFCP-047 stand-in session: answers PING with PONG (allowed before
-/// READY, G-SM4) and ignores everything else. LFCP-048 replaces it.
+/// A transport-only session: answers PING with PONG (allowed before READY,
+/// G-SM4) and ignores everything else. The server runs
+/// [`crate::session::Lfcp`]; this one serves transport tests.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PingOnly;
 
@@ -315,12 +349,6 @@ pub async fn serve<S: Session>(
             reason: reason.into(),
         }));
     };
-    let fail = |error: Error| {
-        tracing::info!(conn = id, code = error.code(), "rejected a message");
-        if let Some(message) = error_message(&error) {
-            let _ = queue.try_send(Out::Lfcp(Box::new(message)));
-        }
-    };
     let options = DecodeOptions {
         max_message_bytes: limits.max_message_bytes,
         ..DecodeOptions::default()
@@ -361,10 +389,14 @@ pub async fn serve<S: Session>(
             Ok(None) => break,
             Ok(Some(Ok(frame))) => frame,
             Ok(Some(Err(WsError::Capacity(CapacityError::MessageTooLong { size, max_size })))) => {
-                fail(Error::MessageTooLarge {
+                let error = Error::MessageTooLarge {
                     size,
                     limit: max_size,
-                });
+                };
+                tracing::info!(conn = id, code = error.code(), "rejected a message");
+                if let Some(message) = error_message(&error) {
+                    let _ = out.send(message);
+                }
                 close(CloseCode::Size, "message too large");
                 break;
             }
@@ -395,9 +427,8 @@ pub async fn serve<S: Session>(
                 }
             }
             Err(error) => {
-                let fatal = error.closes_connection();
-                fail(error);
-                if fatal {
+                tracing::info!(conn = id, code = error.code(), "rejected a message");
+                if session.rejected(error, &out) == Flow::Close {
                     close(CloseCode::Protocol, "protocol error");
                     break;
                 }
