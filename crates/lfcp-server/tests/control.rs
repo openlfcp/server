@@ -621,6 +621,40 @@ async fn a_one_time_invitation_is_claimed_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_active_invitation_subject_may_open_the_resource() {
+    // §41, §84: read authority is data/read, or being the subject of an
+    // active invitation grant, at the accepted Control Head.
+    let v = Vectors::load();
+    let dir = state_dir("control-invite-open");
+    let server = start(&dir, options(both(&v), Arc::default())).await;
+    let mut owner = owner_client(&v, server.addr).await;
+    commit_through(&v, &mut owner, 2).await;
+    let opened = |reply: &Message| matches!(reply.body, Body::ResourceOpened { .. });
+
+    // At C2 the Invitation Principal opens; CAROL, not yet a member, not.
+    let mut invite = Client::connect(server.addr).await;
+    invite.handshake(&v.principal("invite")).await;
+    invite.request(open(&v, 0)).await;
+    assert!(opened(&invite.recv().await), "the invitation subject opens");
+    let mut carol = Client::connect(server.addr).await;
+    carol.handshake(&v.principal("carol")).await;
+    carol.request(open(&v, 0)).await;
+    assert_eq!(code(&carol.recv().await), AUTHORIZATION_FAILED);
+
+    // C3 claims the one-time invitation (re-putting C1 and C2 is answered
+    // with the same ACKs, §47): CAROL now holds data/read. The used-up C2
+    // no longer confers invite/claim, but its data/read stays (§18.1).
+    commit_through(&v, &mut owner, 3).await;
+    carol.request(open(&v, 0)).await;
+    assert!(opened(&carol.recv().await), "the claimant opens");
+    invite.request(open(&v, 0)).await;
+    assert!(opened(&invite.recv().await), "C2's data/read stays");
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_head_survives_a_restart() {
     let v = Vectors::load();
     let dir = state_dir("control-restart");
@@ -711,7 +745,15 @@ async fn commits_are_pushed_to_live_control_subscribers() {
         resource_id: v.resource(),
     })
     .await;
-    assert!(matches!(live.recv().await.body, Body::Ack(_)));
+    // §43: the ACK names RESOURCE_CLOSE (type 14).
+    assert_eq!(
+        live.recv().await.body,
+        Body::Ack(AckBody {
+            request_type: 14,
+            object_ids: None,
+            durable: None,
+        })
+    );
     commit_through(&v, &mut writer, 2).await;
     live.request(Body::Ping([4; 8])).await;
     assert_eq!(live.recv().await.body, Body::Pong([4; 8]));
