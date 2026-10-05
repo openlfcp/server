@@ -963,6 +963,10 @@ impl LfcpSession {
 }
 
 impl Session for LfcpSession {
+    fn is_ready(&self) -> bool {
+        self.state == ServerSession::Ready
+    }
+
     async fn handle(&mut self, message: Message, out: &Outbound) -> Flow {
         let Message {
             message_id: id,

@@ -18,7 +18,7 @@ use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
@@ -145,7 +145,11 @@ async fn serve_http<F: SessionFactory>(
     let mut shutdown = shared.shutdown.clone();
     let handler = shared.clone();
     let service = service_fn(move |request| route(request, peer, handler.clone()));
+    // A client must send its request headers within the handshake
+    // timeout (security review M2).
     let connection = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_millis(shared.config.handshake_timeout_ms))
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades();
     tokio::pin!(connection);
@@ -190,7 +194,8 @@ async fn route<F: SessionFactory>(
         id: shared.next_id.fetch_add(1, Ordering::Relaxed),
         peer,
         server_id: shared.server_id,
-        limits: Limits::new(shared.config.max_message_bytes, shared.config.heartbeat_ms),
+        limits: Limits::new(shared.config.max_message_bytes, shared.config.heartbeat_ms)
+            .with_handshake_timeout(Duration::from_millis(shared.config.handshake_timeout_ms)),
     };
     let session = shared.sessions.open(&connection);
     let alive = shared.alive.clone();

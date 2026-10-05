@@ -76,6 +76,8 @@ pub struct Options {
     pub max_message_bytes: Option<usize>,
     /// The setup code's lifetime (LFCP-046); default one hour.
     pub setup_ttl: Option<Duration>,
+    /// Overrides of the configuration defaults.
+    pub handshake_timeout_ms: Option<u64>,
 }
 
 impl Default for Options {
@@ -88,6 +90,7 @@ impl Default for Options {
             ingest: None,
             max_message_bytes: None,
             setup_ttl: None,
+            handshake_timeout_ms: None,
         }
     }
 }
@@ -129,6 +132,9 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         max_message_bytes: options
             .max_message_bytes
             .unwrap_or(lfcp::wire::message::DEFAULT_MAX_MESSAGE_BYTES),
+        handshake_timeout_ms: options
+            .handshake_timeout_ms
+            .unwrap_or(Config::default().handshake_timeout_ms),
         ..Config::default()
     };
     let identity: Arc<dyn ServerIdentity> = match options.identity {
@@ -247,6 +253,20 @@ impl Client {
                 Some(Ok(Frame::Close(None))) | None | Some(Err(_)) => return,
                 Some(Ok(Frame::Ping(_) | Frame::Pong(_))) => continue,
                 Some(Ok(other)) => panic!("expected a close, got {other:?}"),
+            }
+        }
+    }
+
+    /// Read until the server closes; its close code, if it sent one.
+    pub async fn close_code(&mut self) -> Option<CloseCode> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), self.socket.next())
+                .await
+                .expect("closed in time")
+            {
+                Some(Ok(Frame::Close(frame))) => return frame.map(|f| f.code),
+                None | Some(Err(_)) => return None,
+                Some(Ok(_)) => continue,
             }
         }
     }

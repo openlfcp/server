@@ -88,6 +88,7 @@ cargo run -- --config server.toml
 | `max_message_bytes` | | `8388608` | Maximum LFCP message size (WIRE-01 §31, §37) |
 | `public_urls` | | `[]` | This server's WebSocket URLs: it coordinates the Resources whose Control Coordinator URL is one of them (WIRE-01 §21) |
 | `heartbeat_ms` | | `30000` | READY heartbeat (§37); a connection silent for three is closed. `0` disables, else 1000–3600000 |
+| `handshake_timeout_ms` | | `10000` | Time allowed for a request's HTTP headers, and for a WebSocket connection to reach READY; 1000–600000 |
 | `log_level` | `--log-level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 
 `GET /health` answers `{"status":"ok"}` and nothing else.
@@ -127,6 +128,15 @@ WebSocket version 426.
 - A connection that sends no LFCP message for three heartbeats is closed
   (1001). Only LFCP messages count, an LFCP `PING` included; WebSocket
   ping and pong frames do not.
+- Before READY the peer is unauthenticated, and the limits are tighter
+  (security review M2, M5). The connection must reach READY within
+  `handshake_timeout_ms` of opening, else close 1008. An LFCP `PING`
+  before READY is answered but does not extend this deadline. At most 16
+  messages are read before READY; the 17th gets `ERROR(RATE_LIMITED)` and
+  close 1008. A message over 64 KiB gets `ERROR(MESSAGE_TOO_LARGE)` and
+  close 1009 without being decoded.
+- An HTTP request whose headers do not arrive within
+  `handshake_timeout_ms` has its connection closed.
 - Shutdown sends every WebSocket close 1001, drains its queue, and waits
   within the same 10-second grace as HTTP connections.
 - Logs carry the connection number, message types and error codes; never

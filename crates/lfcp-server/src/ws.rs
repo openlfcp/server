@@ -22,6 +22,16 @@
 //! LFCP message for [`Limits::idle_timeout`] (three READY heartbeat
 //! intervals, §37) is closed. Only LFCP messages (an LFCP `PING` included)
 //! count as liveness; WebSocket-level ping and pong frames do not.
+//!
+//! Before the session is ready ([`Session::is_ready`]: READY sent, §37)
+//! the peer is unauthenticated, so the transport is stricter (security
+//! review M2, M5): the connection must become ready within
+//! [`Limits::handshake_timeout`] of opening, whatever it sends meanwhile
+//! (an LFCP `PING` does not extend it), else it is closed (1008); at most
+//! [`Limits::pre_ready_messages`] messages are read, the next gets
+//! `ERROR(RATE_LIMITED)` and close 1008; and a message over
+//! [`Limits::pre_ready_message_bytes`] gets `ERROR(MESSAGE_TOO_LARGE)` and
+//! close 1009 without being decoded.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -64,6 +74,12 @@ pub struct Limits {
     pub write_timeout: Duration,
     /// How long a closing connection may take to flush and close.
     pub close_timeout: Duration,
+    /// Close a connection that is not ready this long after opening.
+    pub handshake_timeout: Duration,
+    /// The most messages read before the session is ready.
+    pub pre_ready_messages: usize,
+    /// The largest message decoded before the session is ready.
+    pub pre_ready_message_bytes: usize,
 }
 
 impl Limits {
@@ -77,7 +93,16 @@ impl Limits {
                 .then(|| Duration::from_millis(heartbeat_ms.saturating_mul(3))),
             write_timeout: Duration::from_secs(10),
             close_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(10),
+            pre_ready_messages: 16,
+            pre_ready_message_bytes: 64 * 1024,
         }
+    }
+
+    /// The same limits with another handshake deadline.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Limits {
+        self.handshake_timeout = timeout;
+        self
     }
 }
 
@@ -196,6 +221,12 @@ pub trait Session: Send + 'static {
     }
     /// The connection has ended; release whatever the session holds.
     fn closed(&mut self) {}
+    /// Whether the handshake is complete (READY sent, §37). Until then the
+    /// transport applies the handshake deadline and the pre-READY limits.
+    /// By default a session needs no handshake.
+    fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 /// Creates a session for each new connection.
@@ -313,6 +344,16 @@ pub fn check_upgrade<B>(request: &Request<B>) -> Upgrade {
     )
 }
 
+/// An ERROR message with `code` alone (§61).
+fn code_message(code: lfcp::base::WireCode) -> Option<Message> {
+    let body = ErrorBody {
+        code: code.number(),
+        diagnostic: None,
+        details: None,
+    };
+    Some(Message::new(rng::nonce16().ok()?, Body::Error(body)))
+}
+
 /// An ERROR message for `error` (§61), if it has a wire code.
 fn error_message(error: &Error) -> Option<Message> {
     let body = ErrorBody::for_error(error)?;
@@ -390,9 +431,18 @@ pub async fn serve<S: Session>(
             .map(|idle| tokio::time::Instant::now() + idle)
     };
     let mut deadline = idle_deadline();
+    // The handshake deadline is fixed when the connection opens.
+    let handshake_deadline = tokio::time::Instant::now() + limits.handshake_timeout;
+    let mut pre_ready = 0usize;
     loop {
+        let ready = session.is_ready();
+        let wait = match (deadline, ready) {
+            (Some(idle), false) => Some(idle.min(handshake_deadline)),
+            (None, false) => Some(handshake_deadline),
+            (idle, true) => idle,
+        };
         let next = async {
-            match deadline {
+            match wait {
                 Some(deadline) => tokio::time::timeout_at(deadline, stream.next())
                     .await
                     .map_err(|_| ()),
@@ -415,6 +465,11 @@ pub async fn serve<S: Session>(
             }
         };
         let frame = match item {
+            Err(()) if !ready && tokio::time::Instant::now() >= handshake_deadline => {
+                tracing::info!(conn = id, "handshake timeout");
+                close(CloseCode::Policy, "handshake timeout");
+                break;
+            }
             Err(()) => {
                 tracing::info!(conn = id, "idle timeout");
                 close(CloseCode::Away, "idle timeout");
@@ -439,6 +494,34 @@ pub async fn serve<S: Session>(
                 break;
             }
         };
+        if !ready && matches!(frame, Frame::Binary(_) | Frame::Text(_)) {
+            pre_ready += 1;
+            if pre_ready > limits.pre_ready_messages {
+                tracing::info!(conn = id, "too many messages before READY");
+                if let Some(message) = code_message(lfcp::base::WireCode::RateLimited) {
+                    let _ = out.send(message);
+                }
+                close(CloseCode::Policy, "too many messages before READY");
+                break;
+            }
+            let size = frame.len();
+            if size > limits.pre_ready_message_bytes {
+                let error = Error::MessageTooLarge {
+                    size,
+                    limit: limits.pre_ready_message_bytes,
+                };
+                tracing::info!(
+                    conn = id,
+                    code = error.code(),
+                    "rejected a message before READY"
+                );
+                if let Some(message) = error_message(&error) {
+                    let _ = out.send(message);
+                }
+                close(CloseCode::Size, "message too large before READY");
+                break;
+            }
+        }
         let decoded = match frame {
             Frame::Binary(bytes) => Message::decode_frame(FrameKind::Binary, &bytes, &options),
             Frame::Text(text) => Message::decode_frame(FrameKind::Text, text.as_bytes(), &options),

@@ -7,6 +7,7 @@
 //! state_dir = "state"              # server ID, later the database
 //! max_message_bytes = 8388608      # advertised in READY (WIRE-01 §31, §37)
 //! heartbeat_ms = 30000             # READY heartbeat (§37); 0 disables the idle timeout
+//! handshake_timeout_ms = 10000     # HTTP request headers and the LFCP handshake (to READY)
 //! public_urls = ["wss://sync.example.org/v1/ws"]  # this server's WebSocket URLs (§21)
 //! log_level = "info"               # error | warn | info | debug | trace
 //! ```
@@ -43,6 +44,9 @@ pub struct Config {
     /// WebSocket connection silent for three intervals is closed. 0
     /// disables both.
     pub heartbeat_ms: u64,
+    /// How long a client may take to send its HTTP request headers, and a
+    /// WebSocket connection to reach READY (§37); then it is closed.
+    pub handshake_timeout_ms: u64,
     /// The WebSocket URLs clients reach this server at. A Resource whose
     /// Control Coordinator URL (§15, §20) names one of them, compared after
     /// [`crate::coordinator::normalize_url`], is coordinated here (§21);
@@ -60,6 +64,7 @@ impl Default for Config {
             state_dir: PathBuf::from("state"),
             max_message_bytes: lfcp::wire::message::DEFAULT_MAX_MESSAGE_BYTES,
             heartbeat_ms: 30_000,
+            handshake_timeout_ms: 10_000,
             public_urls: Vec::new(),
             log_level: tracing::Level::INFO,
         }
@@ -112,6 +117,7 @@ struct File {
     state_dir: Option<PathBuf>,
     max_message_bytes: Option<u64>,
     heartbeat_ms: Option<u64>,
+    handshake_timeout_ms: Option<u64>,
     public_urls: Option<Vec<String>>,
     log_level: Option<String>,
 }
@@ -136,6 +142,9 @@ impl Config {
         }
         if let Some(ms) = file.heartbeat_ms {
             config.heartbeat_ms = ms;
+        }
+        if let Some(ms) = file.handshake_timeout_ms {
+            config.handshake_timeout_ms = ms;
         }
         if let Some(urls) = file.public_urls {
             config.public_urls = urls;
@@ -207,6 +216,9 @@ impl Config {
         if self.heartbeat_ms > 0 && !(1_000..=3_600_000).contains(&self.heartbeat_ms) {
             return invalid("heartbeat_ms", "must be 0 or between 1000 and 3600000");
         }
+        if !(1_000..=600_000).contains(&self.handshake_timeout_ms) {
+            return invalid("handshake_timeout_ms", "must be between 1000 and 600000");
+        }
         if !(MIN_MESSAGE_BYTES..=MAX_MESSAGE_BYTES).contains(&self.max_message_bytes) {
             return invalid("max_message_bytes", "must be between 65536 and 67108864");
         }
@@ -261,7 +273,7 @@ mod tests {
     #[test]
     fn parses_every_field() {
         let config = Config::from_toml(
-            "bind = \"0.0.0.0:9000\"\nws_path = \"/ws\"\nstate_dir = \"/var/lib/lfcp\"\nmax_message_bytes = 1048576\nheartbeat_ms = 0\npublic_urls = [\"wss://sync.example.org/v1/ws\"]\nlog_level = \"debug\"\n",
+            "bind = \"0.0.0.0:9000\"\nws_path = \"/ws\"\nstate_dir = \"/var/lib/lfcp\"\nmax_message_bytes = 1048576\nheartbeat_ms = 0\nhandshake_timeout_ms = 5000\npublic_urls = [\"wss://sync.example.org/v1/ws\"]\nlog_level = \"debug\"\n",
         )
         .unwrap();
         assert_eq!(config.bind, "0.0.0.0:9000".parse().unwrap());
@@ -269,6 +281,7 @@ mod tests {
         assert_eq!(config.state_dir, PathBuf::from("/var/lib/lfcp"));
         assert_eq!(config.max_message_bytes, 1 << 20);
         assert_eq!(config.heartbeat_ms, 0);
+        assert_eq!(config.handshake_timeout_ms, 5_000);
         assert_eq!(config.public_urls, vec!["wss://sync.example.org/v1/ws"]);
         assert_eq!(config.log_level, tracing::Level::DEBUG);
     }
@@ -287,6 +300,11 @@ mod tests {
         assert_eq!(field("max_message_bytes = 1073741824"), "max_message_bytes");
         assert_eq!(field("log_level = \"loud\""), "log_level");
         assert_eq!(field("heartbeat_ms = 10"), "heartbeat_ms");
+        assert_eq!(field("handshake_timeout_ms = 0"), "handshake_timeout_ms");
+        assert_eq!(
+            field("handshake_timeout_ms = 600001"),
+            "handshake_timeout_ms"
+        );
         assert_eq!(field("public_urls = [\"https://x/v1/ws\"]"), "public_urls");
         assert_eq!(field("public_urls = [\"wss://u@x/v1/ws\"]"), "public_urls");
         assert!(matches!(
