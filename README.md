@@ -102,7 +102,9 @@ WebSocket version 426.
   `Outbound::send` finds it full is told (`Overloaded`) rather than
   buffering, and a write that takes longer than 10 s ends the connection,
   so a slow reader cannot grow memory.
-- A connection that sends nothing for three heartbeats is closed (1001).
+- A connection that sends no LFCP message for three heartbeats is closed
+  (1001). Only LFCP messages count, an LFCP `PING` included; WebSocket
+  ping and pong frames do not.
 - Shutdown sends every WebSocket close 1001, drains its queue, and waits
   within the same 10-second grace as HTTP connections.
 - Logs carry the connection number, message types and error codes; never

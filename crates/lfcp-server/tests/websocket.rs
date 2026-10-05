@@ -367,3 +367,42 @@ async fn a_silent_connection_is_closed_after_three_heartbeats() {
     assert!(started.elapsed() >= Duration::from_millis(2900));
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_lfcp_messages_count_as_liveness() {
+    // Heartbeat 1 s, idle timeout 3 s.
+    let server = start("liveness", PingOnly, 1000).await;
+
+    // WebSocket-level pings do not keep a connection open.
+    let mut client = lfcp(server.addr).await;
+    let started = std::time::Instant::now();
+    let closed = loop {
+        tokio::select! {
+            frame = client.next() => match frame {
+                Some(Ok(Frame::Pong(_))) => continue,
+                other => break other,
+            },
+            () = tokio::time::sleep(Duration::from_millis(500)) => {
+                client.send(Frame::Ping(vec![1].into())).await.unwrap();
+            }
+        }
+    };
+    match closed {
+        Some(Ok(Frame::Close(Some(close)))) => assert_eq!(close.code, CloseCode::Away),
+        other => panic!("expected an idle close, got {other:?}"),
+    }
+    assert!(started.elapsed() >= Duration::from_millis(2900));
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // LFCP PINGs do.
+    let mut client = lfcp(server.addr).await;
+    for n in 0..5u8 {
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        client
+            .send(Frame::Binary(ping(n).encode().into()))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut client).await.body, Body::Pong([n; 8]));
+    }
+    server.stop().await;
+}

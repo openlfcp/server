@@ -19,8 +19,9 @@
 //! [`Limits::outbound_queue`] messages, and a session that finds it full
 //! must close the connection; a write that does not finish within
 //! [`Limits::write_timeout`] closes it too. A connection with no inbound
-//! message for [`Limits::idle_timeout`] (three READY heartbeat intervals,
-//! §37) is closed.
+//! LFCP message for [`Limits::idle_timeout`] (three READY heartbeat
+//! intervals, §37) is closed. Only LFCP messages (an LFCP `PING` included)
+//! count as liveness; WebSocket-level ping and pong frames do not.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -55,7 +56,7 @@ pub struct Limits {
     pub max_message_bytes: usize,
     /// Outbound messages that may wait for the socket.
     pub outbound_queue: usize,
-    /// Close a connection with no inbound message for this long.
+    /// Close a connection with no inbound LFCP message for this long.
     pub idle_timeout: Option<Duration>,
     /// Close a connection whose socket does not take a message this fast.
     pub write_timeout: Duration,
@@ -325,10 +326,17 @@ pub async fn serve<S: Session>(
         ..DecodeOptions::default()
     };
 
+    // Liveness: the deadline moves only when an LFCP message arrives.
+    let idle_deadline = || {
+        limits
+            .idle_timeout
+            .map(|idle| tokio::time::Instant::now() + idle)
+    };
+    let mut deadline = idle_deadline();
     loop {
         let next = async {
-            match limits.idle_timeout {
-                Some(idle) => tokio::time::timeout(idle, stream.next())
+            match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, stream.next())
                     .await
                     .map_err(|_| ()),
                 None => Ok(stream.next().await),
@@ -369,11 +377,13 @@ pub async fn serve<S: Session>(
             Frame::Binary(bytes) => Message::decode_frame(FrameKind::Binary, &bytes, &options),
             Frame::Text(text) => Message::decode_frame(FrameKind::Text, text.as_bytes(), &options),
             // Control frames: tungstenite answers pings and close itself.
+            // They are not LFCP liveness.
             Frame::Ping(_) | Frame::Pong(_) | Frame::Frame(_) => continue,
             Frame::Close(_) => break,
         };
         match decoded {
             Ok(message) => {
+                deadline = idle_deadline();
                 tracing::debug!(
                     conn = id,
                     message_type = message.body.message_type(),
