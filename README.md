@@ -19,8 +19,10 @@ dependency tree.
 - WebSocket transport (LFCP-047): framing, limits and shutdown.
 - Session (LFCP-048): HELLO / CHALLENGE / AUTH / READY, and
   RESOURCE_HOST, RESOURCE_OPEN and RESOURCE_CLOSE.
+- Control Coordinator (LFCP-049): CONTROL_PUT compare-and-swap,
+  CONTROL_HAVE / GET / BATCH, live Control pushes.
 
-Next: setup and admin HTTP (LFCP-046) and the Control Plane (LFCP-049).
+Next: setup and admin HTTP (LFCP-046) and the Data Plane (LFCP-050).
 
 ## Store
 
@@ -68,6 +70,7 @@ cargo run -- --config server.toml
 | `ws_path` | | `/v1/ws` | WebSocket path (WIRE-01 §30) |
 | `state_dir` | `--state-dir` | `state` | Local state: the server ID, later the database |
 | `max_message_bytes` | | `8388608` | Maximum LFCP message size (WIRE-01 §31, §37) |
+| `public_urls` | | `[]` | This server's WebSocket URLs: it coordinates the Resources whose Control Coordinator URL is one of them (WIRE-01 §21) |
 | `heartbeat_ms` | | `30000` | READY heartbeat (§37); a connection silent for three is closed. `0` disables, else 1000–3600000 |
 | `log_level` | `--log-level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 
@@ -146,8 +149,8 @@ After READY:
   coordinator.
 - `RESOURCE_CLOSE`: drops the session's subscription and answers `ACK`;
   stored data is untouched.
-- Control, Data, Key, Snapshot and presence messages: `NACK(PROTOCOL_UNSUPPORTED)`
-  until LFCP-049 onward.
+- Data, Key, Snapshot and presence messages: `NACK(PROTOCOL_UNSUPPORTED)`
+  until LFCP-050 onward.
 
 Authority: AUTH proves possession of the session key and nothing more. The
 hosting credential (in AUTH or RESOURCE_HOST) is server policy only
@@ -155,6 +158,48 @@ hosting credential (in AUTH or RESOURCE_HOST) is server policy only
 authenticated Principal host, with or without one. Neither a credential nor
 the hosting row ever grants a Resource ability: authority always comes from
 the Control Chain. Credentials and proofs are never logged.
+
+## Control Coordinator
+
+`CONTROL_PUT` (WIRE-01 §47) is accepted only where this server is the
+Resource's current Control Coordinator: the coordinator URL of the last
+Genesis or Route Update on the accepted chain must equal one of
+`public_urls` after normalization (scheme and host lower-cased, default
+port dropped, empty path as `/`; host names are not resolved, so list
+every name the server is reached by). Otherwise the answer is
+`NACK(NOT_CONTROL_COORDINATOR)` with the coordinator URL as details. With
+no `public_urls`, the server coordinates nothing.
+
+Then sdk-rs `propose_transition` checks the expected head, placement,
+signature and authority against the cached Control state at the head
+(one-time claims included), and the store commits the record and the new
+head in one SQLite transaction that re-checks the expected head. Puts for
+one Resource are serialized; the `ACK` (`request_type` 23, the record ID,
+`durable: true`) follows the commit.
+
+| Situation | Answer |
+| --- | --- |
+| expected head is not the current head | `NACK(CONTROL_HEAD_MISMATCH)`, details = the current head ID |
+| null expected head | does not decode: `ERROR(MALFORMED_MESSAGE)` |
+| Genesis | `NACK(MALFORMED_MESSAGE)` (use RESOURCE_HOST) |
+| sequence or previous record wrong, unknown core type | `NACK(INVALID_CONTROL_CHAIN)` |
+| signature | `NACK(INVALID_SIGNATURE)` |
+| issuer unknown to the chain | `NACK(MISSING_DEPENDENCY)` |
+| no authority, escalation, used-up claim, revoking a revoked grant | `NACK(AUTHORIZATION_FAILED)` |
+| Coordinator Recovery, Resource Tombstone (deferred) | `NACK(PROTOCOL_UNSUPPORTED)` |
+| the record is already on the chain | the same `ACK` again |
+
+A put that loses the compare-and-swap is not stored: it is a refused
+proposal, not fork evidence, and storing it would show clients a fork the
+coordinator prevented.
+
+After a commit the record goes, as a one-record `CONTROL_BATCH`, to every
+other session that opened the Resource with live Control pushes (flag bit
+1). A push never waits: a session whose queue is full is closed (1013)
+instead of silently missing records. `CONTROL_HAVE` and `CONTROL_GET` need
+the same read authority as `RESOURCE_OPEN`; `CONTROL_GET` returns every
+stored record in the range, competing ones included, split over several
+`CONTROL_BATCH` replies when the size limit requires.
 
 The server speaks plain HTTP and WebSocket. Clients use `wss://` except on
 loopback (WIRE-01 §16), so a deployment puts a TLS-terminating reverse

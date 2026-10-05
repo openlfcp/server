@@ -71,6 +71,7 @@ pub struct Options {
     pub identity: Option<Arc<dyn ServerIdentity>>,
     pub random: Arc<Script>,
     pub hosting: Option<Arc<dyn HostingPolicy>>,
+    pub public_urls: Vec<String>,
 }
 
 impl Default for Options {
@@ -79,6 +80,7 @@ impl Default for Options {
             identity: None,
             random: Arc::new(Script::default()),
             hosting: None,
+            public_urls: Vec::new(),
         }
     }
 }
@@ -114,6 +116,7 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         state_dir: state.to_owned(),
+        public_urls: options.public_urls,
         ..Config::default()
     };
     let identity: Arc<dyn ServerIdentity> = match options.identity {

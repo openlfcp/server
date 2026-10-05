@@ -1,5 +1,6 @@
-//! The LFCP session (WIRE-01 §34–§43, §64): the handshake, then Resource
-//! hosting and opening, on top of the [`crate::ws`] transport.
+//! The LFCP session (WIRE-01 §34–§47, §64): the handshake, Resource
+//! hosting and opening, and the Control Plane, on top of the [`crate::ws`]
+//! transport.
 //!
 //! | Step | Server behaviour | § |
 //! | --- | --- | --- |
@@ -11,6 +12,11 @@
 //! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature, ws/wss URLs), hosting policy, persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16 |
 //! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read`, or be an invitation subject, at the accepted Control Head, else `NACK(AUTHORIZATION_FAILED)`; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator | §41, §42, §84, §73 |
 //! | RESOURCE_CLOSE | drops the session's subscription only; `ACK` | §43 |
+//! | CONTROL_PUT | [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
+//! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows | §44 |
+//! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)` | §45, §46 |
+//! | CONTROL_BATCH from a client | `NACK(PROTOCOL_UNSUPPORTED)`: mirror seeding (§46) is not offered | §46 |
+//! | live Control pushes | after a commit, a one-record CONTROL_BATCH to every other session that opened the Resource with flag bit 1 | §41, §69 |
 //!
 //! Authority: a successful AUTH proves possession of the session
 //! Principal's key and nothing else (§36). The hosting credential and the
@@ -26,28 +32,28 @@
 //! Logs carry the connection number, message types, codes and public
 //! identifiers; never credentials, proofs or payloads.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use lfcp::base::{ControlRecordId, Error, PrincipalId, ResourceId, WireCode};
+use lfcp::base::{ControlRecordId, Error, Hash32, PrincipalId, ResourceId, WireCode};
+use lfcp::cbor::Value;
 use lfcp::principal::PrincipalDescriptor;
-use lfcp::wire::control::authority::{ability, validate_authorized, ControlState};
-use lfcp::wire::control::body::ControlBody;
+use lfcp::wire::control::authority::validate_authorized;
 use lfcp::wire::control::chain::ChainOutcome;
-use lfcp::wire::control::ControlRecord;
 use lfcp::wire::have::HaveVector;
 use lfcp::wire::message::{
-    AckBody, AuthBody, Body, ChallengeBody, ControlHead, ErrorBody, HelloBody, HostingCredential,
-    Message, ReadyBody, SnapshotSummary, WireActorHave,
+    AckBody, AuthBody, Body, ChallengeBody, ErrorBody, HelloBody, HostingCredential, Message,
+    ReadyBody, SnapshotSummary, WireActorHave,
 };
 use lfcp::wire::session::{select_wire_profile, verify_auth, WIRE_PROFILE};
 use lfcp::wire::snapshot::ReceivedSnapshot;
 use lfcp::wire::state::{server_accepts, ServerSession, ServerSessionEvent};
 
 use crate::config::Config;
+use crate::coordinator::{Chain, Coordinator, Failure};
 use crate::identity::ServerId;
 use crate::rng::{OsRandom, Random};
-use crate::store::{Head, Hosting, Store, StoreError, StoredControlRecord, DURABILITY};
+use crate::store::{Hosting, Store, StoreError, DURABILITY};
 use crate::ws::{ConnectionContext, Flow, Outbound, Session, SessionFactory};
 
 /// Server hosting policy (§36, §39): who may ask this server to host a
@@ -82,7 +88,7 @@ pub struct ReadyParams {
 /// The [`SessionFactory`] of LFCP sessions.
 #[derive(Clone)]
 pub struct Lfcp {
-    store: Arc<Store>,
+    coordinator: Arc<Coordinator>,
     random: Arc<dyn Random>,
     hosting: Arc<dyn HostingPolicy>,
     ready: ReadyParams,
@@ -93,7 +99,7 @@ impl Lfcp {
     /// operating-system randomness and [`OpenHosting`].
     pub fn new(store: Arc<Store>, config: &Config) -> Lfcp {
         Lfcp {
-            store,
+            coordinator: Arc::new(Coordinator::new(store, &config.public_urls)),
             random: Arc::new(OsRandom),
             hosting: Arc::new(OpenHosting),
             ready: ReadyParams {
@@ -321,7 +327,13 @@ impl LfcpSession {
             host,
             durability: DURABILITY,
         };
-        match self.shared.store.host_resource(genesis, hosting).await {
+        match self
+            .shared
+            .coordinator
+            .store()
+            .host_resource(genesis, hosting)
+            .await
+        {
             Ok(_) => {
                 tracing::info!(conn = self.conn, resource = %resource_id.to_hex(), "hosted");
                 self.send(
@@ -352,23 +364,15 @@ impl LfcpSession {
             return self.nack(out, request, WireCode::AuthorizationFailed);
         };
         let principal = *auth.principal.id();
-        let store = &self.shared.store;
-        let info = match store.resource(resource_id).await {
-            Ok(Some(info)) => info,
-            Ok(None) => return self.nack(out, request, WireCode::ResourceNotHosted),
+        let chain = match self.readable(request, resource_id, &principal, out).await {
+            Ok(chain) => chain,
+            Err(flow) => return flow,
+        };
+        let store = self.shared.coordinator.store();
+        let heads = match self.shared.coordinator.heads(resource_id).await {
+            Ok(heads) => heads,
             Err(error) => return self.internal(out, request, &error),
         };
-        let records = match store.control_records(resource_id, 0, u64::MAX).await {
-            Ok(records) => records,
-            Err(error) => return self.internal(out, request, &error),
-        };
-        let view = match ResourceView::build(&records, info.head) {
-            Ok(view) => view,
-            Err(error) => return self.nack_error(out, request, &error),
-        };
-        if !view.may_open(&principal) {
-            return self.nack(out, request, WireCode::AuthorizationFailed);
-        }
         let have = match store.data_sequences(resource_id).await {
             Ok(sequences) => have_of(&sequences),
             Err(error) => return self.internal(out, request, &error),
@@ -384,23 +388,24 @@ impl LfcpSession {
                 }),
             Err(error) => return self.internal(out, request, &error),
         };
-        self.subscriptions.insert(
-            resource_id,
-            Subscription {
-                flags: flags.unwrap_or(0),
-            },
-        );
+        let flags = flags.unwrap_or(0);
+        self.subscriptions
+            .insert(resource_id, Subscription { flags });
+        self.shared
+            .coordinator
+            .hub()
+            .subscribe(resource_id, self.conn, flags, out.clone());
         tracing::debug!(conn = self.conn, resource = %resource_id.to_hex(), "opened");
         self.send(
             out,
             Some(request),
             Body::ResourceOpened {
                 resource_id,
-                control_heads: view.heads,
+                control_heads: heads,
                 have,
                 snapshot,
-                route_version: Some(view.state.route_version),
-                coordinator: Some(view.coordinator),
+                route_version: Some(chain.state.route_version),
+                coordinator: Some(chain.coordinator),
             },
         )
     }
@@ -408,6 +413,10 @@ impl LfcpSession {
     fn on_close(&mut self, request: [u8; 16], resource_id: ResourceId, out: &Outbound) -> Flow {
         // §43: session state only; nothing persistent is touched.
         self.subscriptions.remove(&resource_id);
+        self.shared
+            .coordinator
+            .hub()
+            .unsubscribe(resource_id, self.conn);
         self.send(
             out,
             Some(request),
@@ -417,6 +426,158 @@ impl LfcpSession {
                 durable: None,
             }),
         )
+    }
+
+    /// The accepted chain of `resource`, if `principal` may read it (§84);
+    /// otherwise the NACK already sent.
+    async fn readable(
+        &self,
+        request: [u8; 16],
+        resource: ResourceId,
+        principal: &PrincipalId,
+        out: &Outbound,
+    ) -> Result<Chain, Flow> {
+        match self.shared.coordinator.chain(resource).await {
+            Ok(Some(chain)) if chain.may_read(principal) => Ok(chain),
+            Ok(Some(_)) => Err(self.nack(out, request, WireCode::AuthorizationFailed)),
+            Ok(None) => Err(self.nack(out, request, WireCode::ResourceNotHosted)),
+            Err(failure) => Err(self.nack_failure(out, request, failure)),
+        }
+    }
+
+    fn nack_failure(&self, out: &Outbound, request: [u8; 16], failure: Failure) -> Flow {
+        match failure {
+            Failure::NotHosted => self.nack(out, request, WireCode::ResourceNotHosted),
+            // §21: and the currently known coordinator URL.
+            Failure::NotCoordinator(url) => {
+                let mut body = code_body(WireCode::NotControlCoordinator);
+                body.details = Some(Value::text(url));
+                self.send(out, Some(request), Body::Nack(body))
+            }
+            // §47: Genesis uses RESOURCE_HOST.
+            Failure::Genesis => self.nack(out, request, WireCode::MalformedMessage),
+            Failure::Lfcp(error) => self.nack_error(out, request, &error),
+            Failure::Store(error) => self.internal(out, request, &error),
+        }
+    }
+
+    async fn on_control_put(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        expected: ControlRecordId,
+        record: Vec<u8>,
+        out: &Outbound,
+    ) -> Flow {
+        let committed = self
+            .shared
+            .coordinator
+            .put(
+                resource_id,
+                expected,
+                record,
+                self.conn,
+                &*self.shared.random,
+            )
+            .await;
+        match committed {
+            Ok(committed) => {
+                tracing::info!(
+                    conn = self.conn,
+                    resource = %resource_id.to_hex(),
+                    record = %committed.id.to_hex(),
+                    repeated = committed.repeated,
+                    "Control Record committed"
+                );
+                self.send(
+                    out,
+                    Some(request),
+                    Body::Ack(AckBody {
+                        request_type: 23,
+                        object_ids: Some(vec![Hash32::from_bytes(*committed.id.as_bytes())]),
+                        durable: Some(true),
+                    }),
+                )
+            }
+            Err(failure) => self.nack_failure(out, request, failure),
+        }
+    }
+
+    async fn on_control_have(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        out: &Outbound,
+    ) -> Flow {
+        let principal = self.principal();
+        if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
+            return flow;
+        }
+        match self.shared.coordinator.heads(resource_id).await {
+            Ok(control_heads) => self.send(
+                out,
+                Some(request),
+                Body::ControlHave {
+                    resource_id,
+                    control_heads,
+                },
+            ),
+            Err(error) => self.internal(out, request, &error),
+        }
+    }
+
+    /// CONTROL_GET (§45): every stored record in the range, competing ones
+    /// included, sorted by sequence then record ID (§46), in as many
+    /// CONTROL_BATCH replies as the message size limit needs.
+    async fn on_control_get(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        start: u64,
+        end: u64,
+        out: &Outbound,
+    ) -> Flow {
+        if end < start {
+            return self.nack(out, request, WireCode::MalformedMessage);
+        }
+        let principal = self.principal();
+        if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
+            return flow;
+        }
+        let records = match self
+            .shared
+            .coordinator
+            .store()
+            .control_records(resource_id, start, end)
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => return self.internal(out, request, &error),
+        };
+        let budget = usize::try_from(self.shared.ready.max_message_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(BATCH_OVERHEAD);
+        for batch in batches(records.into_iter().map(|r| r.bytes), budget) {
+            let flow = self.send(
+                out,
+                Some(request),
+                Body::ControlBatch {
+                    resource_id,
+                    records: batch,
+                },
+            );
+            if flow == Flow::Close {
+                return flow;
+            }
+        }
+        Flow::Continue
+    }
+
+    fn principal(&self) -> PrincipalId {
+        self.authenticated
+            .as_ref()
+            .map(|a| *a.principal.id())
+            .expect("Control messages pass server_accepts only after READY")
     }
 
     fn internal(&self, out: &Outbound, request: [u8; 16], error: &StoreError) -> Flow {
@@ -465,11 +626,28 @@ impl Session for LfcpSession {
                 resource_id, flags, ..
             } => self.on_open(id, resource_id, flags, out).await,
             Body::ResourceClose { resource_id } => self.on_close(id, resource_id, out),
+            Body::ControlPut {
+                resource_id,
+                expected_head,
+                record,
+            } => {
+                self.on_control_put(id, resource_id, expected_head, record, out)
+                    .await
+            }
+            Body::ControlHave { resource_id, .. } => {
+                self.on_control_have(id, resource_id, out).await
+            }
+            Body::ControlGet {
+                resource_id,
+                start,
+                end,
+            } => self.on_control_get(id, resource_id, start, end, out).await,
             // Server-to-client responses.
             Body::ResourceHosted { .. } | Body::ResourceOpened { .. } => {
                 self.nack(out, id, WireCode::MalformedMessage)
             }
-            // Control, Data, Key, Snapshot and presence: LFCP-049 onward.
+            // Data, Key, Snapshot, presence and client CONTROL_BATCH:
+            // LFCP-050 onward, or not offered.
             _ => self.nack(out, id, WireCode::ProtocolUnsupported),
         }
     }
@@ -493,7 +671,10 @@ impl Session for LfcpSession {
     fn closed(&mut self) {
         self.state = ServerSession::Closed;
         self.pending = None;
-        self.subscriptions.clear();
+        let hub = self.shared.coordinator.hub();
+        for (resource, _) in self.subscriptions.drain() {
+            hub.unsubscribe(resource, self.conn);
+        }
     }
 }
 
@@ -523,79 +704,26 @@ pub fn validate_genesis(genesis: &[u8]) -> Result<ResourceId, Error> {
     }
 }
 
-/// The server's view of a hosted Resource, from its stored Control Records.
-struct ResourceView {
-    /// The Control state at the accepted head.
-    state: ControlState,
-    /// Every Control Head the server knows: the accepted head and the tip
-    /// of each competing branch (§13.2, §42: a fork is never hidden).
-    heads: Vec<ControlHead>,
-    /// The current Control Coordinator URL.
-    coordinator: String,
-}
+/// Room for the envelope and the CONTROL_BATCH body around the records.
+const BATCH_OVERHEAD: usize = 1024;
 
-impl ResourceView {
-    fn build(records: &[StoredControlRecord], head: Head) -> Result<ResourceView, Error> {
-        let by_id: HashMap<ControlRecordId, &StoredControlRecord> =
-            records.iter().map(|r| (r.id, r)).collect();
-        // The accepted chain: from the head back to Genesis.
-        let mut path = Vec::new();
-        let mut next = Some(head.id);
-        while let Some(id) = next {
-            let record = by_id.get(&id).ok_or(Error::UnknownControlHead)?;
-            path.push(record.bytes.as_slice());
-            next = record.previous;
+/// Split `items` into batches whose total size (with a few bytes of CBOR
+/// framing each) stays within `budget`; an item is never split, and there
+/// is always at least one batch, possibly empty.
+fn batches(items: impl IntoIterator<Item = Vec<u8>>, budget: usize) -> Vec<Vec<Vec<u8>>> {
+    let mut batches = vec![Vec::new()];
+    let mut size = 0;
+    for item in items {
+        let cost = item.len() + 9;
+        let current = batches.last_mut().expect("never empty");
+        if !current.is_empty() && size + cost > budget {
+            batches.push(Vec::new());
+            size = 0;
         }
-        path.reverse();
-        // DV1: a chain with Coordinator Recovery or Tombstone is refused
-        // by the engine (PROTOCOL_UNSUPPORTED).
-        let (chain, states) = match validate_authorized(&path, None) {
-            Ok((ChainOutcome::Linear(chain), states)) => (chain, states),
-            Ok((ChainOutcome::Conflict(_), _)) => return Err(Error::ControlConflict),
-            Err(failure) => return Err(failure.error),
-        };
-        let state = states.last().cloned().ok_or(Error::UnknownControlHead)?;
-        let coordinator = coordinator_of(&chain.records).ok_or(Error::UnknownControlHead)?;
-
-        let predecessors: HashSet<ControlRecordId> =
-            records.iter().filter_map(|r| r.previous).collect();
-        let mut heads: Vec<ControlHead> = records
-            .iter()
-            .filter(|r| !predecessors.contains(&r.id))
-            .map(|r| ControlHead {
-                sequence: r.seq,
-                id: r.id,
-            })
-            .collect();
-        heads.sort_by(|a, b| (a.sequence, a.id.as_bytes()).cmp(&(b.sequence, b.id.as_bytes())));
-        Ok(ResourceView {
-            state,
-            heads,
-            coordinator,
-        })
+        size += cost;
+        batches.last_mut().expect("never empty").push(item);
     }
-
-    /// §84 read authorization at the accepted head: `data/read`, or the
-    /// subject of an invitation grant that still confers `invite/claim`
-    /// (§73: the Invitation Principal opens the Resource to claim).
-    fn may_open(&self, principal: &PrincipalId) -> bool {
-        self.state.holds(principal, ability::DATA_READ)
-            || self
-                .state
-                .grants()
-                .any(|g| &g.subject == principal && self.state.confers_invite(g))
-    }
-}
-
-/// The coordinator of the last Genesis, Route Update or Coordinator
-/// Recovery on the chain.
-fn coordinator_of(records: &[ControlRecord]) -> Option<String> {
-    records.iter().rev().find_map(|r| match r.body() {
-        ControlBody::Genesis(b) => Some(b.coordinator.clone()),
-        ControlBody::RouteUpdate(b) => Some(b.coordinator.clone()),
-        ControlBody::CoordinatorRecovery(b) => Some(b.coordinator.clone()),
-        _ => None,
-    })
+    batches
 }
 
 /// The canonical wire Have of stored (actor, sequence) pairs.
@@ -614,8 +742,8 @@ mod tests {
     use crate::ws::test_outbound;
     use lfcp::base::Hash32;
     use lfcp::principal::PrincipalKeys;
-    use lfcp::wire::control::body::{Endpoint, GenesisBody};
-    use lfcp::wire::control::ControlRecordHeader;
+    use lfcp::wire::control::body::{ControlBody, Endpoint, GenesisBody};
+    use lfcp::wire::control::{ControlRecord, ControlRecordHeader};
     use lfcp::wire::session::auth;
     use tokio::sync::mpsc;
 

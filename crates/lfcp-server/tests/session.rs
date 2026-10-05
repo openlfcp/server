@@ -55,6 +55,7 @@ fn vector_options(v: &Vectors) -> (Options, Arc<Script>) {
         ))),
         random: script.clone(),
         hosting: None,
+        public_urls: Vec::new(),
     };
     (options, script)
 }
@@ -584,10 +585,9 @@ async fn an_unknown_resource_is_not_hosted() {
     assert_eq!(nack.correlation_id, Some(id));
     // Not-yet-implemented planes are refused, and the session goes on.
     client
-        .request(Body::ControlGet {
+        .request(Body::DataHave {
             resource_id: v.resource(),
-            start: 0,
-            end: 0,
+            have: vec![],
         })
         .await;
     assert_eq!(code(&client.recv().await), PROTOCOL_UNSUPPORTED);
