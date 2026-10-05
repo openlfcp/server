@@ -1,17 +1,11 @@
-# Dependencies
-node_modules/
-
 # Build output
-dist/
-*.tsbuildinfo
+/target/
 
-# Test output
-coverage/
+# Local state of a development run (server ID, later the database)
+/state/
 
 # Logs
 *.log
-npm-debug.log*
-pnpm-debug.log*
 
 # Local environment and secrets
 .env

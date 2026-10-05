@@ -11,13 +11,36 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
         with:
-          node-version: 24
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm run build
-      - run: pnpm test
+          path: server
+      # sdk-rs is a path dependency (../sdk-rs) at the commit in sdk-rs.lock;
+      # the spec is read by tests (../spec) at the tag in spec.lock.
+      - id: locks
+        run: |
+          echo "sdk=$(jq -er .commit sdk-rs.lock)" >> "$GITHUB_OUTPUT"
+          echo "spec=$(jq -er .tag spec.lock)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: openlfcp/sdk-rs
+          ref: ${{ steps.locks.outputs.sdk }}
+          path: sdk-rs
+      # Full history with tags, so the tests can check that the tag still
+      # resolves to the commit in spec.lock.
+      - uses: actions/checkout@v4
+        with:
+          repository: openlfcp/spec
+          ref: refs/tags/${{ steps.locks.outputs.spec }}
+          path: spec
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Includes tests/dependency_policy.rs: no Automerge, no shared-objects.
+      - run: cargo test --workspace
