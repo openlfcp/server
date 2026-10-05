@@ -14,7 +14,7 @@ dependency tree.
 ## Scope
 
 The reference server implements the server side of the
-OpenLFCP MVP 0.1 subset of LFCP-WIRE-01 at `mvp-0.1-baseline.6`: one
+OpenLFCP MVP 0.1 subset of LFCP-WIRE-01 at `mvp-0.1-baseline.7`: one
 coordinator per Resource, one endpoint, no federation, mirror seeding or
 presence. See `.github: docs/release/deferred-wire-01-features.md` (in [openlfcp/.github](https://github.com/openlfcp/.github)). It does
 not claim full LFCP-WIRE-01 conformance.
@@ -430,7 +430,7 @@ warns when the `lfcp` crate has uncommitted changes. Move the lock
 deliberately when the server needs newer sdk-rs code. A git or tag
 dependency replaces this at a release milestone.
 
-`spec.lock` pins `openlfcp/spec` (`mvp-0.1-baseline.6`); tests read vectors
+`spec.lock` pins `openlfcp/spec` (`mvp-0.1-baseline.7`); tests read vectors
 from `../spec` (or `$LFCP_SPEC_DIR`) with `git show` at the locked commit.
 
 ## Build from a clean checkout

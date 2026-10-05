@@ -1125,9 +1125,9 @@ pub fn validate_genesis(genesis: &[u8]) -> Result<ResourceId, Error> {
 /// no more than 256; a longer one is `NACK(MALFORMED_MESSAGE)` (§62 code 2).
 pub const MAX_GET_RANGES: usize = 256;
 
-/// The most distinct Data Epochs a KEY_PACKAGE_GET may name. §52 sets no
-/// count; the server applies the §49 range limit, with the same
-/// `NACK(MALFORMED_MESSAGE)`.
+/// The most distinct Data Epochs a KEY_PACKAGE_GET may name: §52 allows
+/// no more than 256, and a server MAY refuse more with
+/// `NACK(MALFORMED_MESSAGE)`, as it does.
 pub const MAX_GET_EPOCHS: usize = 256;
 
 /// Each actor's ranges merged where they overlap or touch, actors in order
