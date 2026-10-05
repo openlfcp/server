@@ -406,3 +406,35 @@ async fn only_lfcp_messages_count_as_liveness() {
     }
     server.stop().await;
 }
+
+/// A session that aborts its own connection from outside the session
+/// path, as a live push does when it finds the queue full.
+#[derive(Clone, Default)]
+struct AbortOnMessage;
+
+impl Session for AbortOnMessage {
+    async fn handle(&mut self, _: Message, out: &Outbound) -> Flow {
+        let handle = out.clone();
+        tokio::spawn(async move { handle.abort() });
+        Flow::Continue
+    }
+}
+
+impl SessionFactory for AbortOnMessage {
+    type Session = AbortOnMessage;
+    fn open(&self, _: &ConnectionContext) -> AbortOnMessage {
+        AbortOnMessage
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_connection_is_closed_with_try_again_later() {
+    let server = start("abort", AbortOnMessage, 0).await;
+    let mut client = lfcp(server.addr).await;
+    client
+        .send(Frame::Binary(ping(6).encode().into()))
+        .await
+        .unwrap();
+    expect_close(&mut client, CloseCode::Again).await;
+    server.stop().await;
+}

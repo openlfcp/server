@@ -25,6 +25,8 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -35,7 +37,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use lfcp::base::Error;
 use lfcp::wire::message::{Body, DecodeOptions, ErrorBody, FrameKind, Message};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_tungstenite::tungstenite::error::{CapacityError, Error as WsError};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -106,18 +108,46 @@ pub enum Flow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Overloaded;
 
-/// A session's handle for sending messages on its connection.
+/// A handle for sending messages on a connection: the session's own, or a
+/// clone held elsewhere for live pushes.
 #[derive(Clone, Debug)]
 pub struct Outbound {
     queue: mpsc::Sender<Out>,
+    abort: Arc<Abort>,
+}
+
+#[derive(Debug, Default)]
+struct Abort {
+    requested: AtomicBool,
+    notify: Notify,
 }
 
 impl Outbound {
+    fn new(queue: mpsc::Sender<Out>) -> Outbound {
+        Outbound {
+            queue,
+            abort: Arc::default(),
+        }
+    }
+
     /// Queue a message without waiting.
     pub fn send(&self, message: Message) -> Result<(), Overloaded> {
         self.queue
             .try_send(Out::Lfcp(Box::new(message)))
             .map_err(|_| Overloaded)
+    }
+
+    /// Close the connection from outside its session, for example when a
+    /// live push finds its queue full: the transport closes it with 1013
+    /// (try again later) instead of silently dropping messages.
+    pub fn abort(&self) {
+        self.abort.requested.store(true, Ordering::SeqCst);
+        self.abort.notify.notify_one();
+    }
+
+    /// Whether [`Outbound::abort`] was called.
+    pub fn is_aborted(&self) -> bool {
+        self.abort.requested.load(Ordering::SeqCst)
     }
 }
 
@@ -131,7 +161,7 @@ pub(crate) enum Out {
 #[cfg(test)]
 pub(crate) fn test_outbound(capacity: usize) -> (Outbound, mpsc::Receiver<Out>) {
     let (queue, inbox) = mpsc::channel(capacity);
-    (Outbound { queue }, inbox)
+    (Outbound::new(queue), inbox)
 }
 
 #[cfg(test)]
@@ -340,9 +370,8 @@ pub async fn serve<S: Session>(
         // Flush and wait briefly for the peer's close.
         let _ = tokio::time::timeout(limits.close_timeout, sink.close()).await;
     });
-    let out = Outbound {
-        queue: queue.clone(),
-    };
+    let out = Outbound::new(queue.clone());
+    let abort = out.abort.clone();
     let close = |code: CloseCode, reason: &'static str| {
         let _ = queue.try_send(Out::Close(CloseFrame {
             code,
@@ -372,6 +401,11 @@ pub async fn serve<S: Session>(
         };
         let item = tokio::select! {
             item = next => item,
+            () = abort.notify.notified() => {
+                tracing::info!(conn = id, "aborted: too slow for live pushes");
+                close(CloseCode::Again, "too slow");
+                break;
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     close(CloseCode::Away, "server shutting down");
