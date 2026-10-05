@@ -89,3 +89,38 @@ impl Vectors {
         .unwrap()
     }
 }
+
+/// The published Control Chain, in order.
+pub const CHAIN: [&str; 11] = [
+    "C0_genesis",
+    "C1_grant_bob",
+    "C2_invite_grant",
+    "C3_invite_claim_carol",
+    "C4_owner_transfer_commit",
+    "C5_route_update",
+    "C6_key_epoch_1",
+    "C7_grant_carol_delegator",
+    "C8_grant_owner_delegated",
+    "C9_grant_invite_grandchild",
+    "C10_revoke_grandchild",
+];
+
+/// Host the published Resource in `store` and commit `CHAIN[1..=last]`.
+pub async fn host_chain(store: &lfcp_server::store::Store, v: &Vectors, last: usize) {
+    store
+        .host_resource(
+            v.cose(CHAIN[0]),
+            lfcp_server::store::Hosting {
+                host: *v.principal("owner").descriptor().id(),
+                durability: 2,
+            },
+        )
+        .await
+        .unwrap();
+    for i in 1..=last {
+        store
+            .commit_control_record(v.cose(CHAIN[i]), v.record_id(CHAIN[i - 1]))
+            .await
+            .unwrap();
+    }
+}

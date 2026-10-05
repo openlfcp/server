@@ -73,6 +73,7 @@ pub struct Options {
     pub hosting: Option<Arc<dyn HostingPolicy>>,
     pub public_urls: Vec<String>,
     pub ingest: Option<Arc<dyn lfcp_server::ingest::IngestPolicy>>,
+    pub max_message_bytes: Option<usize>,
 }
 
 impl Default for Options {
@@ -83,6 +84,7 @@ impl Default for Options {
             hosting: None,
             public_urls: Vec::new(),
             ingest: None,
+            max_message_bytes: None,
         }
     }
 }
@@ -119,6 +121,9 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         bind: "127.0.0.1:0".parse().unwrap(),
         state_dir: state.to_owned(),
         public_urls: options.public_urls,
+        max_message_bytes: options
+            .max_message_bytes
+            .unwrap_or(lfcp::wire::message::DEFAULT_MAX_MESSAGE_BYTES),
         ..Config::default()
     };
     let identity: Arc<dyn ServerIdentity> = match options.identity {
