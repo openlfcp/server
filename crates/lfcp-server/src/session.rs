@@ -979,7 +979,8 @@ impl Session for LfcpSession {
                 self.on_auth(id, auth, out)
             }
             // A handshake message out of order, or anything else before
-            // READY (baseline.4: MALFORMED_MESSAGE, close).
+            // READY (§64: MALFORMED_MESSAGE, close; a server never accepts
+            // CHALLENGE or READY from a client).
             Body::Hello(_) | Body::Challenge(_) | Body::Auth(_) | Body::Ready(_) => {
                 self.fatal(out, WireCode::MalformedMessage)
             }
