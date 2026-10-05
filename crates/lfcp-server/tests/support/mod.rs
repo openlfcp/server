@@ -5,3 +5,4 @@
 
 pub mod lfcp;
 pub mod spec;
+pub mod vectors;
