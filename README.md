@@ -392,7 +392,7 @@ warns when the `lfcp` crate has uncommitted changes. Move the lock
 deliberately when the server needs newer sdk-rs code. A git or tag
 dependency replaces this at a release milestone.
 
-`spec.lock` pins `openlfcp/spec` (`mvp-0.1-baseline.4`); tests read vectors
+`spec.lock` pins `openlfcp/spec` (`mvp-0.1-baseline.5`); tests read vectors
 from `../spec` (or `$LFCP_SPEC_DIR`) with `git show` at the locked commit.
 
 ## Build from a clean checkout
