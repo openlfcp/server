@@ -1,0 +1,11 @@
+# The build context is the parent of server/ and sdk-rs/: allow only the
+# Rust sources the image needs.
+*
+!server/Cargo.toml
+!server/Cargo.lock
+!server/crates
+!server/deploy/server.toml
+!sdk-rs/Cargo.toml
+!sdk-rs/crates
+**/target
+**/.git

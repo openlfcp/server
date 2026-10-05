@@ -1,0 +1,15 @@
+# lfcp-server configuration for the container (LFCP-055).
+#
+# Mounted at /etc/lfcp/server.toml by compose.yaml (also baked into the
+# image as the default). See README "Running" for every setting.
+
+# Inside the container; the TLS proxy reaches it on the compose network.
+bind = "0.0.0.0:7820"
+ws_path = "/v1/ws"
+# The persistent volume.
+state_dir = "/var/lib/lfcp"
+log_level = "info"
+# The wss:// URLs clients reach this server at, through the proxy. A
+# Resource whose Control Coordinator URL is one of them is coordinated
+# here (WIRE-01 §21). Set your host name for a real deployment.
+public_urls = ["wss://localhost/v1/ws"]

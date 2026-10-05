@@ -268,6 +268,62 @@ proxy in front (LFCP-055).
 92 unique crates in the normal dependency tree. No web framework, no ORM,
 no clap.
 
+## Docker
+
+`deploy/` holds a container setup (LFCP-055): the server image, a Compose
+file that puts [Caddy](https://caddyserver.com) in front for TLS (`wss://`,
+WIRE-01 §16), and a check script.
+
+On a machine with Docker (Compose v2) and git, starting from nothing:
+
+```sh
+mkdir openlfcp && cd openlfcp
+git clone https://github.com/openlfcp/server
+git clone https://github.com/openlfcp/sdk-rs
+git -C sdk-rs checkout "$(jq -r .commit server/sdk-rs.lock)"
+cd server
+docker compose -f deploy/compose.yaml up -d --build
+docker compose -f deploy/compose.yaml cp proxy:/data/caddy/pki/authorities/local/root.crt .
+curl --cacert root.crt https://localhost/health
+```
+
+- Image (`deploy/Dockerfile`): a multi-stage build. A `rust` image runs
+  `cargo build --release --locked`; the runtime is distroless
+  `cc-debian12:nonroot` (glibc, no shell or package manager), running as
+  uid 65532. The build context is the parent of `server/` and `sdk-rs/`,
+  and `Dockerfile.dockerignore` lets in only their Rust sources.
+- State: the `lfcp-state` volume at `/var/lib/lfcp` (server ID and SQLite
+  database). Recreating the containers keeps it; `down -v` destroys it,
+  which gives a new server.
+- Health: the image's `HEALTHCHECK` runs `lfcp-server --health-check`
+  against `/health`. The proxy starts once the server is healthy.
+- Configuration: `deploy/server.toml`, mounted read-only. Set
+  `public_urls` to the `wss://` URL clients use, so the server coordinates
+  the Resources that name it.
+- Endpoints: `https://<host>/health` and `wss://<host>/v1/ws` through the
+  proxy. The server's own port is not published.
+- TLS: by default (`LFCP_TLS=internal`) Caddy issues certificates from its
+  local CA, for development; clients must trust
+  `/data/caddy/pki/authorities/local/root.crt` from the proxy. For
+  production, set `LFCP_SITE` to the host name and `LFCP_TLS` to an email
+  address (a Let's Encrypt certificate, with ports 80 and 443 reachable),
+  or to the paths of your own certificate and key mounted into the proxy.
+  `LFCP_HTTPS_PORT` and `LFCP_HTTP_PORT` change the published ports.
+- No credentials are baked in or committed. First-run setup and admin
+  pairing (the admin HTTP API) are LFCP-046, not implemented yet; until
+  then any authenticated Principal may host a Resource (`OpenHosting`).
+
+`deploy/check.sh` builds the image and checks it end to end. It verifies:
+- the user is non-root and the container is healthy;
+- `/health` and a WebSocket upgrade selecting `lfcp-1` work through the
+  proxy;
+- a Resource populated over the protocol (as in
+  `tests/process_restart.rs`) survives recreating the containers on the
+  same volume;
+- after `down -v` the server is new and the Resource is gone.
+
+CI runs it in the `docker` job.
+
 ## sdk-rs and the spec
 
 sdk-rs is consumed from a sibling checkout, `../sdk-rs`, as a path

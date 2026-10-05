@@ -1,0 +1,6 @@
+# Overlay for deploy/check.sh only: publishes the server's port on
+# loopback so the Rust test client (plain ws://) can drive it directly.
+services:
+  lfcp-server:
+    ports:
+      - "127.0.0.1:${LFCP_CHECK_PORT:-17820}:7820"

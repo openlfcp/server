@@ -1,0 +1,17 @@
+# TLS termination for the LFCP WebSocket endpoint (WIRE-01 §16: wss://
+# except on loopback). Caddy proxies WebSocket upgrades, including the
+# lfcp-1 subprotocol header, unchanged.
+#
+# LFCP_SITE: the host name clients use (default localhost).
+# LFCP_TLS:
+#   internal          development: certificates from Caddy's own local CA
+#                     (trust /data/caddy/pki/authorities/local/root.crt);
+#   you@example.org   production: a publicly trusted certificate from
+#                     Let's Encrypt (ACME) for LFCP_SITE, which must resolve
+#                     here with ports 80 and 443 reachable;
+#   /certs/fullchain.pem /certs/privkey.pem
+#                     production with your own certificate (mount /certs).
+{$LFCP_SITE:localhost} {
+	tls {$LFCP_TLS:internal}
+	reverse_proxy lfcp-server:7820
+}
