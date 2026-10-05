@@ -15,8 +15,12 @@
 //! | CONTROL_PUT | [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
 //! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows | §44 |
 //! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)` | §45, §46 |
-//! | CONTROL_BATCH from a client | `NACK(PROTOCOL_UNSUPPORTED)`: mirror seeding (§46) is not offered | §46 |
-//! | live Control pushes | after a commit, a one-record CONTROL_BATCH to every other session that opened the Resource with flag bit 1 | §41, §69 |
+//! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57 |
+//! | an equivocating Data Unit | stored as evidence; `NACK(ACTOR_EQUIVOCATION)` | §26.2 |
+//! | DATA_HAVE | the client's Have must normalize; answered with the server's | §48 |
+//! | DATA_GET / KEY_PACKAGE_GET / SNAPSHOT_GET | read authority; Key Packages only to their recipient; size-limited batches; no stored Snapshot is `NACK(MISSING_DEPENDENCY)` | §49, §52, §55 |
+//! | CONTROL/DATA/KEY_PACKAGE_BATCH, SNAPSHOT from a client | `NACK(PROTOCOL_UNSUPPORTED)`: mirror seeding (§46) is not offered | §46 |
+//! | live pushes | a committed Control Record (flag bit 1) or newly accepted Data Units (bit 0) to every other subscribed session; after each Control commit, subscribers without read authority are dropped | §41, §69 |
 //!
 //! Authority: a successful AUTH proves possession of the session
 //! Principal's key and nothing else (§36). The hosting credential and the
@@ -32,7 +36,7 @@
 //! Logs carry the connection number, message types, codes and public
 //! identifiers; never credentials, proofs or payloads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lfcp::base::{ControlRecordId, Error, Hash32, PrincipalId, ResourceId, WireCode};
@@ -41,6 +45,7 @@ use lfcp::principal::PrincipalDescriptor;
 use lfcp::wire::control::authority::validate_authorized;
 use lfcp::wire::control::chain::ChainOutcome;
 use lfcp::wire::have::HaveVector;
+use lfcp::wire::message::DataRange;
 use lfcp::wire::message::{
     AckBody, AuthBody, Body, ChallengeBody, ErrorBody, HelloBody, HostingCredential, Message,
     ReadyBody, SnapshotSummary, WireActorHave,
@@ -52,8 +57,9 @@ use lfcp::wire::state::{server_accepts, ServerSession, ServerSessionEvent};
 use crate::config::Config;
 use crate::coordinator::{Chain, Coordinator, Failure};
 use crate::identity::ServerId;
+use crate::ingest::{self, IngestPolicy, ObjectKind, Unlimited};
 use crate::rng::{OsRandom, Random};
-use crate::store::{Hosting, Store, StoreError, DURABILITY};
+use crate::store::{Hosting, Put, Store, StoreError, StoredObject, DURABILITY};
 use crate::ws::{ConnectionContext, Flow, Outbound, Session, SessionFactory};
 
 /// Server hosting policy (§36, §39): who may ask this server to host a
@@ -89,6 +95,7 @@ pub struct ReadyParams {
 #[derive(Clone)]
 pub struct Lfcp {
     coordinator: Arc<Coordinator>,
+    ingest: Arc<dyn IngestPolicy>,
     random: Arc<dyn Random>,
     hosting: Arc<dyn HostingPolicy>,
     ready: ReadyParams,
@@ -100,6 +107,7 @@ impl Lfcp {
     pub fn new(store: Arc<Store>, config: &Config) -> Lfcp {
         Lfcp {
             coordinator: Arc::new(Coordinator::new(store, &config.public_urls)),
+            ingest: Arc::new(Unlimited),
             random: Arc::new(OsRandom),
             hosting: Arc::new(OpenHosting),
             ready: ReadyParams {
@@ -112,6 +120,12 @@ impl Lfcp {
     /// Use `random` for nonces, session IDs and message IDs.
     pub fn with_random(mut self, random: Arc<dyn Random>) -> Lfcp {
         self.random = random;
+        self
+    }
+
+    /// Use `ingest` for quotas and rate limits.
+    pub fn with_ingest(mut self, ingest: Arc<dyn IngestPolicy>) -> Lfcp {
+        self.ingest = ingest;
         self
     }
 
@@ -391,10 +405,13 @@ impl LfcpSession {
         let flags = flags.unwrap_or(0);
         self.subscriptions
             .insert(resource_id, Subscription { flags });
-        self.shared
-            .coordinator
-            .hub()
-            .subscribe(resource_id, self.conn, flags, out.clone());
+        self.shared.coordinator.hub().subscribe(
+            resource_id,
+            self.conn,
+            flags,
+            principal,
+            out.clone(),
+        );
         tracing::debug!(conn = self.conn, resource = %resource_id.to_hex(), "opened");
         self.send(
             out,
@@ -404,7 +421,7 @@ impl LfcpSession {
                 control_heads: heads,
                 have,
                 snapshot,
-                route_version: Some(chain.state.route_version),
+                route_version: Some(chain.state().route_version),
                 coordinator: Some(chain.coordinator),
             },
         )
@@ -554,20 +571,347 @@ impl LfcpSession {
             Ok(records) => records,
             Err(error) => return self.internal(out, request, &error),
         };
+        let records = records.into_iter().map(|r| r.bytes).collect();
+        self.reply_in_batches(out, request, records, |records| Body::ControlBatch {
+            resource_id,
+            records,
+        })
+    }
+
+    /// Validate every object first (nothing is stored if one fails), then
+    /// the ingest policy; returns the held Resource lock with the chain.
+    async fn admit<T>(
+        &self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        kind: ObjectKind,
+        objects: &[Vec<u8>],
+        validate: impl Fn(&Chain, ResourceId, &[u8]) -> Result<T, Error>,
+        out: &Outbound,
+    ) -> Result<(crate::coordinator::Locked, Vec<T>), Flow> {
+        let locked = match self.shared.coordinator.lock(resource_id).await {
+            Ok(locked) => locked,
+            Err(failure) => return Err(self.nack_failure(out, request, failure)),
+        };
+        let Some(chain) = locked.chain.as_ref() else {
+            return Err(self.nack(out, request, WireCode::ResourceNotHosted));
+        };
+        let mut valid = Vec::with_capacity(objects.len());
+        for bytes in objects {
+            match validate(chain, resource_id, bytes) {
+                Ok(object) => valid.push(object),
+                Err(error) => return Err(self.nack_error(out, request, &error)),
+            }
+        }
+        let size = objects.iter().map(Vec::len).sum();
+        if let Err(refusal) = self
+            .shared
+            .ingest
+            .admit(&resource_id, kind, objects.len(), size)
+        {
+            return Err(self.nack(out, request, refusal.code()));
+        }
+        Ok((locked, valid))
+    }
+
+    fn ack(&self, out: &Outbound, request: [u8; 16], request_type: u64, ids: Vec<Hash32>) -> Flow {
+        self.send(
+            out,
+            Some(request),
+            Body::Ack(AckBody {
+                request_type,
+                object_ids: Some(ids),
+                durable: Some(true),
+            }),
+        )
+    }
+
+    /// DATA_PUT (§51): every unit validated, then stored, then `ACK`
+    /// (type 33, every unit ID, durable). A unit that equivocates (another
+    /// signature-valid unit at its actor and sequence) is stored as
+    /// evidence and the request is answered `NACK(ACTOR_EQUIVOCATION)`
+    /// (§26.2: a server reports it). New, non-equivocating units are
+    /// pushed to live Data subscribers.
+    async fn on_data_put(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        units: Vec<Vec<u8>>,
+        out: &Outbound,
+    ) -> Flow {
+        let (locked, valid) = match self
+            .admit(
+                request,
+                resource_id,
+                ObjectKind::DataUnit,
+                &units,
+                ingest::data_unit,
+                out,
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(flow) => return flow,
+        };
+        let store = self.shared.coordinator.store();
+        let mut fresh = Vec::new();
+        let mut equivocated = false;
+        for (bytes, unit) in units.into_iter().zip(&valid) {
+            let put = match store.put_data_unit(bytes.clone()).await {
+                Ok(put) => put,
+                Err(error) => return self.internal(out, request, &error),
+            };
+            match store
+                .data_units_at(resource_id, unit.actor, unit.sequence)
+                .await
+            {
+                Ok(ids) if ids.len() > 1 => {
+                    tracing::warn!(
+                        conn = self.conn,
+                        actor = %unit.actor.to_hex(),
+                        seq = unit.sequence,
+                        "actor equivocation stored as evidence"
+                    );
+                    equivocated = true;
+                }
+                Ok(_) if put == Put::Inserted => fresh.push(bytes),
+                Ok(_) => {}
+                Err(error) => return self.internal(out, request, &error),
+            }
+        }
+        drop(locked);
+        self.shared.coordinator.hub().push_data(
+            resource_id,
+            self.conn,
+            &fresh,
+            &*self.shared.random,
+        );
+        if equivocated {
+            return self.nack(out, request, WireCode::ActorEquivocation);
+        }
+        let ids = valid
+            .iter()
+            .map(|u| Hash32::from_bytes(*u.id.as_bytes()))
+            .collect();
+        self.ack(out, request, 33, ids)
+    }
+
+    /// KEY_PACKAGE_PUT (§54): validated, stored, `ACK` (type 42).
+    async fn on_key_package_put(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        packages: Vec<Vec<u8>>,
+        out: &Outbound,
+    ) -> Flow {
+        let (_locked, ids) = match self
+            .admit(
+                request,
+                resource_id,
+                ObjectKind::KeyPackage,
+                &packages,
+                ingest::key_package,
+                out,
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(flow) => return flow,
+        };
+        let store = self.shared.coordinator.store();
+        for bytes in packages {
+            if let Err(error) = store.put_key_package(bytes).await {
+                return self.internal(out, request, &error);
+            }
+        }
+        self.ack(out, request, 42, ids)
+    }
+
+    /// SNAPSHOT_PUT (§57): validated, stored, `ACK` (type 52). The
+    /// Snapshot never becomes Control state.
+    async fn on_snapshot_put(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        snapshot: Vec<u8>,
+        out: &Outbound,
+    ) -> Flow {
+        let objects = [snapshot];
+        let (_locked, ids) = match self
+            .admit(
+                request,
+                resource_id,
+                ObjectKind::Snapshot,
+                &objects,
+                ingest::snapshot,
+                out,
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(flow) => return flow,
+        };
+        let [snapshot] = objects;
+        if let Err(error) = self.shared.coordinator.store().put_snapshot(snapshot).await {
+            return self.internal(out, request, &error);
+        }
+        self.ack(out, request, 52, ids)
+    }
+
+    /// DATA_HAVE (§48): the client's Have must normalize (a reversed
+    /// range or sequence 0 is malformed); answered with the server's.
+    async fn on_data_have(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        have: Vec<WireActorHave>,
+        out: &Outbound,
+    ) -> Flow {
+        if HaveVector::from_wire(&have).is_err() {
+            return self.nack(out, request, WireCode::MalformedMessage);
+        }
+        let principal = self.principal();
+        if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
+            return flow;
+        }
+        match self
+            .shared
+            .coordinator
+            .store()
+            .data_sequences(resource_id)
+            .await
+        {
+            Ok(sequences) => self.send(
+                out,
+                Some(request),
+                Body::DataHave {
+                    resource_id,
+                    have: have_of(&sequences),
+                },
+            ),
+            Err(error) => self.internal(out, request, &error),
+        }
+    }
+
+    /// DATA_GET (§49): every stored unit in the ranges, equivocating ones
+    /// included, in size-limited DATA_BATCH replies (§50).
+    async fn on_data_get(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        ranges: Vec<DataRange>,
+        out: &Outbound,
+    ) -> Flow {
+        if ranges.iter().any(|r| r.start == 0 || r.start > r.end) {
+            return self.nack(out, request, WireCode::MalformedMessage);
+        }
+        let principal = self.principal();
+        if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
+            return flow;
+        }
+        let store = self.shared.coordinator.store();
+        let mut units = Vec::new();
+        for range in ranges {
+            match store
+                .data_units_in(resource_id, range.principal, range.start, range.end)
+                .await
+            {
+                Ok(found) => units.extend(found),
+                Err(error) => return self.internal(out, request, &error),
+            }
+        }
+        let units = unique(units);
+        self.reply_in_batches(out, request, units, |units| Body::DataBatch {
+            resource_id,
+            units,
+        })
+    }
+
+    /// KEY_PACKAGE_GET (§52): every stored package for the requested
+    /// epochs, served only to their recipient.
+    async fn on_key_package_get(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        recipient: PrincipalId,
+        epochs: Vec<u64>,
+        out: &Outbound,
+    ) -> Flow {
+        let principal = self.principal();
+        if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
+            return flow;
+        }
+        if recipient != principal {
+            return self.nack(out, request, WireCode::AuthorizationFailed);
+        }
+        let store = self.shared.coordinator.store();
+        let mut packages = Vec::new();
+        for epoch in epochs {
+            match store.key_packages_for(resource_id, epoch, recipient).await {
+                Ok(found) => packages.extend(found),
+                Err(error) => return self.internal(out, request, &error),
+            }
+        }
+        let packages = unique(packages);
+        self.reply_in_batches(out, request, packages, |packages| Body::KeyPackageBatch {
+            resource_id,
+            packages,
+        })
+    }
+
+    /// SNAPSHOT_GET (§55): the named Snapshot of this Resource, or the
+    /// preferred latest one. None stored is `NACK(MISSING_DEPENDENCY)`.
+    async fn on_snapshot_get(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        snapshot_id: Option<Hash32>,
+        out: &Outbound,
+    ) -> Flow {
+        let principal = self.principal();
+        if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
+            return flow;
+        }
+        let store = self.shared.coordinator.store();
+        let found = match snapshot_id {
+            Some(id) => store.snapshot(id).await.map(|bytes| {
+                bytes.filter(|b| {
+                    ReceivedSnapshot::parse(b).is_ok_and(|s| s.header().resource_id == resource_id)
+                })
+            }),
+            None => store
+                .snapshots(resource_id)
+                .await
+                .map(|all| all.into_iter().next().map(|s| s.bytes)),
+        };
+        match found {
+            Ok(Some(snapshot)) => self.send(
+                out,
+                Some(request),
+                Body::Snapshot {
+                    resource_id,
+                    snapshot,
+                },
+            ),
+            Ok(None) => self.nack(out, request, WireCode::MissingDependency),
+            Err(error) => self.internal(out, request, &error),
+        }
+    }
+
+    /// Send `objects` as correlated batches within the message size limit.
+    fn reply_in_batches(
+        &self,
+        out: &Outbound,
+        request: [u8; 16],
+        objects: Vec<Vec<u8>>,
+        body: impl Fn(Vec<Vec<u8>>) -> Body,
+    ) -> Flow {
         let budget = usize::try_from(self.shared.ready.max_message_bytes)
             .unwrap_or(usize::MAX)
             .saturating_sub(BATCH_OVERHEAD);
-        for batch in batches(records.into_iter().map(|r| r.bytes), budget) {
-            let flow = self.send(
-                out,
-                Some(request),
-                Body::ControlBatch {
-                    resource_id,
-                    records: batch,
-                },
-            );
-            if flow == Flow::Close {
-                return flow;
+        for batch in batches(objects, budget) {
+            if self.send(out, Some(request), body(batch)) == Flow::Close {
+                return Flow::Close;
             }
         }
         Flow::Continue
@@ -642,12 +986,48 @@ impl Session for LfcpSession {
                 start,
                 end,
             } => self.on_control_get(id, resource_id, start, end, out).await,
+            Body::DataPut { resource_id, units } => {
+                self.on_data_put(id, resource_id, units, out).await
+            }
+            Body::DataHave { resource_id, have } => {
+                self.on_data_have(id, resource_id, have, out).await
+            }
+            Body::DataGet {
+                resource_id,
+                ranges,
+            } => self.on_data_get(id, resource_id, ranges, out).await,
+            Body::KeyPackagePut {
+                resource_id,
+                packages,
+            } => {
+                self.on_key_package_put(id, resource_id, packages, out)
+                    .await
+            }
+            Body::KeyPackageGet {
+                resource_id,
+                recipient,
+                epochs,
+            } => {
+                self.on_key_package_get(id, resource_id, recipient, epochs, out)
+                    .await
+            }
+            Body::SnapshotPut {
+                resource_id,
+                snapshot,
+            } => self.on_snapshot_put(id, resource_id, snapshot, out).await,
+            Body::SnapshotGet {
+                resource_id,
+                snapshot_id,
+            } => {
+                self.on_snapshot_get(id, resource_id, snapshot_id, out)
+                    .await
+            }
             // Server-to-client responses.
             Body::ResourceHosted { .. } | Body::ResourceOpened { .. } => {
                 self.nack(out, id, WireCode::MalformedMessage)
             }
-            // Data, Key, Snapshot, presence and client CONTROL_BATCH:
-            // LFCP-050 onward, or not offered.
+            // Mirror seeding (client CONTROL/DATA/KEY_PACKAGE_BATCH and
+            // SNAPSHOT, §46) and presence (§58) are not offered.
             _ => self.nack(out, id, WireCode::ProtocolUnsupported),
         }
     }
@@ -724,6 +1104,16 @@ fn batches(items: impl IntoIterator<Item = Vec<u8>>, budget: usize) -> Vec<Vec<V
         batches.last_mut().expect("never empty").push(item);
     }
     batches
+}
+
+/// The objects' bytes, each object once, in order.
+fn unique(objects: Vec<StoredObject>) -> Vec<Vec<u8>> {
+    let mut seen = HashSet::new();
+    objects
+        .into_iter()
+        .filter(|o| seen.insert(o.id))
+        .map(|o| o.bytes)
+        .collect()
 }
 
 /// The canonical wire Have of stored (actor, sequence) pairs.

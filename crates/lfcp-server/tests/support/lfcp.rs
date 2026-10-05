@@ -72,6 +72,7 @@ pub struct Options {
     pub random: Arc<Script>,
     pub hosting: Option<Arc<dyn HostingPolicy>>,
     pub public_urls: Vec<String>,
+    pub ingest: Option<Arc<dyn lfcp_server::ingest::IngestPolicy>>,
 }
 
 impl Default for Options {
@@ -81,6 +82,7 @@ impl Default for Options {
             random: Arc::new(Script::default()),
             hosting: None,
             public_urls: Vec::new(),
+            ingest: None,
         }
     }
 }
@@ -132,6 +134,9 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
     let mut sessions = Lfcp::new(store.clone(), &config).with_random(options.random);
     if let Some(hosting) = options.hosting {
         sessions = sessions.with_hosting(hosting);
+    }
+    if let Some(ingest) = options.ingest {
+        sessions = sessions.with_ingest(ingest);
     }
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(server.run(sessions, async {

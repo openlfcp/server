@@ -56,6 +56,7 @@ fn vector_options(v: &Vectors) -> (Options, Arc<Script>) {
         random: script.clone(),
         hosting: None,
         public_urls: Vec::new(),
+        ingest: None,
     };
     (options, script)
 }
@@ -583,11 +584,11 @@ async fn an_unknown_resource_is_not_hosted() {
     let nack = client.recv().await;
     assert_eq!(code(&nack), RESOURCE_NOT_HOSTED);
     assert_eq!(nack.correlation_id, Some(id));
-    // Not-yet-implemented planes are refused, and the session goes on.
+    // Presence is not offered; the session goes on.
     client
-        .request(Body::DataHave {
+        .request(Body::PresenceLeave {
             resource_id: v.resource(),
-            have: vec![],
+            principal: *v.principal("owner").descriptor().id(),
         })
         .await;
     assert_eq!(code(&client.recv().await), PROTOCOL_UNSUPPORTED);

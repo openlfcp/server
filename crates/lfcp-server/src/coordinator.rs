@@ -47,6 +47,9 @@ use crate::rng::Random;
 use crate::store::{CasOutcome, Store, StoreError, StoredControlRecord};
 use crate::ws::Outbound;
 
+/// The RESOURCE_OPEN flag for live Data Plane pushes (§41, bit 0).
+pub const LIVE_DATA: u64 = 1;
+
 /// The RESOURCE_OPEN flag for live Control Plane pushes (§41, bit 1).
 pub const LIVE_CONTROL: u64 = 1 << 1;
 
@@ -103,8 +106,9 @@ pub fn normalize_url(url: &str) -> Option<String> {
 /// The accepted Control Chain of a hosted Resource, at the stored head.
 #[derive(Clone, Debug)]
 pub struct Chain {
-    /// The Control state at the accepted head.
-    pub state: ControlState,
+    /// The Control state after every accepted record, Genesis first: the
+    /// sdk-rs ingest policies evaluate objects at their referenced head.
+    history: Vec<ControlState>,
     /// The current Control Coordinator URL.
     pub coordinator: String,
     accepted: HashSet<ControlRecordId>,
@@ -130,21 +134,43 @@ impl Chain {
             Ok((ChainOutcome::Conflict(_), _)) => return Err(Error::ControlConflict),
             Err(failure) => return Err(failure.error),
         };
-        let state = states.last().cloned().ok_or(Error::UnknownControlHead)?;
+        if states.is_empty() {
+            return Err(Error::UnknownControlHead);
+        }
         let coordinator = coordinator_of(&chain.records).ok_or(Error::UnknownControlHead)?;
         Ok(Chain {
-            state,
+            history: states,
             coordinator,
             accepted: chain.records.iter().map(ControlRecord::id).collect(),
         })
     }
 
+    /// The Control state at the accepted head.
+    pub fn state(&self) -> &ControlState {
+        self.history.last().expect("a chain has at least Genesis")
+    }
+
+    /// The state after every accepted record.
+    pub fn history(&self) -> &[ControlState] {
+        &self.history
+    }
+
     /// The accepted head.
     pub fn head(&self) -> ControlHead {
+        let head = self.state().head;
         ControlHead {
-            sequence: self.state.head.sequence,
-            id: self.state.head.id,
+            sequence: head.sequence,
+            id: head.id,
         }
+    }
+
+    /// The descriptor of a Principal the chain names, else
+    /// `MISSING_DEPENDENCY` (§13.1).
+    pub fn principal(
+        &self,
+        id: &PrincipalId,
+    ) -> Result<&lfcp::principal::PrincipalDescriptor, Error> {
+        self.state().principal(id).ok_or(Error::IssuerUnknown(*id))
     }
 
     /// Whether `record` is on the accepted chain.
@@ -156,11 +182,11 @@ impl Chain {
     /// subject of an invitation grant that still confers `invite/claim`
     /// (§73: the Invitation Principal opens the Resource to claim).
     pub fn may_read(&self, principal: &PrincipalId) -> bool {
-        self.state.holds(principal, ability::DATA_READ)
-            || self
-                .state
+        let state = self.state();
+        state.holds(principal, ability::DATA_READ)
+            || state
                 .grants()
-                .any(|g| &g.subject == principal && self.state.confers_invite(g))
+                .any(|g| &g.subject == principal && state.confers_invite(g))
     }
 }
 
@@ -208,6 +234,13 @@ pub struct Committed {
     pub id: ControlRecordId,
     /// Whether the record was already on the chain (a repeated put).
     pub repeated: bool,
+}
+
+/// A held Resource lock ([`Coordinator::lock`]).
+pub struct Locked {
+    _guard: tokio::sync::OwnedMutexGuard<Option<Chain>>,
+    /// The accepted chain, if the Resource is hosted.
+    pub chain: Option<Chain>,
 }
 
 /// One Resource's cached chain; its lock serializes the Resource's puts.
@@ -269,13 +302,26 @@ impl Coordinator {
         let Some(head) = self.store.head(resource).await? else {
             return Ok(None);
         };
-        if let Some(chain) = cached.as_ref().filter(|c| c.state.head.id == head.id) {
+        if let Some(chain) = cached.as_ref().filter(|c| c.state().head.id == head.id) {
             return Ok(Some(chain.clone()));
         }
         let records = self.store.control_records(resource, 0, head.seq).await?;
         let chain = Chain::build(&records, head.id).map_err(Failure::Lfcp)?;
         *cached = Some(chain.clone());
         Ok(Some(chain))
+    }
+
+    /// Take `resource`'s lock and its accepted chain (`None` if not
+    /// hosted). Control commits and object ingest for the Resource wait
+    /// while it is held, so an object is never validated against a head
+    /// that a concurrent commit (a Key Epoch, a Revoke) has superseded.
+    pub async fn lock(&self, resource: ResourceId) -> Result<Locked, Failure> {
+        let mut guard = self.slot(resource).lock_owned().await;
+        let chain = self.load(&mut guard, resource).await?;
+        Ok(Locked {
+            _guard: guard,
+            chain,
+        })
     }
 
     /// The accepted chain of a hosted Resource.
@@ -330,7 +376,7 @@ impl Coordinator {
         if chain.contains(&id) {
             return Ok(Committed { id, repeated: true });
         }
-        let next = propose_transition(&chain.state, expected, &record).map_err(Failure::Lfcp)?;
+        let next = propose_transition(chain.state(), expected, &record).map_err(Failure::Lfcp)?;
         match self
             .store
             .commit_control_record(record.clone(), expected)
@@ -338,12 +384,15 @@ impl Coordinator {
         {
             CasOutcome::Committed(_) => {
                 let mut chain = chain;
-                chain.state = next;
+                chain.history.push(next);
                 chain.accepted.insert(id);
                 // Verified by propose_transition above.
                 if let Some(url) = coordinator_in(parsed.body()) {
                     chain.coordinator = url;
                 }
+                // Stop pushing to subscribers that just lost read
+                // authority, then push the record to the others.
+                self.hub.revalidate(resource, &chain);
                 *cached = Some(chain);
                 self.hub.push_control(resource, origin, &record, random);
                 Ok(Committed {
@@ -369,24 +418,49 @@ impl Coordinator {
     }
 }
 
-/// Per Resource, per connection: the RESOURCE_OPEN flags and outbound
-/// handle.
-type Subscribers = HashMap<ResourceId, HashMap<u64, (u64, Outbound)>>;
+/// A session subscribed to a Resource's live pushes.
+struct Subscriber {
+    flags: u64,
+    principal: PrincipalId,
+    out: Outbound,
+}
+
+/// Per Resource, per connection.
+type Subscribers = HashMap<ResourceId, HashMap<u64, Subscriber>>;
 
 /// Live-push subscriptions: per Resource, the connections that opened it
-/// with their RESOURCE_OPEN flags and outbound handles (§41, §69).
+/// with their RESOURCE_OPEN flags, session Principal and outbound handle
+/// (§41, §69).
+///
+/// Revalidation: after every committed Control Record the subscribers'
+/// read authority is checked again at the new head; a subscriber that lost
+/// it is dropped silently. §43 has no server-initiated close, so its
+/// session stays open and its next request for the Resource is refused
+/// with `AUTHORIZATION_FAILED`.
 #[derive(Default)]
 pub struct Hub {
     subscribers: Mutex<Subscribers>,
 }
 
 impl Hub {
-    /// Connection `conn` opened `resource` with `flags`.
-    pub fn subscribe(&self, resource: ResourceId, conn: u64, flags: u64, out: Outbound) {
-        self.lock()
-            .entry(resource)
-            .or_default()
-            .insert(conn, (flags, out));
+    /// Connection `conn`, authenticated as `principal`, opened `resource`
+    /// with `flags`.
+    pub fn subscribe(
+        &self,
+        resource: ResourceId,
+        conn: u64,
+        flags: u64,
+        principal: PrincipalId,
+        out: Outbound,
+    ) {
+        self.lock().entry(resource).or_default().insert(
+            conn,
+            Subscriber {
+                flags,
+                principal,
+                out,
+            },
+        );
     }
 
     /// Connection `conn` closed `resource`, or the connection ended.
@@ -400,15 +474,39 @@ impl Hub {
         }
     }
 
+    /// Whether connection `conn` receives pushes for `resource`.
+    pub fn is_subscribed(&self, resource: ResourceId, conn: u64) -> bool {
+        self.lock()
+            .get(&resource)
+            .is_some_and(|by_conn| by_conn.contains_key(&conn))
+    }
+
     /// The number of connections subscribed to `resource`.
     pub fn subscribers(&self, resource: ResourceId) -> usize {
         self.lock().get(&resource).map_or(0, HashMap::len)
     }
 
-    /// Push a committed Control Record as a one-record CONTROL_BATCH to
-    /// every live Control subscriber of `resource` except `origin`. Never
-    /// waits: a subscriber whose queue is full is aborted (closed) and
-    /// removed rather than skipped silently. Returns the number of pushes.
+    /// Drop the subscribers of `resource` that no longer have read
+    /// authority in `chain`. Returns their connections.
+    pub fn revalidate(&self, resource: ResourceId, chain: &Chain) -> Vec<u64> {
+        let mut subscribers = self.lock();
+        let Some(by_conn) = subscribers.get_mut(&resource) else {
+            return Vec::new();
+        };
+        let lost: Vec<u64> = by_conn
+            .iter()
+            .filter(|(_, s)| !chain.may_read(&s.principal))
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in &lost {
+            tracing::info!(conn, "read authority lost; live pushes stop");
+            by_conn.remove(conn);
+        }
+        lost
+    }
+
+    /// Push a committed Control Record as a one-record CONTROL_BATCH to the
+    /// live Control subscribers (flag bit 1) of `resource` except `origin`.
     pub fn push_control(
         &self,
         resource: ResourceId,
@@ -416,31 +514,61 @@ impl Hub {
         record: &[u8],
         random: &dyn Random,
     ) -> usize {
+        self.push(resource, origin, LIVE_CONTROL, random, || {
+            Body::ControlBatch {
+                resource_id: resource,
+                records: vec![record.to_vec()],
+            }
+        })
+    }
+
+    /// Push accepted Data Units as one DATA_BATCH to the live Data
+    /// subscribers (flag bit 0) of `resource` except `origin` (§50, §69).
+    pub fn push_data(
+        &self,
+        resource: ResourceId,
+        origin: u64,
+        units: &[Vec<u8>],
+        random: &dyn Random,
+    ) -> usize {
+        if units.is_empty() {
+            return 0;
+        }
+        self.push(resource, origin, LIVE_DATA, random, || Body::DataBatch {
+            resource_id: resource,
+            units: units.to_vec(),
+        })
+    }
+
+    /// Never waits: a subscriber whose queue is full is aborted (closed)
+    /// and removed rather than skipped silently. Returns the number of
+    /// pushes.
+    fn push(
+        &self,
+        resource: ResourceId,
+        origin: u64,
+        flag: u64,
+        random: &dyn Random,
+        body: impl Fn() -> Body,
+    ) -> usize {
         let mut subscribers = self.lock();
         let Some(by_conn) = subscribers.get_mut(&resource) else {
             return 0;
         };
         let mut pushed = 0;
         let mut dropped = Vec::new();
-        for (&conn, (flags, out)) in by_conn.iter() {
-            if conn == origin || flags & LIVE_CONTROL == 0 {
+        for (&conn, subscriber) in by_conn.iter() {
+            if conn == origin || subscriber.flags & flag == 0 {
                 continue;
             }
             let Ok(id) = random.nonce16() else {
                 continue;
             };
-            let message = Message::new(
-                id,
-                Body::ControlBatch {
-                    resource_id: resource,
-                    records: vec![record.to_vec()],
-                },
-            );
-            match out.send(message) {
+            match subscriber.out.send(Message::new(id, body())) {
                 Ok(()) => pushed += 1,
                 Err(_) => {
                     tracing::info!(conn, "live push overflow; closing the subscriber");
-                    out.abort();
+                    subscriber.out.abort();
                     dropped.push(conn);
                 }
             }
@@ -511,10 +639,11 @@ mod tests {
         let (fast, mut fast_inbox) = test_outbound(8);
         let (origin, mut origin_inbox) = test_outbound(8);
         let (quiet, mut quiet_inbox) = test_outbound(8);
-        hub.subscribe(resource, 1, LIVE_CONTROL, slow.clone());
-        hub.subscribe(resource, 2, LIVE_CONTROL | 1, fast);
-        hub.subscribe(resource, 3, LIVE_CONTROL, origin);
-        hub.subscribe(resource, 4, 1, quiet);
+        let p = PrincipalId::from_bytes([2; 32]);
+        hub.subscribe(resource, 1, LIVE_CONTROL, p, slow.clone());
+        hub.subscribe(resource, 2, LIVE_CONTROL | LIVE_DATA, p, fast);
+        hub.subscribe(resource, 3, LIVE_CONTROL, p, origin);
+        hub.subscribe(resource, 4, LIVE_DATA, p, quiet);
 
         assert_eq!(hub.push_control(resource, 3, b"r1", &OsRandom), 2);
         assert!(!slow.is_aborted());

@@ -78,4 +78,14 @@ impl Vectors {
         let name = self.case(id)["expected"]["error"]["code"].as_str()?;
         (1..=22).find(|&n| lfcp::base::WireCode::from_number(n).unwrap().name() == name)
     }
+
+    /// A resource fixture's bytes, such as `dek0`.
+    pub fn resource_fixture(&self, name: &str) -> Vec<u8> {
+        lfcp::base::from_hex(
+            self.0["fixtures"]["resource"][name]["hex"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    }
 }

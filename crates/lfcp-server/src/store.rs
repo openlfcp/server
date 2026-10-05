@@ -517,6 +517,36 @@ impl Store {
         .await
     }
 
+    /// The stored Data Units of `actor` with sequence in `start..=end`, by
+    /// sequence then unit ID: equivocating units appear side by side
+    /// (WIRE-01 §49, §26.2).
+    pub async fn data_units_in(
+        &self,
+        resource: ResourceId,
+        actor: PrincipalId,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<StoredObject>, StoreError> {
+        let (start, end) = (i64_of(start)?, i64_of(end.min(i64::MAX as u64))?);
+        self.call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT unit_id, bytes FROM data_units
+                 WHERE resource_id = ?1 AND actor = ?2 AND seq BETWEEN ?3 AND ?4 ORDER BY seq, unit_id",
+            )?;
+            let rows = stmt.query_map(
+                params![resource.as_bytes().as_slice(), actor.as_bytes().as_slice(), start, end],
+                |row| {
+                    Ok(StoredObject {
+                        id: id32(row.get(0)?),
+                        bytes: row.get(1)?,
+                    })
+                },
+            )?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
     /// Every stored (actor, sequence) of a Resource's Data Units, in
     /// order, each once: the server's Have (WIRE-01 §28, §42).
     pub async fn data_sequences(

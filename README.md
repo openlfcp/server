@@ -21,8 +21,10 @@ dependency tree.
   RESOURCE_HOST, RESOURCE_OPEN and RESOURCE_CLOSE.
 - Control Coordinator (LFCP-049): CONTROL_PUT compare-and-swap,
   CONTROL_HAVE / GET / BATCH, live Control pushes.
+- Ingest (LFCP-050): Data Units, Key Packages and Snapshots validated
+  with sdk-rs and served to readers; live Data pushes.
 
-Next: setup and admin HTTP (LFCP-046) and the Data Plane (LFCP-050).
+Next: setup and admin HTTP (LFCP-046) and equivocation policy (LFCP-052).
 
 ## Store
 
@@ -149,8 +151,8 @@ After READY:
   coordinator.
 - `RESOURCE_CLOSE`: drops the session's subscription and answers `ACK`;
   stored data is untouched.
-- Data, Key, Snapshot and presence messages: `NACK(PROTOCOL_UNSUPPORTED)`
-  until LFCP-050 onward.
+- Presence and mirror seeding (client `CONTROL_BATCH`, `DATA_BATCH`,
+  `KEY_PACKAGE_BATCH`, `SNAPSHOT`): `NACK(PROTOCOL_UNSUPPORTED)`.
 
 Authority: AUTH proves possession of the session key and nothing more. The
 hosting credential (in AUTH or RESOURCE_HOST) is server policy only
@@ -200,6 +202,43 @@ instead of silently missing records. `CONTROL_HAVE` and `CONTROL_GET` need
 the same read authority as `RESOURCE_OPEN`; `CONTROL_GET` returns every
 stored record in the range, competing ones included, split over several
 `CONTROL_BATCH` replies when the size limit requires.
+
+## Ingest
+
+`DATA_PUT`, `KEY_PACKAGE_PUT` and `SNAPSHOT_PUT` objects are validated
+with sdk-rs against the Resource's accepted Control Chain (`ingest`), all
+of a put before any is stored: one invalid object refuses the put. The
+server never decrypts and never holds a DEK.
+
+| Check | Failure |
+| --- | --- |
+| canonical COSE, closed payload, the request's Resource ID, sequence ≥ 1 | `MALFORMED_MESSAGE` |
+| signer (actor, sender, publisher) unknown to the chain; referenced head not on it; epoch unknown there | `MISSING_DEPENDENCY` |
+| `kid` = signer, strict Ed25519 | `INVALID_SIGNATURE` |
+| Data Unit: `data/write` at its referenced head (an older head is fine) | `AUTHORIZATION_FAILED` |
+| Data Unit: a closed epoch beyond the actor's cutoff (latest state) | `STALE_DATA_EPOCH` |
+| Key Package: sender `key/distribute`, recipient `data/read` or an invitation subject, at its head | `AUTHORIZATION_FAILED` |
+| Snapshot: `snapshot/publish` at its head; a closed epoch's frontier beyond the cutoff | `AUTHORIZATION_FAILED`, `STALE_DATA_EPOCH` |
+| `ingest::IngestPolicy` (quotas, rate limits; unlimited by default) | `QUOTA_EXCEEDED`, `RATE_LIMITED` |
+
+AEAD failures, an HPKE package sealed to someone else and actor hash chain
+gaps are detectable only by clients and are accepted. A Data Unit that
+equivocates (another signature-valid unit at its actor and sequence) is
+stored as evidence and the put is answered `NACK(ACTOR_EQUIVOCATION)`.
+Otherwise the `ACK` (`request_type` 33, 42 or 52, every object ID,
+`durable: true`) follows the commit; repeated puts get the same `ACK`.
+
+Ingest for a Resource holds its coordinator lock, so an object is never
+validated against a head that a concurrent Key Epoch or Revoke has
+superseded.
+
+Reads (`DATA_HAVE`, `DATA_GET`, `KEY_PACKAGE_GET`, `SNAPSHOT_GET`) need
+read authority at the accepted head; Key Packages go only to their
+recipient. Newly accepted Data Units go as a `DATA_BATCH` to other
+sessions that opened the Resource with live Data pushes (flag bit 0).
+After every Control commit, subscribers that lost read authority are
+dropped from live pushes; their session stays open and its next request
+for the Resource gets `AUTHORIZATION_FAILED`.
 
 The server speaks plain HTTP and WebSocket. Clients use `wss://` except on
 loopback (WIRE-01 §16), so a deployment puts a TLS-terminating reverse
