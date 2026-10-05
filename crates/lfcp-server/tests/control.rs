@@ -366,8 +366,23 @@ async fn invalid_records_are_refused_with_their_codes() {
         .await;
     assert_eq!(code(&client.recv().await), INVALID_CONTROL_CHAIN);
 
+    // §20: a Route Update that does not advance the route version
+    // (baseline.4: AUTHORIZATION_FAILED).
+    commit_through(&v, &mut client, 4).await;
+    client
+        .request(put(
+            &v,
+            v.record_id("C4_owner_transfer_commit"),
+            v.negative("route_version_not_increasing_C5"),
+        ))
+        .await;
+    assert_eq!(
+        Some(code(&client.recv().await)),
+        v.expected_code("route_version_not_increasing_C5")
+    );
+
     // §17.2 escalation (C9 granting what C8 cannot delegate) and §17.3
-    // revoking a revoked grant.
+    // revoking a revoked grant or one that does not exist.
     commit_through(&v, &mut client, 8).await;
     client
         .request(put(
@@ -377,6 +392,18 @@ async fn invalid_records_are_refused_with_their_codes() {
         ))
         .await;
     assert_eq!(code(&client.recv().await), AUTHORIZATION_FAILED);
+    commit_through(&v, &mut client, 9).await;
+    client
+        .request(put(
+            &v,
+            v.record_id("C9_grant_invite_grandchild"),
+            v.negative("revoke_unknown_grant"),
+        ))
+        .await;
+    assert_eq!(
+        Some(code(&client.recv().await)),
+        v.expected_code("revoke_unknown_grant")
+    );
     commit_through(&v, &mut client, 10).await;
     client
         .request(put(

@@ -571,6 +571,8 @@ async fn snapshots_are_validated_and_served() {
         "frontier_duplicate_principal",
         "frontier_unsorted",
         "snapshot_sequence_zero",
+        // §29 (G-EP4), baseline.4: epoch 0 at C5 covering BOB 1..3.
+        "snapshot_beyond_cutoff",
     ];
     for case in negatives {
         let wanted = v.expected_code(case).unwrap_or(MALFORMED_MESSAGE);
