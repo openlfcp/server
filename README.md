@@ -33,7 +33,12 @@ async facade (`store::Store`): operations are serialized and every write is
 acknowledged after its transaction commits.
 
 - Durability: WAL journal with `synchronous = FULL`, so a committed write
-  survives a crash or power loss (on storage that honors fsync). That backs
+  survives a crash or power loss (on storage that honors fsync). `tests/process_restart.rs` checks this on the real binary: it kills the
+  process with SIGKILL right after the last ACK (and, separately, stops it
+  with SIGTERM), and a new process on the same state directory still has
+  every acknowledged object, the server ID, the Control Head and consumed
+  claims, and the dedup and equivocation indexes. Power loss itself is
+  not simulated: the claim holds as far as SQLite and fsync do. That backs
   durability level 2, durable local persistence (WIRE-01 §37, §40); the
   server does not replicate, so it never claims level 3.
 - Exact bytes are authoritative: every Genesis, Control Record, Data Unit,
