@@ -28,6 +28,11 @@
 //! fork that the coordinator prevented. Fork evidence enters the store only
 //! through its own ingest path.
 //!
+//! Slots: the per-Resource lock and cached chain exist only for hosted
+//! Resources. A request naming an unknown Resource ID costs one store
+//! lookup and leaves nothing behind (security review M4). Hosting is never
+//! undone, so the map grows only with the hosted Resources.
+//!
 //! Coordinator recovery (§22) is deferred in MVP 0.1; its records are
 //! refused by the capability engine (DV1).
 
@@ -238,7 +243,7 @@ pub struct Committed {
 
 /// A held Resource lock ([`Coordinator::lock`]).
 pub struct Locked {
-    _guard: tokio::sync::OwnedMutexGuard<Option<Chain>>,
+    _guard: Option<tokio::sync::OwnedMutexGuard<Option<Chain>>>,
     /// The accepted chain, if the Resource is hosted.
     pub chain: Option<Chain>,
 }
@@ -284,13 +289,25 @@ impl Coordinator {
         normalize_url(coordinator_url).is_some_and(|url| self.public_urls.contains(&url))
     }
 
-    fn slot(&self, resource: ResourceId) -> Slot {
+    /// `resource`'s slot, created on first use; `None`, and nothing
+    /// created, while the Resource is not hosted.
+    async fn slot(&self, resource: ResourceId) -> Result<Option<Slot>, StoreError> {
+        let slots = || self.slots.lock().expect("the slot map is never poisoned");
+        if let Some(slot) = slots().get(&resource) {
+            return Ok(Some(slot.clone()));
+        }
+        if self.store.head(resource).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(slots().entry(resource).or_default().clone()))
+    }
+
+    /// The number of Resources with a slot.
+    pub fn slots(&self) -> usize {
         self.slots
             .lock()
             .expect("the slot map is never poisoned")
-            .entry(resource)
-            .or_default()
-            .clone()
+            .len()
     }
 
     /// The chain at the stored head, from the cache unless the head moved.
@@ -316,17 +333,25 @@ impl Coordinator {
     /// while it is held, so an object is never validated against a head
     /// that a concurrent commit (a Key Epoch, a Revoke) has superseded.
     pub async fn lock(&self, resource: ResourceId) -> Result<Locked, Failure> {
-        let mut guard = self.slot(resource).lock_owned().await;
+        let Some(slot) = self.slot(resource).await? else {
+            return Ok(Locked {
+                _guard: None,
+                chain: None,
+            });
+        };
+        let mut guard = slot.lock_owned().await;
         let chain = self.load(&mut guard, resource).await?;
         Ok(Locked {
-            _guard: guard,
+            _guard: Some(guard),
             chain,
         })
     }
 
     /// The accepted chain of a hosted Resource.
     pub async fn chain(&self, resource: ResourceId) -> Result<Option<Chain>, Failure> {
-        let slot = self.slot(resource);
+        let Some(slot) = self.slot(resource).await? else {
+            return Ok(None);
+        };
         let mut cached = slot.lock().await;
         self.load(&mut cached, resource).await
     }
@@ -360,7 +385,9 @@ impl Coordinator {
         origin: u64,
         random: &dyn Random,
     ) -> Result<Committed, Failure> {
-        let slot = self.slot(resource);
+        let Some(slot) = self.slot(resource).await? else {
+            return Err(Failure::NotHosted);
+        };
         let mut cached = slot.lock().await;
         let Some(chain) = self.load(&mut cached, resource).await? else {
             return Err(Failure::NotHosted);
@@ -629,6 +656,78 @@ mod tests {
         ] {
             assert_eq!(n(bad), None, "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_resources_leave_no_slot() {
+        use crate::store::Hosting;
+        use lfcp::base::Hash32;
+        use lfcp::principal::PrincipalKeys;
+        use lfcp::wire::control::body::{Endpoint, GenesisBody};
+        use lfcp::wire::control::ControlRecordHeader;
+
+        let dir =
+            std::env::temp_dir().join(format!("lfcp-coordinator-slots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        let url = "wss://sync.example.test/v1/ws".to_owned();
+        let coordinator = Coordinator::new(store.clone(), std::slice::from_ref(&url));
+        for i in 0..200u8 {
+            let unknown = ResourceId::from_bytes([i; 32]);
+            assert!(coordinator.chain(unknown).await.unwrap().is_none());
+            assert!(coordinator.lock(unknown).await.unwrap().chain.is_none());
+            let put = coordinator
+                .put(
+                    unknown,
+                    ControlRecordId::from_bytes([0; 32]),
+                    vec![0xa0],
+                    1,
+                    &OsRandom,
+                )
+                .await;
+            assert!(matches!(put, Err(Failure::NotHosted)));
+        }
+        assert_eq!(coordinator.slots(), 0);
+
+        let owner = PrincipalKeys::from_secrets(&[1; 32], [2; 32]);
+        let resource = ResourceId::from_bytes([200; 32]);
+        let genesis = ControlRecord::sign(
+            ControlRecordHeader {
+                resource_id: resource,
+                sequence: 0,
+                previous: None,
+                issuer: *owner.descriptor().id(),
+            },
+            ControlBody::Genesis(GenesisBody {
+                data_profile: "org.lfcp.test.raw.v1".into(),
+                owner: owner.descriptor().clone(),
+                dek_commitment: Hash32::from_bytes([3; 32]),
+                endpoints: vec![Endpoint {
+                    url: url.clone(),
+                    priority: 0,
+                    flags: None,
+                }],
+                coordinator: url,
+            }),
+            &owner,
+        )
+        .unwrap();
+        store
+            .host_resource(
+                genesis.signed_object().bytes().to_vec(),
+                Hosting {
+                    host: *owner.descriptor().id(),
+                    durability: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(coordinator.chain(resource).await.unwrap().is_some());
+        assert!(coordinator.lock(resource).await.unwrap().chain.is_some());
+        assert_eq!(coordinator.slots(), 1, "a hosted Resource keeps its slot");
+
+        drop((coordinator, store));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

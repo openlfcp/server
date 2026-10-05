@@ -232,6 +232,10 @@ the same read authority as `RESOURCE_OPEN`; `CONTROL_GET` returns every
 stored record in the range, competing ones included, split over several
 `CONTROL_BATCH` replies when the size limit requires.
 
+The coordinator keeps a lock and a cached chain only for hosted
+Resources. A request that names an unknown Resource ID costs one store
+lookup and leaves nothing in memory.
+
 ## Ingest
 
 `DATA_PUT`, `KEY_PACKAGE_PUT` and `SNAPSHOT_PUT` objects are validated
