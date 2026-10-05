@@ -48,20 +48,25 @@ fn healthy(addr: SocketAddr) -> bool {
 
 /// Spawn the binary on `state` with both published coordinator URLs.
 fn spawn(state: &Path) -> Process {
+    spawn_with_output(state, Stdio::null, "warn")
+}
+
+/// [`spawn`], with stdout and stderr going where `output` says.
+fn spawn_with_output(state: &Path, output: impl Fn() -> Stdio, log_level: &str) -> Process {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let config = state.with_extension("toml");
     std::fs::write(
         &config,
         format!(
-            "bind = \"{addr}\"\nstate_dir = \"{}\"\nlog_level = \"warn\"\npublic_urls = [\"wss://sync-a.example.test/v1/ws\", \"wss://sync-b.example.test/v1/ws\"]\n",
+            "bind = \"{addr}\"\nstate_dir = \"{}\"\nlog_level = \"{log_level}\"\npublic_urls = [\"wss://sync-a.example.test/v1/ws\", \"wss://sync-b.example.test/v1/ws\"]\n",
             state.display()
         ),
     )
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_lfcp-server"))
         .args(["--config", config.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(output())
+        .stderr(output())
         .spawn()
         .unwrap();
     let started = Instant::now();
@@ -213,5 +218,113 @@ fn the_health_check_mode_reports_the_server_state() {
     assert!(check(), "healthy while running");
     process.kill();
     assert!(!check(), "unhealthy once killed");
+    cleanup(&dir);
+}
+
+/// LFCP-046: the setup code is printed once, at the first start, and
+/// appears nowhere else in the output, through pairing, an admin session
+/// and a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_setup_code_is_printed_once_and_never_logged() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let v = Vectors::load();
+    let dir = fresh("setup-code");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.with_extension("log");
+    let file = std::fs::File::create(&log).unwrap();
+    let output = || Stdio::from(file.try_clone().unwrap());
+
+    let first = spawn_with_output(&dir, output, "debug");
+    let started = Instant::now();
+    let code = loop {
+        let text = std::fs::read_to_string(&log).unwrap();
+        if let Some(rest) = text.split("Admin pairing code:").nth(1) {
+            break rest.split_whitespace().next().unwrap().to_owned();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no code printed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(code.len(), 9);
+
+    async fn http(addr: SocketAddr, method: &str, path: &str, body: String) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        reply
+    }
+    let challenge = |reply: String| {
+        let body = reply.split_once("\r\n\r\n").unwrap().1.to_owned();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        json["challenge"].as_str().unwrap().to_owned()
+    };
+    let server_id = {
+        let reply = http(first.addr, "GET", "/setup", String::new()).await;
+        let body = reply.split_once("\r\n\r\n").unwrap().1.to_owned();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        lfcp::base::from_hex(json["server_id"].as_str().unwrap()).unwrap()
+    };
+    let carol = v.principal("carol");
+    let proof = |purpose: &str, challenge: &str| {
+        use lfcp::cbor::Value;
+        let transcript = lfcp::cbor::encode(&Value::Array(vec![
+            Value::text("LFCP-ADMIN-v1"),
+            Value::text(purpose),
+            Value::bytes(server_id.clone()),
+            Value::bytes(lfcp::base::from_hex(challenge).unwrap()),
+        ]))
+        .unwrap();
+        serde_json::json!({
+            "principal": lfcp::base::to_hex(&carol.descriptor().encode()),
+            "challenge": challenge,
+            "proof": lfcp::base::to_hex(lfcp::cose::sign(&transcript, &carol).unwrap().bytes()),
+        })
+    };
+    // A wrong code, then the right one, then an admin session.
+    for (attempt, expected) in [("ZZZZ-ZZZZ", "403"), (code.as_str(), "200")] {
+        let c = challenge(http(first.addr, "POST", "/admin/challenge", String::new()).await);
+        let mut body = proof("pair", &c);
+        body["code"] = serde_json::json!(attempt);
+        let reply = http(first.addr, "POST", "/setup/pair", body.to_string()).await;
+        assert_eq!(&reply[9..12], expected);
+    }
+    let c = challenge(http(first.addr, "POST", "/admin/challenge", String::new()).await);
+    let reply = http(
+        first.addr,
+        "POST",
+        "/admin/session",
+        proof("session", &c).to_string(),
+    )
+    .await;
+    assert_eq!(&reply[9..12], "200");
+    let token = {
+        let body = reply.split_once("\r\n\r\n").unwrap().1.to_owned();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        json["token"].as_str().unwrap().to_owned()
+    };
+    first.terminate();
+
+    // A paired server prints no code.
+    let second = spawn_with_output(&dir, output, "debug");
+    second.terminate();
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.matches(code.as_str()).count(),
+        1,
+        "printed exactly once"
+    );
+    assert!(!text.contains(&code.replace('-', "")));
+    assert_eq!(text.matches("Admin pairing code:").count(), 1);
+    assert!(!text.contains(&token), "the session token is never logged");
+    assert!(text.contains("server administrator paired"));
+    std::fs::remove_file(&log).unwrap();
     cleanup(&dir);
 }

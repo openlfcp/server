@@ -4,6 +4,7 @@
 //!
 //! | Module | Purpose | Task |
 //! | --- | --- | --- |
+//! | [`admin`] | first-run setup pairing and the admin HTTP API | LFCP-046 |
 //! | [`config`] | TOML configuration and flags, typed validation | LFCP-044 |
 //! | [`identity`] | the stable server ID (WIRE-01 §35, §37) | LFCP-044 |
 //! | [`rng`] | operating-system randomness | LFCP-044 |
@@ -15,14 +16,15 @@
 //! | [`coordinator`] | Control Coordinator CAS, Control state cache, live pushes | LFCP-049 |
 //! | [`ingest`] | Data Unit, Key Package and Snapshot validation, ingest policy | LFCP-050 |
 //!
-//! Later tasks add setup/admin HTTP (LFCP-046) and equivocation policy
-//! (LFCP-052). The server never understands Markdown, Tasks or
+//! Server administration (LFCP-046) is infrastructure only and never LFCP
+//! Resource authority. The server never understands Markdown, Tasks or
 //! Automerge, and never logs keys, DEKs, invitation secrets, credentials or
 //! decrypted data.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod admin;
 pub mod config;
 pub mod coordinator;
 pub mod http;

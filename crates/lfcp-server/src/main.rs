@@ -70,8 +70,33 @@ fn main() -> ExitCode {
             server_id = %server.server_id().to_hex(),
             "listening"
         );
-        let sessions = lfcp_server::session::Lfcp::new(server.store().clone(), server.config());
-        server.run(sessions, shutdown_signal()).await;
+        let (admin, setup_code) = match lfcp_server::admin::Admin::open(
+            server.store().clone(),
+            server.server_id(),
+            server.config(),
+            std::sync::Arc::new(lfcp_server::rng::OsRandom),
+            lfcp_server::admin::SETUP_TTL,
+        )
+        .await
+        {
+            Ok(opened) => opened,
+            Err(error) => {
+                tracing::error!(%error, "cannot open the admin surface");
+                return ExitCode::FAILURE;
+            }
+        };
+        // The one place the setup code is shown: stdout, once, never the
+        // log (WIRE-01 §92). Only its hash is stored.
+        if let Some(code) = setup_code {
+            println!(
+                "\nAdmin pairing code:\n\n    {}\n\nOpen /setup and pair an LFCP Principal as server administrator.\nThe code expires in {} minutes; restart the server for a new one.\n",
+                code.expose(),
+                lfcp_server::admin::SETUP_TTL.as_secs() / 60
+            );
+        }
+        let sessions = lfcp_server::session::Lfcp::new(server.store().clone(), server.config())
+            .with_hosting(admin.hosting());
+        server.with_admin(admin).run(sessions, shutdown_signal()).await;
         ExitCode::SUCCESS
     })
 }

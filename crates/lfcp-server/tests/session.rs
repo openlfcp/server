@@ -58,6 +58,7 @@ fn vector_options(v: &Vectors) -> (Options, Arc<Script>) {
         public_urls: Vec::new(),
         ingest: None,
         max_message_bytes: None,
+        setup_ttl: None,
     };
     (options, script)
 }

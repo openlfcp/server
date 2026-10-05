@@ -23,8 +23,9 @@ dependency tree.
   CONTROL_HAVE / GET / BATCH, live Control pushes.
 - Ingest (LFCP-050): Data Units, Key Packages and Snapshots validated
   with sdk-rs and served to readers; live Data pushes.
-
-Next: setup and admin HTTP (LFCP-046) and equivocation policy (LFCP-052).
+- Catch-up, deduplication and restart durability (LFCP-051, 052, 054).
+- Docker image and compose (LFCP-055).
+- Setup and admin HTTP (LFCP-046): first-run pairing, hosting policy.
 
 ## Store
 
@@ -164,8 +165,9 @@ After READY:
 
 Authority: AUTH proves possession of the session key and nothing more. The
 hosting credential (in AUTH or RESOURCE_HOST) is server policy only
-(`session::HostingPolicy`); the self-hosted default, `OpenHosting`, lets any
-authenticated Principal host, with or without one. Neither a credential nor
+(`session::HostingPolicy`). The server runs the admin-managed policy
+(`admin::ManagedHosting`, see "Administration"): open by default, so any
+authenticated Principal may host, with or without a credential. Neither a credential nor
 the hosting row ever grants a Resource ability: authority always comes from
 the Control Chain. Credentials and proofs are never logged.
 
@@ -263,10 +265,64 @@ proxy in front (LFCP-055).
 | `getrandom` | The server ID; later nonces and session IDs |
 | `tracing`, `tracing-subscriber` | Logs (level from the configuration) |
 | `serde`, `toml` | The configuration file |
+| `serde_json` | The setup/admin HTTP API |
 | `rusqlite` (bundled SQLite) | The store |
 
-92 unique crates in the normal dependency tree. No web framework, no ORM,
+95 unique crates in the normal dependency tree. No web framework, no ORM,
 no clap.
+
+## Administration
+
+The setup and admin HTTP API (`src/admin.rs`, LFCP-046) shares the
+listener and speaks JSON only. It is server infrastructure: it never
+touches Resource data and is never LFCP Resource authority. An
+administrator gets no Resource ability, and is not even allowed to host
+unless the hosting policy allows it. There is no account system and no
+REST access to Resources: they are synchronized over the WebSocket only.
+
+First run (WIRE-01 §92). While no administrator is paired, each start
+creates a one-time pairing code (`XXXX-XXXX`, from the OS random source)
+and prints it to stdout, once:
+
+```text
+Admin pairing code:
+
+    X7KM-P9LA
+
+Open /setup and pair an LFCP Principal as server administrator.
+```
+
+The store keeps only its hash. The code expires after an hour (restart
+for a new one), is destroyed after 5 wrong attempts, and is destroyed by
+the pairing. The log never contains the code, proofs or tokens.
+
+Pairing binds an LFCP Principal to the administrator role, proven with the
+Principal's own key; there are no passwords.
+
+1. `POST /admin/challenge` answers `{"challenge": <32 bytes hex>}`. A
+   challenge can be used once, within 5 minutes.
+2. `POST /setup/pair` with `{"code", "principal", "challenge", "proof"}`:
+   - `principal` is the encoded Principal Descriptor, in hex;
+   - `proof` is a COSE_Sign1 by that Principal (hex) over the
+     deterministic CBOR `["LFCP-ADMIN-v1", "pair", server_id, challenge]`,
+     where `server_id` comes from `GET /setup`.
+   - The answer is 200, 403 for a wrong code, 410 when there is no code
+     or it expired, 401 for a bad proof, 400 for a malformed request.
+
+Later administration:
+
+- `POST /admin/session` with the same proof (purpose `"session"`) returns
+  a bearer token, valid 15 minutes and kept only as a hash in memory.
+- `GET /admin/status`: server ID, limits, public URLs, durability,
+  administrators, number of hosted Resources.
+- `GET` and `PUT /admin/hosting`: `{"mode": "open"}`, or
+  `{"mode": "allow_list", "principals": [<id hex>], "credentials": [<hex>]}`.
+  Credentials are stored as SHA-256 hashes and only counted when read. The
+  change takes effect on the next `RESOURCE_HOST` and persists.
+- `GET /admin/resources`: per Resource, its ID, Control Head sequence,
+  object counts and bytes; never contents.
+
+`GET /health` stays `{"status":"ok"}`.
 
 ## Docker
 
@@ -309,9 +365,12 @@ curl --cacert root.crt https://localhost/health
   address (a Let's Encrypt certificate, with ports 80 and 443 reachable),
   or to the paths of your own certificate and key mounted into the proxy.
   `LFCP_HTTPS_PORT` and `LFCP_HTTP_PORT` change the published ports.
-- No credentials are baked in or committed. First-run setup and admin
-  pairing (the admin HTTP API) are LFCP-046, not implemented yet; until
-  then any authenticated Principal may host a Resource (`OpenHosting`).
+- No credentials are baked in or committed. At first start the server
+  prints a one-time admin pairing code: `docker compose -f
+  deploy/compose.yaml logs lfcp-server` shows it, and pairing goes to
+  `https://<host>/setup/pair` through the proxy (see "Administration").
+  Recreating the containers on the same volume keeps the pairing; a new
+  volume is a new server with a new code.
 
 `deploy/check.sh` builds the image and checks it end to end. It verifies:
 - the user is non-root and the container is healthy;

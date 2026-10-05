@@ -74,6 +74,8 @@ pub struct Options {
     pub public_urls: Vec<String>,
     pub ingest: Option<Arc<dyn lfcp_server::ingest::IngestPolicy>>,
     pub max_message_bytes: Option<usize>,
+    /// The setup code's lifetime (LFCP-046); default one hour.
+    pub setup_ttl: Option<Duration>,
 }
 
 impl Default for Options {
@@ -85,12 +87,15 @@ impl Default for Options {
             public_urls: Vec::new(),
             ingest: None,
             max_message_bytes: None,
+            setup_ttl: None,
         }
     }
 }
 
 pub struct Running {
     pub addr: SocketAddr,
+    /// The setup code the admin surface created, while unpaired.
+    pub setup_code: Option<String>,
     pub store: Arc<Store>,
     pub server_id: ServerId,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -136,7 +141,19 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         .unwrap();
     let addr = server.local_addr().unwrap();
     let server_id = server.server_id();
-    let mut sessions = Lfcp::new(store.clone(), &config).with_random(options.random);
+    let (admin, setup_code) = lfcp_server::admin::Admin::open(
+        store.clone(),
+        server_id,
+        &config,
+        Arc::new(lfcp_server::rng::OsRandom),
+        options.setup_ttl.unwrap_or(lfcp_server::admin::SETUP_TTL),
+    )
+    .await
+    .unwrap();
+    let server = server.with_admin(admin.clone());
+    let mut sessions = Lfcp::new(store.clone(), &config)
+        .with_random(options.random)
+        .with_hosting(admin.hosting());
     if let Some(hosting) = options.hosting {
         sessions = sessions.with_hosting(hosting);
     }
@@ -149,6 +166,7 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
     }));
     Running {
         addr,
+        setup_code: setup_code.map(|c| c.expose().to_owned()),
         store,
         server_id,
         stop: Some(stop),

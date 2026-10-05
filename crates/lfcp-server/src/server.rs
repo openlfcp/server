@@ -33,6 +33,7 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// A bound, not yet running server.
 pub struct Server {
+    admin: Option<Arc<crate::admin::Admin>>,
     listener: TcpListener,
     identity: Arc<dyn ServerIdentity>,
     store: Arc<Store>,
@@ -41,6 +42,7 @@ pub struct Server {
 
 /// What every connection task shares.
 struct Shared<F> {
+    admin: Option<Arc<crate::admin::Admin>>,
     config: Config,
     server_id: ServerId,
     sessions: F,
@@ -59,11 +61,18 @@ impl Server {
     ) -> std::io::Result<Server> {
         let listener = TcpListener::bind(config.bind).await?;
         Ok(Server {
+            admin: None,
             listener,
             identity,
             store,
             config,
         })
+    }
+
+    /// Serve the setup/admin HTTP API (LFCP-046) on this listener too.
+    pub fn with_admin(mut self, admin: Arc<crate::admin::Admin>) -> Server {
+        self.admin = Some(admin);
+        self
     }
 
     /// The store.
@@ -93,6 +102,7 @@ impl Server {
         let (stop, stopping) = watch::channel(false);
         let (alive, mut all_done) = mpsc::channel::<()>(1);
         let shared = Arc::new(Shared {
+            admin: self.admin.clone(),
             config: self.config.clone(),
             server_id: self.identity.server_id(),
             sessions,
@@ -163,6 +173,13 @@ async fn route<F: SessionFactory>(
     shared: Arc<Shared<F>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.uri().path() != shared.config.ws_path {
+        if let Some(admin) = shared
+            .admin
+            .as_ref()
+            .filter(|_| crate::admin::Admin::handles(request.uri().path()))
+        {
+            return Ok(admin.handle(request).await);
+        }
         return Ok(http::route(request.method(), request.uri().path()));
     }
     let response = match ws::check_upgrade(&request) {
