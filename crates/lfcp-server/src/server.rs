@@ -16,8 +16,9 @@
 //! Per client IP (POST-003, [`crate::limits`]): the client of each request
 //! is the TCP peer, or the address a trusted proxy reports. A WebSocket
 //! upgrade past [`crate::limits::AbuseLimits::max_connections_per_ip`]
-//! open WebSockets of its client gets `429 Too Many Requests` with
-//! `Retry-After`, and no WebSocket.
+//! open WebSockets of its client, or past
+//! [`crate::limits::AbuseLimits::connections_per_ip_per_minute`] new ones,
+//! gets `429 Too Many Requests` with `Retry-After`, and no WebSocket.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -38,7 +39,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use crate::config::Config;
 use crate::http;
 use crate::identity::{ServerId, ServerIdentity};
-use crate::limits::{Client, IpTable, Proxies, Refused};
+use crate::limits::{retry_after, Client, IpTable, Proxies, Refused};
 use crate::store::Store;
 use crate::ws::{self, ConnectionContext, Limits, SessionFactory};
 
@@ -276,6 +277,10 @@ async fn route<F: SessionFactory>(
 fn too_many(refused: Refused) -> Response<Full<Bytes>> {
     let (retry, body) = match refused {
         Refused::TooMany => (5, "too many connections from this address\n"),
+        Refused::Rate(wait) => (
+            retry_after(wait),
+            "too many new connections from this address\n",
+        ),
     };
     Response::builder()
         .status(hyper::StatusCode::TOO_MANY_REQUESTS)

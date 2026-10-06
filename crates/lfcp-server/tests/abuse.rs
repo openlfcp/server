@@ -53,6 +53,7 @@ async fn open_websockets_per_ip_are_capped_and_untrusted_headers_ignored() {
         &dir,
         with(AbuseLimits {
             max_connections_per_ip: 2,
+            connections_per_ip_per_minute: 0,
             ..AbuseLimits::default()
         }),
     )
@@ -91,6 +92,7 @@ async fn a_trusted_proxy_reports_the_client_ip() {
         &dir,
         with(AbuseLimits {
             max_connections_per_ip: 1,
+            connections_per_ip_per_minute: 0,
             trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
             ..AbuseLimits::default()
         }),
@@ -112,6 +114,37 @@ async fn a_trusted_proxy_reports_the_client_ip() {
     // Without the header the proxy is the client.
     let _c = Client::try_connect(server.addr, &[]).await.unwrap();
     assert!(Client::try_connect(server.addr, &[]).await.is_err());
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_websockets_per_ip_are_rate_limited() {
+    let dir = state_dir("abuse-connect-rate");
+    let server = start(
+        &dir,
+        with(AbuseLimits {
+            connections_per_ip_per_minute: 3,
+            ..AbuseLimits::default()
+        }),
+    )
+    .await;
+    for _ in 0..3 {
+        drop(Client::connect(server.addr).await);
+    }
+    let refused = Client::try_connect(server.addr, &[])
+        .await
+        .err()
+        .expect("the fourth new connection in a minute");
+    assert_eq!(
+        refused,
+        Refused {
+            status: 429,
+            retry_after: Some("20".into()),
+            body: "too many new connections from this address\n".into(),
+        }
+    );
 
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();

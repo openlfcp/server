@@ -31,7 +31,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hyper::header::HeaderMap;
 
@@ -239,6 +239,79 @@ fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
     }
 }
 
+/// A token bucket's rate: `per_second` tokens refill it, up to `burst`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rate {
+    per_second: f64,
+    burst: f64,
+}
+
+impl Rate {
+    /// `count` per `period`, with a burst of `burst`; `None` when `count`
+    /// is 0 (no limit).
+    pub fn new(count: u32, period: Duration, burst: u32) -> Option<Rate> {
+        (count > 0).then(|| Rate {
+            per_second: f64::from(count) / period.as_secs_f64(),
+            burst: f64::from(burst.max(1)),
+        })
+    }
+
+    /// `count` per minute, with a burst of `count`.
+    pub fn per_minute(count: u32) -> Option<Rate> {
+        Rate::new(count, Duration::from_secs(60), count)
+    }
+}
+
+/// A token bucket: one token per event, refilled at its [`Rate`].
+#[derive(Clone, Copy, Debug)]
+pub struct Bucket {
+    rate: Rate,
+    tokens: f64,
+    at: Instant,
+}
+
+impl Bucket {
+    /// A full bucket at `now`.
+    pub fn new(rate: Rate, now: Instant) -> Bucket {
+        Bucket {
+            rate,
+            tokens: rate.burst,
+            at: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate.per_second).min(self.rate.burst);
+        self.at = now;
+    }
+
+    /// Take a token at `now`, or say how long until one is available.
+    pub fn take(&mut self, now: Instant) -> Result<(), Duration> {
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64(
+                (1.0 - self.tokens) / self.rate.per_second,
+            ))
+        }
+    }
+
+    /// Whether the bucket would be full at `now`: it remembers nothing.
+    fn is_full(&self, now: Instant) -> bool {
+        let mut probe = *self;
+        probe.refill(now);
+        probe.tokens >= probe.rate.burst
+    }
+}
+
+/// Whole seconds to wait, at least 1: an HTTP `Retry-After` value.
+pub fn retry_after(wait: Duration) -> u64 {
+    wait.as_secs_f64().ceil().max(1.0) as u64
+}
+
 /// Where the client IP of a request comes from.
 #[derive(Clone, Debug)]
 pub struct Proxies {
@@ -318,22 +391,38 @@ impl IpKey {
 pub enum Refused {
     /// [`AbuseLimits::max_connections_per_ip`] connections are open.
     TooMany,
+    /// [`AbuseLimits::connections_per_ip_per_minute`] were opened; one is
+    /// allowed again after this long.
+    Rate(Duration),
 }
 
 #[derive(Debug)]
 struct Entry {
     open: usize,
     seen: Instant,
+    connects: Option<Bucket>,
 }
 
 impl Entry {
     fn new(now: Instant) -> Entry {
-        Entry { open: 0, seen: now }
+        Entry {
+            open: 0,
+            seen: now,
+            connects: None,
+        }
     }
 
     /// Nothing to remember: dropping it changes no decision.
-    fn is_idle(&self, _now: Instant) -> bool {
-        self.open == 0
+    fn is_idle(&self, now: Instant) -> bool {
+        self.open == 0 && self.connects.is_none_or(|b| b.is_full(now))
+    }
+}
+
+/// Take a token from the bucket in `slot` (created full at `rate`).
+fn take(slot: &mut Option<Bucket>, rate: Option<Rate>, now: Instant) -> Result<(), Duration> {
+    match rate {
+        Some(rate) => slot.get_or_insert_with(|| Bucket::new(rate, now)).take(now),
+        None => Ok(()),
     }
 }
 
@@ -341,6 +430,7 @@ impl Entry {
 #[derive(Debug)]
 pub struct IpTable {
     max_open: usize,
+    connects: Option<Rate>,
     max_tracked: usize,
     entries: Mutex<HashMap<IpKey, Entry>>,
 }
@@ -350,6 +440,7 @@ impl IpTable {
     pub fn new(limits: &AbuseLimits) -> Arc<IpTable> {
         Arc::new(IpTable {
             max_open: limits.max_connections_per_ip,
+            connects: Rate::per_minute(limits.connections_per_ip_per_minute),
             max_tracked: limits.max_tracked_ips,
             entries: Mutex::default(),
         })
@@ -378,14 +469,16 @@ impl IpTable {
     }
 
     /// Open a WebSocket connection for `ip`: refused past
-    /// [`AbuseLimits::max_connections_per_ip`]. The permit holds the place
-    /// until dropped.
+    /// [`AbuseLimits::max_connections_per_ip`] open ones, or
+    /// [`AbuseLimits::connections_per_ip_per_minute`] new ones. The permit
+    /// holds the place until dropped.
     pub fn connect(self: &Arc<Self>, ip: IpAddr, now: Instant) -> Result<IpPermit, Refused> {
-        let max_open = self.max_open;
+        let (max_open, connects) = (self.max_open, self.connects);
         self.with(ip, now, |entry| {
             if max_open > 0 && entry.open >= max_open {
                 return Err(Refused::TooMany);
             }
+            take(&mut entry.connects, connects, now).map_err(Refused::Rate)?;
             entry.open += 1;
             Ok(())
         })?;
@@ -603,8 +696,45 @@ mod tests {
     }
 
     #[test]
+    fn buckets_refill_at_their_rate() {
+        let now = Instant::now();
+        let mut bucket = Bucket::new(Rate::new(2, Duration::from_secs(1), 3).unwrap(), now);
+        for _ in 0..3 {
+            assert_eq!(bucket.take(now), Ok(()));
+        }
+        assert_eq!(bucket.take(now), Err(Duration::from_millis(500)));
+        let later = now + Duration::from_millis(500);
+        assert_eq!(bucket.take(later), Ok(()));
+        assert!(bucket.take(later).is_err());
+        assert!(!bucket.is_full(later));
+        assert!(bucket.is_full(later + Duration::from_secs(2)));
+        assert_eq!(Rate::per_minute(0), None);
+        assert_eq!(retry_after(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after(Duration::from_millis(19_990)), 20);
+    }
+
+    #[test]
+    fn new_connections_per_ip_are_rate_limited() {
+        let t = table(AbuseLimits {
+            connections_per_ip_per_minute: 3,
+            ..AbuseLimits::default()
+        });
+        let now = Instant::now();
+        for _ in 0..3 {
+            drop(t.connect(ip("192.0.2.1"), now).unwrap());
+        }
+        let Err(Refused::Rate(wait)) = t.connect(ip("192.0.2.1"), now) else {
+            panic!("the fourth connection in a minute")
+        };
+        assert_eq!(wait, Duration::from_secs(20));
+        assert!(t.connect(ip("192.0.2.2"), now).is_ok(), "another IP");
+        assert!(t.connect(ip("192.0.2.1"), now + wait).is_ok());
+    }
+
+    #[test]
     fn open_connections_per_ip_are_capped_and_released() {
         let t = table(AbuseLimits {
+            connections_per_ip_per_minute: 0,
             max_connections_per_ip: 2,
             ..AbuseLimits::default()
         });
@@ -623,6 +753,7 @@ mod tests {
         );
         let off = table(AbuseLimits {
             max_connections_per_ip: 0,
+            connections_per_ip_per_minute: 0,
             ..AbuseLimits::default()
         });
         let held: Vec<_> = (0..100)
@@ -636,6 +767,7 @@ mod tests {
         let cap = 1024;
         let t = table(AbuseLimits {
             max_tracked_ips: cap,
+            max_connections_per_ip: 3,
             ..AbuseLimits::default()
         });
         let now = Instant::now();
@@ -651,12 +783,10 @@ mod tests {
             drop(t.connect(ip, now).unwrap());
             assert!(t.len() <= cap, "{} entries after {i}", t.len());
         }
-        // The open ones are still counted.
-        let max_open = AbuseLimits::default().max_connections_per_ip;
+        // The open ones are still counted (each sprayed entry had a
+        // half-used rate bucket, so it was evicted by age, not as idle).
         let ten = IpAddr::V4(0x0a00_0000.into());
-        let more: Vec<_> = (1..max_open)
-            .map(|_| t.connect(ten, now).unwrap())
-            .collect();
+        let more: Vec<_> = (1..3).map(|_| t.connect(ten, now).unwrap()).collect();
         assert_eq!(t.connect(ten, now).unwrap_err(), Refused::TooMany);
         drop((held, more));
     }
