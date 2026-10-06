@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lfcp-server"]
+members = ["crates/lfcp-server", "crates/lfcp-admin"]
 
 [workspace.package]
 version = "0.2.0"

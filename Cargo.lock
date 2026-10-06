@@ -475,6 +475,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfcp-admin"
+version = "0.2.0"
+dependencies = [
+ "getrandom",
+ "lfcp",
+ "lfcp-server",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "lfcp-server"
 version = "0.2.0"
 dependencies = [

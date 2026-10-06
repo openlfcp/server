@@ -1,0 +1,23 @@
+[package]
+name = "lfcp-admin"
+description = "Administration CLI for the OpenLFCP reference server: pairing, hosting policy, quotas."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Keys and COSE from the sdk-rs protocol core, at the commit in sdk-rs.lock.
+lfcp = { path = "../../../sdk-rs/crates/lfcp", default-features = false }
+# The server's admin proof format (admin::sign_proof), so it is not copied.
+lfcp-server = { path = "../lfcp-server" }
+# The admin API speaks JSON.
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# OS randomness for a new admin key.
+getrandom = { version = "0.4", default-features = false }
+# Key bytes are wiped after use.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "macros"] }
