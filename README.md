@@ -2,6 +2,8 @@
 
 # openlfcp/server
 
+Website: [openlfcp.org](https://openlfcp.org)
+
 The OpenLFCP reference server: an application-agnostic LFCP
 synchronization peer in Rust, built on the `lfcp` crate of
 [`sdk-rs`](https://github.com/openlfcp/sdk-rs).
