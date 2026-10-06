@@ -11,6 +11,22 @@
 //! max_connections = 1024           # open TCP connections; more get HTTP 503
 //! public_urls = ["wss://sync.example.org/v1/ws"]  # this server's WebSocket URLs (§21)
 //! log_level = "info"               # error | warn | info | debug | trace
+//! # Abuse limits (POST-003; crate::limits). 0 disables a per-IP or rate limit.
+//! trusted_proxies = ["172.18.0.0/16"]   # peers whose client_ip_header is believed
+//! client_ip_header = "x-forwarded-for"  # or "x-real-ip", "cf-connecting-ip"
+//! max_connections_per_ip = 32           # open WebSockets per client IP
+//! connections_per_ip_per_minute = 20    # new WebSockets per client IP
+//! ws_messages_per_second = 50           # per connection, token bucket
+//! ws_message_burst = 200
+//! admin_requests_per_ip_per_minute = 60 # /setup and /admin/*
+//! max_tracked_ips = 65536               # bounded per-IP state
+//! quota_resources_per_principal = 20    # quota hosting mode
+//! quota_bytes_per_principal = 268435456
+//! quota_bytes_per_resource = 134217728
+//! hosts_per_ip_per_day = 10
+//! max_total_bytes = 3221225472          # every mode; unset: no cap
+//! min_free_bytes = 2147483648           # every mode; 0 disables
+//! disk_check_interval_ms = 10000
 //! ```
 //!
 //! Every field has a default; unknown fields are rejected. There is no
@@ -21,6 +37,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+
+use crate::limits::{AbuseLimits, Cidr};
 
 /// The smallest maximum message size the server accepts: enough for any
 /// MVP message and far below the 8 MiB default (WIRE-01 §31).
@@ -61,6 +79,8 @@ pub struct Config {
     pub public_urls: Vec<String>,
     /// The log level.
     pub log_level: tracing::Level,
+    /// The abuse limits (POST-003).
+    pub abuse: AbuseLimits,
 }
 
 impl Default for Config {
@@ -75,6 +95,7 @@ impl Default for Config {
             max_connections: 1024,
             public_urls: Vec::new(),
             log_level: tracing::Level::INFO,
+            abuse: AbuseLimits::default(),
         }
     }
 }
@@ -129,6 +150,22 @@ struct File {
     max_connections: Option<u64>,
     public_urls: Option<Vec<String>>,
     log_level: Option<String>,
+    // The abuse limits (POST-003).
+    trusted_proxies: Option<Vec<String>>,
+    client_ip_header: Option<String>,
+    max_connections_per_ip: Option<u64>,
+    connections_per_ip_per_minute: Option<u32>,
+    ws_messages_per_second: Option<u32>,
+    ws_message_burst: Option<u32>,
+    admin_requests_per_ip_per_minute: Option<u32>,
+    max_tracked_ips: Option<u64>,
+    quota_resources_per_principal: Option<u64>,
+    quota_bytes_per_principal: Option<u64>,
+    quota_bytes_per_resource: Option<u64>,
+    hosts_per_ip_per_day: Option<u32>,
+    max_total_bytes: Option<u64>,
+    min_free_bytes: Option<u64>,
+    disk_check_interval_ms: Option<u64>,
 }
 
 impl Config {
@@ -136,7 +173,10 @@ impl Config {
     pub fn from_toml(text: &str) -> Result<Config, ConfigError> {
         let file: File =
             toml::from_str(text).map_err(|e| ConfigError::Syntax(e.message().to_owned()))?;
-        let mut config = Config::default();
+        let mut config = Config {
+            abuse: abuse_limits(&file)?,
+            ..Config::default()
+        };
         if let Some(bind) = file.bind {
             config.bind = parse_bind(&bind)?;
         }
@@ -247,8 +287,74 @@ impl Config {
                 "each must be an absolute ws:// or wss:// URL without user info or fragment",
             );
         }
+        if let Err((field, reason)) = self.abuse.validate() {
+            return invalid(field, reason);
+        }
         Ok(())
     }
+}
+
+/// The abuse limits of `file` over their defaults.
+fn abuse_limits(file: &File) -> Result<AbuseLimits, ConfigError> {
+    let mut limits = AbuseLimits::default();
+    if let Some(proxies) = &file.trusted_proxies {
+        limits.trusted_proxies = proxies
+            .iter()
+            .map(|p| p.parse::<Cidr>())
+            .collect::<Result<_, _>>()
+            .map_err(|e| ConfigError::Invalid {
+                field: "trusted_proxies",
+                reason: e.to_string(),
+            })?;
+    }
+    if let Some(header) = &file.client_ip_header {
+        limits.client_ip_header = header.to_ascii_lowercase();
+    }
+    let size = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+    let set = |slot: &mut u32, value: Option<u32>| {
+        if let Some(value) = value {
+            *slot = value;
+        }
+    };
+    if let Some(n) = file.max_connections_per_ip {
+        limits.max_connections_per_ip = size(n);
+    }
+    set(
+        &mut limits.connections_per_ip_per_minute,
+        file.connections_per_ip_per_minute,
+    );
+    set(
+        &mut limits.ws_messages_per_second,
+        file.ws_messages_per_second,
+    );
+    set(&mut limits.ws_message_burst, file.ws_message_burst);
+    set(
+        &mut limits.admin_requests_per_ip_per_minute,
+        file.admin_requests_per_ip_per_minute,
+    );
+    set(&mut limits.hosts_per_ip_per_day, file.hosts_per_ip_per_day);
+    if let Some(n) = file.max_tracked_ips {
+        limits.max_tracked_ips = size(n);
+    }
+    if let Some(n) = file.quota_resources_per_principal {
+        limits.quota_resources_per_principal = n;
+    }
+    if let Some(n) = file.quota_bytes_per_principal {
+        limits.quota_bytes_per_principal = n;
+    }
+    if let Some(n) = file.quota_bytes_per_resource {
+        limits.quota_bytes_per_resource = n;
+    }
+    if file.max_total_bytes.is_some() {
+        limits.max_total_bytes = file.max_total_bytes;
+    }
+    if let Some(n) = file.min_free_bytes {
+        limits.min_free_bytes = n;
+    }
+    if let Some(ms) = file.disk_check_interval_ms {
+        limits.disk_check_interval_ms = ms;
+    }
+    Ok(limits)
 }
 
 fn parse_bind(text: &str) -> Result<SocketAddr, ConfigError> {
@@ -337,6 +443,89 @@ mod tests {
             Config::from_toml("bind = "),
             Err(ConfigError::Syntax(_))
         ));
+    }
+
+    #[test]
+    fn parses_the_abuse_limits() {
+        let config = Config::from_toml(
+            "trusted_proxies = [\"172.18.0.0/16\", \"10.0.0.2\", \"fd00::/8\"]\nclient_ip_header = \"CF-Connecting-IP\"\nmax_connections_per_ip = 4\nconnections_per_ip_per_minute = 0\nws_messages_per_second = 10\nws_message_burst = 20\nadmin_requests_per_ip_per_minute = 5\nmax_tracked_ips = 2048\nquota_resources_per_principal = 3\nquota_bytes_per_principal = 1000\nquota_bytes_per_resource = 500\nhosts_per_ip_per_day = 2\nmax_total_bytes = 3221225472\nmin_free_bytes = 0\ndisk_check_interval_ms = 1000\n",
+        )
+        .unwrap();
+        let abuse = &config.abuse;
+        let proxies: Vec<String> = abuse.trusted_proxies.iter().map(Cidr::to_string).collect();
+        assert_eq!(proxies, ["172.18.0.0/16", "10.0.0.2/32", "fd00::/8"]);
+        assert_eq!(abuse.client_ip_header, "cf-connecting-ip");
+        assert_eq!(abuse.max_connections_per_ip, 4);
+        assert_eq!(abuse.connections_per_ip_per_minute, 0);
+        assert_eq!(
+            (abuse.ws_messages_per_second, abuse.ws_message_burst),
+            (10, 20)
+        );
+        assert_eq!(abuse.admin_requests_per_ip_per_minute, 5);
+        assert_eq!(abuse.max_tracked_ips, 2048);
+        assert_eq!(abuse.quota_resources_per_principal, 3);
+        assert_eq!(abuse.quota_bytes_per_principal, 1000);
+        assert_eq!(abuse.quota_bytes_per_resource, 500);
+        assert_eq!(abuse.hosts_per_ip_per_day, 2);
+        assert_eq!(abuse.max_total_bytes, Some(3 << 30));
+        assert_eq!(abuse.min_free_bytes, 0);
+        assert_eq!(abuse.disk_check_interval_ms, 1000);
+
+        let defaults = Config::default().abuse;
+        assert!(defaults.trusted_proxies.is_empty());
+        assert_eq!(defaults.client_ip_header, "x-forwarded-for");
+        assert_eq!(defaults.max_connections_per_ip, 32);
+        assert_eq!(defaults.connections_per_ip_per_minute, 20);
+        assert_eq!(
+            (defaults.ws_messages_per_second, defaults.ws_message_burst),
+            (50, 200)
+        );
+        assert_eq!(defaults.admin_requests_per_ip_per_minute, 60);
+        assert_eq!(defaults.quota_resources_per_principal, 20);
+        assert_eq!(defaults.quota_bytes_per_principal, 256 << 20);
+        assert_eq!(defaults.quota_bytes_per_resource, 128 << 20);
+        assert_eq!(defaults.hosts_per_ip_per_day, 10);
+        assert_eq!(defaults.max_total_bytes, None);
+        assert_eq!(defaults.min_free_bytes, 2 << 30);
+    }
+
+    #[test]
+    fn rejects_invalid_abuse_limits() {
+        let field = |text: &str| match Config::from_toml(text) {
+            Err(ConfigError::Invalid { field, .. }) => field,
+            other => panic!("{text}: {other:?}"),
+        };
+        assert_eq!(
+            field("trusted_proxies = [\"10.0.0.0/40\"]"),
+            "trusted_proxies"
+        );
+        assert_eq!(field("trusted_proxies = [\"proxy\"]"), "trusted_proxies");
+        assert_eq!(
+            field("client_ip_header = \"x forwarded\""),
+            "client_ip_header"
+        );
+        assert_eq!(
+            field("ws_messages_per_second = 5\nws_message_burst = 0"),
+            "ws_message_burst"
+        );
+        assert_eq!(
+            field("connections_per_ip_per_minute = 1000001"),
+            "connections_per_ip_per_minute"
+        );
+        assert_eq!(field("max_tracked_ips = 10"), "max_tracked_ips");
+        assert_eq!(
+            field("quota_resources_per_principal = 0"),
+            "quota_resources_per_principal"
+        );
+        assert_eq!(
+            field("quota_bytes_per_resource = 0"),
+            "quota_bytes_per_resource"
+        );
+        assert_eq!(field("max_total_bytes = 0"), "max_total_bytes");
+        assert_eq!(
+            field("disk_check_interval_ms = 1"),
+            "disk_check_interval_ms"
+        );
     }
 
     #[test]

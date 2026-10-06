@@ -16,6 +16,7 @@
 //! | [`session`] | the LFCP session: handshake, Resource host/open/close, Control Plane | LFCP-048, LFCP-049 |
 //! | [`coordinator`] | Control Coordinator CAS, Control state cache, live pushes | LFCP-049 |
 //! | [`ingest`] | Data Unit, Key Package and Snapshot validation, ingest policy | LFCP-050 |
+//! | [`limits`] | abuse limits: client IP behind a proxy, per-IP and rate limits, quotas | POST-003 |
 //!
 //! Server administration (LFCP-046) is infrastructure only and never LFCP
 //! Resource authority. The server never understands Markdown, Tasks or
@@ -31,6 +32,7 @@ pub mod coordinator;
 pub mod http;
 pub mod identity;
 pub mod ingest;
+pub mod limits;
 pub mod private;
 pub mod rng;
 pub mod server;
