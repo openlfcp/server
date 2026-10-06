@@ -85,6 +85,8 @@ pub struct Options {
     pub abuse: Option<lfcp_server::limits::AbuseLimits>,
     /// The free disk space reader of the storage floor; default the OS.
     pub disk: Option<Arc<dyn lfcp_server::limits::DiskSpace>>,
+    /// Any other change to the configuration, applied last.
+    pub configure: Option<fn(&mut Config)>,
 }
 
 impl Default for Options {
@@ -101,6 +103,7 @@ impl Default for Options {
             max_connections: None,
             abuse: None,
             disk: None,
+            configure: None,
         }
     }
 }
@@ -135,7 +138,7 @@ pub fn state_dir(name: &str) -> PathBuf {
 
 /// Start a server on `state` (created if new) with default limits.
 pub async fn start(state: &std::path::Path, options: Options) -> Running {
-    let config = Config {
+    let mut config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         state_dir: state.to_owned(),
         public_urls: options.public_urls,
@@ -154,6 +157,9 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         }),
         ..Config::default()
     };
+    if let Some(configure) = options.configure {
+        configure(&mut config);
+    }
     let identity: Arc<dyn ServerIdentity> = match options.identity {
         Some(identity) => identity,
         None => Arc::new(lfcp_server::identity::FileIdentity::load_or_create(state).unwrap()),

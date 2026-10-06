@@ -50,6 +50,11 @@
 //! (WIRE-01 §10.5.1). `/admin/*` other than `challenge` and `session` needs
 //! `Authorization: Bearer <token>`.
 //!
+//! A request body is read within [`Config::admin_body_timeout_ms`] (security
+//! review, POST-004): a body that is still incomplete then gets
+//! `408 Request Timeout` and the connection is closed, so a slow body does
+//! not hold a connection place.
+//!
 //! Being an administrator grants no LFCP ability: no Resource ownership,
 //! no `data/read`, nothing in a Control Chain. An administrator is not even
 //! allowed to host unless the hosting policy allows it. The setup code,
@@ -312,6 +317,7 @@ pub struct Admin {
     random: Arc<dyn Random>,
     hosting: Arc<ManagedHosting>,
     status: StatusInfo,
+    body_timeout: Duration,
     challenges: Challenges,
     sessions: Mutex<HashMap<[u8; 32], Session>>,
 }
@@ -403,6 +409,7 @@ impl Admin {
                 heartbeat_ms: config.heartbeat_ms,
                 public_urls: config.public_urls.clone(),
             },
+            body_timeout: Duration::from_millis(config.admin_body_timeout_ms),
             challenges: Challenges::new(challenge_key, Instant::now()),
             sessions: Mutex::new(HashMap::new()),
         };
@@ -432,9 +439,19 @@ impl Admin {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(str::to_owned);
-        let body = match Limited::new(request.into_body(), MAX_BODY).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
+        let body = Limited::new(request.into_body(), MAX_BODY).collect();
+        let body = match tokio::time::timeout(self.body_timeout, body).await {
+            Ok(Ok(collected)) => collected.to_bytes(),
+            Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
+            Err(_) => {
+                tracing::info!("admin request body too slow; closing");
+                let mut response = error(StatusCode::REQUEST_TIMEOUT, "body too slow");
+                response.headers_mut().insert(
+                    hyper::header::CONNECTION,
+                    hyper::header::HeaderValue::from_static("close"),
+                );
+                return response;
+            }
         };
         match self.route(&method, &path, bearer.as_deref(), &body).await {
             Ok(response) => response,

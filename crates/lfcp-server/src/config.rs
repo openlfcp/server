@@ -9,6 +9,7 @@
 //! heartbeat_ms = 30000             # READY heartbeat (§37); 0 disables the idle timeout
 //! handshake_timeout_ms = 10000     # HTTP request headers and the LFCP handshake (to READY)
 //! max_connections = 1024           # open TCP connections; more get HTTP 503
+//! admin_body_timeout_ms = 10000    # reading a setup/admin request body; then HTTP 408, close
 //! public_urls = ["wss://sync.example.org/v1/ws"]  # this server's WebSocket URLs (§21)
 //! log_level = "info"               # error | warn | info | debug | trace
 //! # Abuse limits (POST-003; crate::limits). 0 disables a per-IP or rate limit.
@@ -73,6 +74,9 @@ pub struct Config {
     /// The most TCP connections (HTTP and WebSocket) open at once; past it
     /// a new connection gets HTTP 503 and is closed.
     pub max_connections: usize,
+    /// How long a client may take to send a setup/admin request body (at
+    /// most 16 KiB); then it gets HTTP 408 and the connection is closed.
+    pub admin_body_timeout_ms: u64,
     /// The WebSocket URLs clients reach this server at. A Resource whose
     /// Control Coordinator URL (§15, §20) names one of them, compared after
     /// [`crate::coordinator::normalize_url`], is coordinated here (§21);
@@ -94,6 +98,7 @@ impl Default for Config {
             heartbeat_ms: 30_000,
             handshake_timeout_ms: 10_000,
             max_connections: 1024,
+            admin_body_timeout_ms: 10_000,
             public_urls: Vec::new(),
             log_level: tracing::Level::INFO,
             abuse: AbuseLimits::default(),
@@ -149,6 +154,7 @@ struct File {
     heartbeat_ms: Option<u64>,
     handshake_timeout_ms: Option<u64>,
     max_connections: Option<u64>,
+    admin_body_timeout_ms: Option<u64>,
     public_urls: Option<Vec<String>>,
     log_level: Option<String>,
     // The abuse limits (POST-003).
@@ -199,6 +205,9 @@ impl Config {
         }
         if let Some(n) = file.max_connections {
             config.max_connections = usize::try_from(n).unwrap_or(usize::MAX);
+        }
+        if let Some(ms) = file.admin_body_timeout_ms {
+            config.admin_body_timeout_ms = ms;
         }
         if let Some(urls) = file.public_urls {
             config.public_urls = urls;
@@ -272,6 +281,9 @@ impl Config {
         }
         if !(1_000..=600_000).contains(&self.handshake_timeout_ms) {
             return invalid("handshake_timeout_ms", "must be between 1000 and 600000");
+        }
+        if !(1_000..=600_000).contains(&self.admin_body_timeout_ms) {
+            return invalid("admin_body_timeout_ms", "must be between 1000 and 600000");
         }
         if !(1..=MAX_CONNECTIONS).contains(&self.max_connections) {
             return invalid("max_connections", "must be between 1 and 1000000");
@@ -399,7 +411,7 @@ mod tests {
     #[test]
     fn parses_every_field() {
         let config = Config::from_toml(
-            "bind = \"0.0.0.0:9000\"\nws_path = \"/ws\"\nstate_dir = \"/var/lib/lfcp\"\nmax_message_bytes = 1048576\nheartbeat_ms = 0\nhandshake_timeout_ms = 5000\nmax_connections = 64\npublic_urls = [\"wss://sync.example.org/v1/ws\"]\nlog_level = \"debug\"\n",
+            "bind = \"0.0.0.0:9000\"\nws_path = \"/ws\"\nstate_dir = \"/var/lib/lfcp\"\nmax_message_bytes = 1048576\nheartbeat_ms = 0\nhandshake_timeout_ms = 5000\nmax_connections = 64\nadmin_body_timeout_ms = 2000\npublic_urls = [\"wss://sync.example.org/v1/ws\"]\nlog_level = \"debug\"\n",
         )
         .unwrap();
         assert_eq!(config.bind, "0.0.0.0:9000".parse().unwrap());
@@ -409,6 +421,7 @@ mod tests {
         assert_eq!(config.heartbeat_ms, 0);
         assert_eq!(config.handshake_timeout_ms, 5_000);
         assert_eq!(config.max_connections, 64);
+        assert_eq!(config.admin_body_timeout_ms, 2_000);
         assert_eq!(config.public_urls, vec!["wss://sync.example.org/v1/ws"]);
         assert_eq!(config.log_level, tracing::Level::DEBUG);
     }
@@ -433,6 +446,10 @@ mod tests {
         assert_eq!(
             field("handshake_timeout_ms = 600001"),
             "handshake_timeout_ms"
+        );
+        assert_eq!(
+            field("admin_body_timeout_ms = 999"),
+            "admin_body_timeout_ms"
         );
         assert_eq!(field("public_urls = [\"https://x/v1/ws\"]"), "public_urls");
         assert_eq!(field("public_urls = [\"wss://u@x/v1/ws\"]"), "public_urls");

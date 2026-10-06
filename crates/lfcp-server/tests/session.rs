@@ -63,6 +63,7 @@ fn vector_options(v: &Vectors) -> (Options, Arc<Script>) {
         max_connections: None,
         abuse: None,
         disk: None,
+        configure: None,
     };
     (options, script)
 }

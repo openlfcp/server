@@ -105,6 +105,7 @@ cargo run -- --config server.toml
 | `heartbeat_ms` | | `30000` | READY heartbeat (§37); a connection silent for three is closed. `0` disables, else 1000–3600000 |
 | `max_connections` | | `1024` | Open TCP connections, WebSocket included; a connection past it gets HTTP 503 with `Retry-After: 5` and is closed. 1–1000000 |
 | `handshake_timeout_ms` | | `10000` | Time allowed for a request's HTTP headers, and for a WebSocket connection to reach READY; 1000–600000 |
+| `admin_body_timeout_ms` | | `10000` | Time allowed for a setup/admin request body; a slower body gets HTTP 408 and its connection is closed. 1000–600000 |
 | `log_level` | `--log-level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 | `trusted_proxies` | | `[]` | Proxies (IPv4/IPv6 CIDRs or addresses) whose `client_ip_header` is believed; see "Abuse limits" |
 | `client_ip_header` | | `x-forwarded-for` | The header a trusted proxy puts the client IP in: `x-forwarded-for`, `x-real-ip`, `cf-connecting-ip` or any other |
@@ -497,6 +498,10 @@ Later administration:
   answer as `GET`.
 - `GET /admin/resources`: per Resource, its ID, Control Head sequence,
   object counts and bytes; never contents.
+
+A request body (at most 16 KiB) must arrive within
+`admin_body_timeout_ms` (default 10 s). A slower one gets 408 and the
+connection is closed, so a trickled body cannot hold a connection place.
 
 `GET /health` stays `{"status":"ok"}`.
 
