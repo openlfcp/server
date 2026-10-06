@@ -44,7 +44,10 @@ acknowledged after its transaction commits.
 - Permissions: a state directory the server creates is mode 0700. The
   database and its `-wal` and `-shm` files are mode 0600, tightened at
   every start if an older server left them looser. An existing state
-  directory keeps its mode.
+  directory keeps its mode. This applies on Unix. On Windows the server
+  does not tighten permissions: the state files inherit the state
+  directory's ACL, so put the state directory where only the server's
+  user can read it (e.g. under that user's profile).
 
 - Durability: WAL journal with `synchronous = FULL`, so a committed write
   survives a crash or power loss (on storage that honors fsync). `tests/process_restart.rs` checks this on the real binary: it kills the
