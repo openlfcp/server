@@ -32,6 +32,19 @@
 //! `ERROR(RATE_LIMITED)` and close 1008; and a message over
 //! [`Limits::pre_ready_message_bytes`] gets `ERROR(MESSAGE_TOO_LARGE)` and
 //! close 1009 without being decoded.
+//!
+//! Closing (lingering close): when the server closes, unread bytes from the
+//! peer may still be on their way or in the socket's receive buffer (e.g.
+//! the rest of an oversized message). Closing a TCP socket with unread data
+//! makes the kernel send RST (always on Linux), and a RST makes the peer
+//! discard the ERROR and close frame it has not read yet, so it would never
+//! learn why it was dropped. So after the close frame is flushed, the
+//! write half is shut down (FIN: the peer reads every frame, then EOF), and
+//! incoming bytes are read and discarded until the peer's EOF, for at most
+//! [`Limits::linger_timeout`] and [`Limits::linger_bytes`], or until the
+//! server shuts down; only then is the socket dropped. A peer that keeps
+//! sending past those bounds can still get a RST: the bound keeps a
+//! closing connection from holding its slot indefinitely.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -47,6 +60,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use lfcp::base::Error;
 use lfcp::wire::message::{Body, DecodeOptions, ErrorBody, FrameKind, Message};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio_tungstenite::tungstenite::error::{CapacityError, Error as WsError};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
@@ -80,6 +94,11 @@ pub struct Limits {
     pub pre_ready_messages: usize,
     /// The largest message decoded before the session is ready.
     pub pre_ready_message_bytes: usize,
+    /// How long a closing connection reads and discards the peer's bytes
+    /// before the socket is dropped (lingering close).
+    pub linger_timeout: Duration,
+    /// How many bytes a closing connection reads and discards at most.
+    pub linger_bytes: usize,
 }
 
 impl Limits {
@@ -96,6 +115,8 @@ impl Limits {
             handshake_timeout: Duration::from_secs(10),
             pre_ready_messages: 16,
             pre_ready_message_bytes: 64 * 1024,
+            linger_timeout: Duration::from_secs(2),
+            linger_bytes: max_message_bytes.saturating_add(64 * 1024),
         }
     }
 
@@ -400,16 +421,18 @@ pub async fn serve<S: Session>(
                 Ok(Ok(())) => break,
                 Ok(Err(error)) => {
                     tracing::debug!(conn = id, %error, "write failed");
-                    return;
+                    return None;
                 }
                 Err(_) => {
                     tracing::info!(conn = id, "write timed out; closing a slow connection");
-                    return;
+                    return None;
                 }
             }
         }
         // Flush and wait briefly for the peer's close.
         let _ = tokio::time::timeout(limits.close_timeout, sink.close()).await;
+        // Handed back for the lingering close.
+        Some(sink)
     });
     let out = Outbound::new(queue.clone());
     let abort = out.abort.clone();
@@ -560,9 +583,48 @@ pub async fn serve<S: Session>(
     // up after the write and close timeouts.
     let budget = limits.write_timeout + limits.close_timeout;
     let abort = writer.abort_handle();
-    if tokio::time::timeout(budget, writer).await.is_err() {
-        abort.abort();
-        tracing::info!(conn = id, "writer did not finish; dropping the connection");
+    match tokio::time::timeout(budget, writer).await {
+        Ok(Ok(Some(sink))) => {
+            if let Ok(socket) = stream.reunite(sink) {
+                linger(socket.into_inner(), &limits, &mut shutdown).await;
+            }
+        }
+        Ok(_) => {}
+        Err(_) => {
+            abort.abort();
+            tracing::info!(conn = id, "writer did not finish; dropping the connection");
+        }
     }
     tracing::info!(conn = id, "websocket closed");
+}
+
+/// The lingering close (see the module documentation): shut down the write
+/// half, then read and discard the peer's bytes until EOF, within
+/// `linger_timeout` and `linger_bytes`, or until the server shuts down.
+async fn linger<S: AsyncRead + AsyncWrite + Unpin>(
+    mut socket: S,
+    limits: &Limits,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let drain = async {
+        let _ = socket.shutdown().await;
+        let mut buffer = [0u8; 16 * 1024];
+        let mut left = limits.linger_bytes;
+        loop {
+            match socket.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) if n >= left => return,
+                Ok(n) => left -= n,
+            }
+        }
+    };
+    tokio::select! {
+        _ = tokio::time::timeout(limits.linger_timeout, drain) => {}
+        () = stopped(shutdown) => {}
+    }
+}
+
+/// Completes once the server is shutting down (or gone).
+async fn stopped(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
 }
