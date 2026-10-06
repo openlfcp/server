@@ -18,7 +18,11 @@
 //! upgrade past [`crate::limits::AbuseLimits::max_connections_per_ip`]
 //! open WebSockets of its client, or past
 //! [`crate::limits::AbuseLimits::connections_per_ip_per_minute`] new ones,
-//! gets `429 Too Many Requests` with `Retry-After`, and no WebSocket.
+//! gets `429 Too Many Requests` with `Retry-After`, and no WebSocket. An
+//! admin request (`/setup`, `/admin/*`) past
+//! [`crate::limits::AbuseLimits::admin_requests_per_ip_per_minute`] of its
+//! client gets `429` with `Retry-After` and the JSON error
+//! [`ADMIN_RATE_LIMITED`], before its body is read.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -48,6 +52,9 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// The answer to a connection past [`Config::max_connections`].
 const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 5\r\ncontent-type: text/plain\r\ncontent-length: 19\r\nconnection: close\r\n\r\nserver at capacity\n";
+
+/// The error of an admin request past the per-IP rate.
+pub const ADMIN_RATE_LIMITED: &str = "too many admin requests from this address; retry later";
 
 /// How many refused connections may be answering [`BUSY`] at once; past
 /// that they are closed without an answer.
@@ -237,6 +244,14 @@ async fn route<F: SessionFactory>(
             .as_ref()
             .filter(|_| crate::admin::Admin::handles(request.uri().path()))
         {
+            let client_ip = shared.proxies.client_ip(peer.ip(), request.headers());
+            if let Err(wait) = shared
+                .ips
+                .admin_request(client_ip, std::time::Instant::now())
+            {
+                tracing::info!(%peer, client = %client_ip, "admin rate limit; refusing");
+                return Ok(admin_rate_limited(wait));
+            }
             return Ok(admin.handle(request).await);
         }
         return Ok(http::route(request.method(), request.uri().path()));
@@ -293,4 +308,16 @@ fn too_many(refused: Refused) -> Response<Full<Bytes>> {
         .header("retry-after", retry.to_string())
         .body(Full::new(Bytes::from_static(body.as_bytes())))
         .expect("a static response is valid")
+}
+
+/// The answer to an admin request past its client's rate.
+fn admin_rate_limited(wait: Duration) -> Response<Full<Bytes>> {
+    let body = serde_json::json!({ "error": ADMIN_RATE_LIMITED }).to_string();
+    Response::builder()
+        .status(hyper::StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .header("retry-after", retry_after(wait).to_string())
+        .body(Full::new(Bytes::from(body)))
+        .expect("a valid response")
 }

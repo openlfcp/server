@@ -401,6 +401,7 @@ struct Entry {
     open: usize,
     seen: Instant,
     connects: Option<Bucket>,
+    admin: Option<Bucket>,
 }
 
 impl Entry {
@@ -409,12 +410,15 @@ impl Entry {
             open: 0,
             seen: now,
             connects: None,
+            admin: None,
         }
     }
 
     /// Nothing to remember: dropping it changes no decision.
     fn is_idle(&self, now: Instant) -> bool {
-        self.open == 0 && self.connects.is_none_or(|b| b.is_full(now))
+        self.open == 0
+            && self.connects.is_none_or(|b| b.is_full(now))
+            && self.admin.is_none_or(|b| b.is_full(now))
     }
 }
 
@@ -431,6 +435,7 @@ fn take(slot: &mut Option<Bucket>, rate: Option<Rate>, now: Instant) -> Result<(
 pub struct IpTable {
     max_open: usize,
     connects: Option<Rate>,
+    admin: Option<Rate>,
     max_tracked: usize,
     entries: Mutex<HashMap<IpKey, Entry>>,
 }
@@ -441,6 +446,7 @@ impl IpTable {
         Arc::new(IpTable {
             max_open: limits.max_connections_per_ip,
             connects: Rate::per_minute(limits.connections_per_ip_per_minute),
+            admin: Rate::per_minute(limits.admin_requests_per_ip_per_minute),
             max_tracked: limits.max_tracked_ips,
             entries: Mutex::default(),
         })
@@ -486,6 +492,15 @@ impl IpTable {
             table: self.clone(),
             key: IpKey::of(ip),
         })
+    }
+}
+
+impl IpTable {
+    /// Admit one admin HTTP request from `ip`, or say how long until
+    /// [`AbuseLimits::admin_requests_per_ip_per_minute`] admits one.
+    pub fn admin_request(&self, ip: IpAddr, now: Instant) -> Result<(), Duration> {
+        let rate = self.admin;
+        self.with(ip, now, |entry| take(&mut entry.admin, rate, now))
     }
 }
 
@@ -729,6 +744,24 @@ mod tests {
         assert_eq!(wait, Duration::from_secs(20));
         assert!(t.connect(ip("192.0.2.2"), now).is_ok(), "another IP");
         assert!(t.connect(ip("192.0.2.1"), now + wait).is_ok());
+    }
+
+    #[test]
+    fn admin_requests_per_ip_are_rate_limited() {
+        let t = table(AbuseLimits {
+            admin_requests_per_ip_per_minute: 2,
+            ..AbuseLimits::default()
+        });
+        let now = Instant::now();
+        assert!(t.admin_request(ip("192.0.2.1"), now).is_ok());
+        assert!(t.admin_request(ip("192.0.2.1"), now).is_ok());
+        assert_eq!(
+            t.admin_request(ip("192.0.2.1"), now),
+            Err(Duration::from_secs(30))
+        );
+        assert!(t.admin_request(ip("192.0.2.2"), now).is_ok(), "another IP");
+        // Connections and admin requests are counted apart.
+        assert!(t.connect(ip("192.0.2.1"), now).is_ok());
     }
 
     #[test]

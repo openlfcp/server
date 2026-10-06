@@ -185,3 +185,55 @@ async fn websocket_messages_are_rate_limited() {
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// One HTTP/1.1 request on a new connection: status, Retry-After, body.
+async fn http(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+) -> (u16, Option<String>, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).await.unwrap();
+    let reply = String::from_utf8(reply).unwrap();
+    let (head, body) = reply.split_once("\r\n\r\n").unwrap();
+    let retry = head
+        .lines()
+        .find_map(|l| l.strip_prefix("retry-after: "))
+        .map(str::to_owned);
+    (head[9..12].parse().unwrap(), retry, body.to_owned())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_requests_are_rate_limited_per_ip() {
+    let dir = state_dir("abuse-admin-rate");
+    let server = start(
+        &dir,
+        with(AbuseLimits {
+            admin_requests_per_ip_per_minute: 3,
+            ..AbuseLimits::default()
+        }),
+    )
+    .await;
+    assert_eq!(http(server.addr, "GET", "/setup").await.0, 200);
+    assert_eq!(http(server.addr, "POST", "/admin/challenge").await.0, 200);
+    assert_eq!(http(server.addr, "GET", "/admin/status").await.0, 401);
+    let (status, retry, body) = http(server.addr, "POST", "/admin/challenge").await;
+    assert_eq!(status, 429);
+    assert_eq!(retry.as_deref(), Some("20"));
+    assert_eq!(
+        body,
+        r#"{"error":"too many admin requests from this address; retry later"}"#
+    );
+    // Health and WebSocket are not admin requests.
+    assert_eq!(http(server.addr, "GET", "/health").await.0, 200);
+    let _ws = Client::connect(server.addr).await;
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
