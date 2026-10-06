@@ -1,0 +1,16 @@
+# lfcp-server configuration for deploy/check.sh only (LFCP-055).
+#
+# Mounted over /etc/lfcp/server.toml by compose.check.yaml: server.toml plus
+# the Control Coordinator URLs of the published test vectors, so the Rust
+# test client can host the vectors' Resource and put its Control Records
+# (WIRE-01 §21). A real deployment uses server.toml.
+
+bind = "0.0.0.0:7820"
+ws_path = "/v1/ws"
+state_dir = "/var/lib/lfcp"
+log_level = "info"
+public_urls = [
+    "wss://localhost/v1/ws",
+    "wss://sync-a.example.test/v1/ws",
+    "wss://sync-b.example.test/v1/ws",
+]
