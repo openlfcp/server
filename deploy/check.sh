@@ -36,6 +36,23 @@ phase() {
         cargo test --quiet --test container -- --ignored --exact container_phase)
 }
 
+# The admin HTTP surface (LFCP-046) over https through the proxy, trusting
+# Caddy's local CA (re-read after the proxy's volume is recreated).
+trust() { "${compose[@]}" cp proxy:/data/caddy/pki/authorities/local/root.crt "$work/root.crt"; }
+https() { curl --fail --silent --show-error --cacert "$work/root.crt" "$@"; }
+field() { sed -n "s/.*\"$1\": *\"\{0,1\}\([^\",}]*\).*/\1/p"; }
+# The body of an admin request: a proof by the vectors' bob for $1 ("pair"
+# or "session") over the server ID and a fresh challenge.
+admin_body() {
+    local id challenge
+    id="$(https https://localhost:18443/setup | field server_id)"
+    challenge="$(https -X POST https://localhost:18443/admin/challenge | field challenge)"
+    (cd "$server" && LFCP_E2E_PHASE=admin-proof LFCP_E2E_PURPOSE="$1" LFCP_E2E_SERVER_ID="$id" \
+        LFCP_E2E_CHALLENGE="$challenge" LFCP_E2E_OUT="$2" LFCP_E2E_ADDR=127.0.0.1:1 LFCP_E2E_STATE=/dev/null \
+        cargo test --quiet --test container -- --ignored --exact container_phase)
+}
+paired() { https https://localhost:18443/setup | field paired; }
+
 echo "check: build and start"
 "${compose[@]}" up -d --build --wait
 
@@ -65,7 +82,7 @@ grep -q 'pairing code written to /var/lib/lfcp/setup-code' <<<"$logs" ||
 if grep -qF "$code" <<<"$logs"; then fail "the pairing code is in docker logs"; fi
 
 echo "check: wss through the proxy"
-"${compose[@]}" cp proxy:/data/caddy/pki/authorities/local/root.crt "$work/root.crt"
+trust
 curl --fail --silent --show-error --cacert "$work/root.crt" https://localhost:18443/health | grep -q '"ok"' ||
     fail "/health through the proxy"
 # A WebSocket upgrade with lfcp-1: 101 and the subprotocol selected. curl
@@ -77,16 +94,46 @@ curl --silent --http1.1 --cacert "$work/root.crt" --max-time 2 --dump-header "$w
 grep -q '^HTTP/1.1 101' "$work/upgrade" || fail "no 101 through the proxy: $(head -1 "$work/upgrade")"
 grep -qi '^sec-websocket-protocol: lfcp-1' "$work/upgrade" || fail "lfcp-1 not selected"
 
+# First-run pairing (LFCP-046) over https through the proxy, with the code
+# read from its private file; the code is never echoed, and it is never
+# in the logs.
+echo "check: first-run pairing over https"
+[ "$(paired)" = false ] || fail "a new server is already paired"
+admin_body pair "$work/pair.json"
+sed -i.bak "s/^{/{\"code\":\"$code\",/" "$work/pair.json"
+https -X POST -H 'Content-Type: application/json' --data @"$work/pair.json" \
+    https://localhost:18443/setup/pair >/dev/null || fail "pairing was refused"
+rm -f "$work/pair.json" "$work/pair.json.bak"
+[ "$(paired)" = true ] || fail "the server is not paired after /setup/pair"
+if "${compose[@]}" cp lfcp-server:/var/lib/lfcp/setup-code - >/dev/null 2>&1; then
+    fail "the pairing code file is still there after pairing"
+fi
+admin_body session "$work/session.json"
+token="$(https -X POST -H 'Content-Type: application/json' --data @"$work/session.json" \
+    https://localhost:18443/admin/session | field token)"
+[ -n "$token" ] || fail "no admin session for the paired administrator"
+https -H "Authorization: Bearer $token" https://localhost:18443/admin/status >/dev/null ||
+    fail "/admin/status with the admin token"
+if "${compose[@]}" logs lfcp-server 2>&1 | grep -qF "$code"; then fail "the pairing code is in docker logs"; fi
+
 phase populate
 
 echo "check: recreate the containers on the same volume"
 "${compose[@]}" down
 "${compose[@]}" up -d --wait
 phase verify
+[ "$(paired)" = true ] || fail "the pairing did not survive the restart"
+if "${compose[@]}" cp lfcp-server:/var/lib/lfcp/setup-code - >/dev/null 2>&1; then
+    fail "a paired server wrote a new pairing code"
+fi
 
 echo "check: destroy the volume"
 "${compose[@]}" down -v
 "${compose[@]}" up -d --wait
 phase fresh
+trust
+[ "$(paired)" = false ] || fail "a destroyed volume is still paired"
+fresh_code="$("${compose[@]}" cp lfcp-server:/var/lib/lfcp/setup-code - | tar -xO)"
+[ -n "$fresh_code" ] && [ "$fresh_code" != "$code" ] || fail "a new server has no new pairing code"
 
 echo "check: all passed"

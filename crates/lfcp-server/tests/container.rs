@@ -8,11 +8,20 @@
 //!   destroyed: a new server ID and no Resource).
 //! - `LFCP_E2E_STATE`: a file carrying the server ID and the randomized Key
 //!   Package from `populate` to the later phases.
+//!
+//! The `admin-proof` phase needs no server: it writes the body of an admin
+//! request (LFCP-046: the principal, the challenge and a COSE_Sign1 proof by
+//! the vectors' `bob` over ["LFCP-ADMIN-v1", purpose, server_id,
+//! challenge]) to `LFCP_E2E_OUT`, for `LFCP_E2E_PURPOSE` ("pair" or
+//! "session"), `LFCP_E2E_SERVER_ID` and `LFCP_E2E_CHALLENGE` (hex).
+//! deploy/check.sh sends it over https through the proxy.
 
 mod support;
 
 use std::net::SocketAddr;
 
+use lfcp::cbor::{self, Value};
+use lfcp::cose;
 use lfcp::wire::message::Body;
 use support::durability::{populate, second_package, session, verify_after_restart};
 use support::vectors::Vectors;
@@ -27,6 +36,24 @@ fn env(name: &str) -> String {
 #[ignore = "needs a running container; run deploy/check.sh"]
 async fn container_phase() {
     let v = Vectors::load();
+    if env("LFCP_E2E_PHASE") == "admin-proof" {
+        let challenge = env("LFCP_E2E_CHALLENGE");
+        let transcript = cbor::encode(&Value::Array(vec![
+            Value::text("LFCP-ADMIN-v1"),
+            Value::text(env("LFCP_E2E_PURPOSE")),
+            Value::bytes(lfcp::base::from_hex(&env("LFCP_E2E_SERVER_ID")).unwrap()),
+            Value::bytes(lfcp::base::from_hex(&challenge).unwrap()),
+        ]))
+        .unwrap();
+        let keys = v.principal("bob");
+        let body = serde_json::json!({
+            "principal": lfcp::base::to_hex(&keys.descriptor().encode()),
+            "challenge": challenge,
+            "proof": lfcp::base::to_hex(cose::sign(&transcript, &keys).unwrap().bytes()),
+        });
+        std::fs::write(env("LFCP_E2E_OUT"), body.to_string()).unwrap();
+        return;
+    }
     let addr: SocketAddr = env("LFCP_E2E_ADDR").parse().unwrap();
     let state = std::path::PathBuf::from(env("LFCP_E2E_STATE"));
     match env("LFCP_E2E_PHASE").as_str() {
