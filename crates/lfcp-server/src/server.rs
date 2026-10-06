@@ -259,7 +259,12 @@ async fn route<F: SessionFactory>(
         client: Client::new(client_ip, shared.ips.clone()),
         server_id: shared.server_id,
         limits: Limits::new(shared.config.max_message_bytes, shared.config.heartbeat_ms)
-            .with_handshake_timeout(Duration::from_millis(shared.config.handshake_timeout_ms)),
+            .with_handshake_timeout(Duration::from_millis(shared.config.handshake_timeout_ms))
+            .with_message_rate(crate::limits::Rate::new(
+                shared.config.abuse.ws_messages_per_second,
+                Duration::from_secs(1),
+                shared.config.abuse.ws_message_burst,
+            )),
     };
     let session = shared.sessions.open(&connection);
     let alive = shared.alive.clone();

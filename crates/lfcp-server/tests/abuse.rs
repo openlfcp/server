@@ -149,3 +149,39 @@ async fn new_websockets_per_ip_are_rate_limited() {
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_messages_are_rate_limited() {
+    use lfcp::wire::message::Body;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let dir = state_dir("abuse-message-rate");
+    let server = start(
+        &dir,
+        with(AbuseLimits {
+            ws_messages_per_second: 1,
+            ws_message_burst: 5,
+            ..AbuseLimits::default()
+        }),
+    )
+    .await;
+    let mut client = Client::connect(server.addr).await;
+    client.handshake(&keys()).await; // HELLO and AUTH: 2 of the 5
+    for i in 0..3u8 {
+        client.request(Body::Ping([i; 8])).await;
+        assert!(matches!(client.recv().await.body, Body::Pong(_)));
+    }
+    client.request(Body::Ping([3; 8])).await;
+    let Body::Error(error) = client.recv().await.body else {
+        panic!("ERROR expected")
+    };
+    assert_eq!(error.code, 17, "RATE_LIMITED");
+    assert_eq!(
+        error.diagnostic.as_deref(),
+        Some("message rate limit exceeded")
+    );
+    assert_eq!(client.close_code().await, Some(CloseCode::Policy));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}

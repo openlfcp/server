@@ -33,6 +33,10 @@
 //! [`Limits::pre_ready_message_bytes`] gets `ERROR(MESSAGE_TOO_LARGE)` and
 //! close 1009 without being decoded.
 //!
+//! After READY too, a connection may send at most
+//! [`Limits::message_rate`] messages (a token bucket, POST-003): the next
+//! one gets `ERROR(RATE_LIMITED)` with a diagnostic and close 1008.
+//!
 //! Closing (lingering close): when the server closes, unread bytes from the
 //! peer may still be on their way or in the socket's receive buffer (e.g.
 //! the rest of an oversized message). Closing a TCP socket with unread data
@@ -75,8 +79,12 @@ use crate::rng;
 /// The LFCP WebSocket subprotocol (§30).
 pub const SUBPROTOCOL: &str = "lfcp-1";
 
+/// The diagnostic of the `ERROR(RATE_LIMITED)` past
+/// [`Limits::message_rate`].
+pub const RATE_LIMIT_DIAGNOSTIC: &str = "message rate limit exceeded";
+
 /// Per-connection transport limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Limits {
     /// The maximum LFCP message size (§31, advertised in READY §37).
     pub max_message_bytes: usize,
@@ -99,6 +107,9 @@ pub struct Limits {
     pub linger_timeout: Duration,
     /// How many bytes a closing connection reads and discards at most.
     pub linger_bytes: usize,
+    /// Messages per second and burst a connection may send; `None` is no
+    /// limit (POST-003).
+    pub message_rate: Option<crate::limits::Rate>,
 }
 
 impl Limits {
@@ -117,7 +128,14 @@ impl Limits {
             pre_ready_message_bytes: 64 * 1024,
             linger_timeout: Duration::from_secs(2),
             linger_bytes: max_message_bytes.saturating_add(64 * 1024),
+            message_rate: None,
         }
+    }
+
+    /// The same limits with another message rate.
+    pub fn with_message_rate(mut self, rate: Option<crate::limits::Rate>) -> Limits {
+        self.message_rate = rate;
+        self
     }
 
     /// The same limits with another handshake deadline.
@@ -370,9 +388,14 @@ pub fn check_upgrade<B>(request: &Request<B>) -> Upgrade {
 
 /// An ERROR message with `code` alone (§61).
 fn code_message(code: lfcp::base::WireCode) -> Option<Message> {
+    diagnostic_message(code, None)
+}
+
+/// An ERROR message with `code` and an optional diagnostic (§61).
+fn diagnostic_message(code: lfcp::base::WireCode, diagnostic: Option<&str>) -> Option<Message> {
     let body = ErrorBody {
         code: code.number(),
-        diagnostic: None,
+        diagnostic: diagnostic.map(str::to_owned),
         details: None,
     };
     Some(Message::new(rng::nonce16().ok()?, Body::Error(body)))
@@ -460,6 +483,9 @@ pub async fn serve<S: Session>(
     // The handshake deadline is fixed when the connection opens.
     let handshake_deadline = tokio::time::Instant::now() + limits.handshake_timeout;
     let mut pre_ready = 0usize;
+    let mut rate = limits
+        .message_rate
+        .map(|rate| crate::limits::Bucket::new(rate, std::time::Instant::now()));
     loop {
         let ready = session.is_ready();
         let wait = match (deadline, ready) {
@@ -547,6 +573,20 @@ pub async fn serve<S: Session>(
                 close(CloseCode::Size, "message too large before READY");
                 break;
             }
+        }
+        if matches!(frame, Frame::Binary(_) | Frame::Text(_))
+            && rate
+                .as_mut()
+                .is_some_and(|bucket| bucket.take(std::time::Instant::now()).is_err())
+        {
+            tracing::info!(conn = id, "message rate limit; closing");
+            let diagnostic = Some(RATE_LIMIT_DIAGNOSTIC);
+            if let Some(message) = diagnostic_message(lfcp::base::WireCode::RateLimited, diagnostic)
+            {
+                let _ = out.send(message);
+            }
+            close(CloseCode::Policy, "message rate limit");
+            break;
         }
         let decoded = match frame {
             Frame::Binary(bytes) => Message::decode_frame(FrameKind::Binary, &bytes, &options),
