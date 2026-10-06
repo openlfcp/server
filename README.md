@@ -118,8 +118,9 @@ cargo run -- --config server.toml
 | `quota_bytes_per_principal` | | `268435456` (256 MiB) | Quota mode: stored bytes across one hosting Principal's Resources |
 | `quota_bytes_per_resource` | | `134217728` (128 MiB) | Quota mode: stored bytes of one Resource |
 | `hosts_per_ip_per_day` | | `10` | Quota mode: new Resources hosted per client IP per 24 hours; `0` disables, at most 10000 |
-| `max_total_bytes` | | unset | Every mode: the store's total stored bytes; unset is no cap |
-| `min_free_bytes` | | `2147483648` (2 GiB) | Every mode: the least free disk space on `state_dir`; `0` disables |
+| `quota_control_reserve_bytes` | | `16777216` (16 MiB) | Quota mode: what Control Records and Key Packages may store past the byte quotas of their Resource and Principal, so revocation and key rotation work at quota |
+| `max_total_bytes` | | unset | Every mode: the store's total stored bytes (Control Records and Key Packages exempt); unset is no cap |
+| `min_free_bytes` | | `2147483648` (2 GiB) | Every mode: the least free disk space on `state_dir` for bulk writes; Control Records and Key Packages pass until a quarter of it; `0` disables |
 | `disk_check_interval_ms` | | `10000` | How long a free disk space reading is reused; 100–3600000 |
 
 `GET /health` answers `{"status":"ok"}` and nothing else.
@@ -172,18 +173,29 @@ reaches the proxy. `deploy/` does this for Caddy (see "Docker").
 | messages per WebSocket connection (`ws_messages_per_second`, `ws_message_burst`, token bucket) | 50/s, burst 200 | `ERROR(RATE_LIMITED)`, `message rate limit exceeded`, close 1008 |
 | admin requests per client IP (`admin_requests_per_ip_per_minute`; `/setup`, `/admin/*`, not `/health`) | 60/min | HTTP 429, `Retry-After`, `{"error": "too many admin requests from this address; retry later"}`, before the body is read |
 | quota mode: Resources per hosting Principal (`quota_resources_per_principal`) | 20 | `RESOURCE_HOST`: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: Resources per hosting Principal` |
-| quota mode: stored bytes per hosting Principal (`quota_bytes_per_principal`) | 256 MiB | `RESOURCE_HOST` and puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: stored bytes per hosting Principal` |
-| quota mode: stored bytes per Resource (`quota_bytes_per_resource`) | 128 MiB | puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: stored bytes per Resource` |
+| quota mode: stored bytes per hosting Principal (`quota_bytes_per_principal`) | 256 MiB | `RESOURCE_HOST` and puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: stored bytes per hosting Principal`; control puts only past it plus the reserve |
+| quota mode: stored bytes per Resource (`quota_bytes_per_resource`) | 128 MiB | puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: stored bytes per Resource`; control puts only past it plus the reserve |
 | quota mode: new Resources per client IP per 24 h (`hosts_per_ip_per_day`) | 10 | `RESOURCE_HOST`: `NACK(RATE_LIMITED)`, `rate limited: new Resources per client address per day` |
-| every mode: the store's total (`max_total_bytes`) | unset | `RESOURCE_HOST` and puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: server storage full` |
-| every mode: free disk on `state_dir` (`min_free_bytes`) | 2 GiB | `RESOURCE_HOST` and puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: server disk space low` |
+| every mode: the store's total (`max_total_bytes`) | unset | `RESOURCE_HOST` and bulk puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: server storage full` |
+| every mode: free disk on `state_dir` (`min_free_bytes`) | 2 GiB | `RESOURCE_HOST` and bulk puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: server disk space low` |
+| every mode: the hard disk floor, a quarter of `min_free_bytes` | 512 MiB | every put: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: server disk space critically low` |
 
 - "Puts" are `CONTROL_PUT`, `DATA_PUT`, `KEY_PACKAGE_PUT` and
   `SNAPSHOT_PUT`: a write is refused when it would pass a byte limit
-  (stored bytes plus the request's objects). At its quota a Resource takes
-  no Control Record either, a revocation included: raise the quota (an
-  override) to let it continue. Reads (`RESOURCE_OPEN`, `*_HAVE`,
-  `*_GET`) keep working.
+  (stored bytes plus the request's objects). Reads (`RESOURCE_OPEN`,
+  `*_HAVE`, `*_GET`) keep working.
+- Revocation always gets through. "Control puts", `CONTROL_PUT` and
+  `KEY_PACKAGE_PUT`, carry what a revocation needs end to end: the
+  Capability Revoke, the Key Epoch that rotates the DEK, and the Key
+  Packages that deliver it to the remaining readers. They are exempt from
+  `max_total_bytes`, pass a low disk until the hard floor, and may store
+  `quota_control_reserve_bytes` past the byte quotas, so a writer who
+  fills a Resource cannot block their own revocation. "Bulk puts",
+  `DATA_PUT` and `SNAPSHOT_PUT`, keep every limit. The reserve is bounded
+  rather than unlimited: anyone can own a Resource of their own and
+  would otherwise write Control Records without end. A member who may
+  write Control Records can still use up the reserve; the administrator
+  can then raise the Principal's quota with an override.
 - Hosting the same Genesis again is not a new Resource: it passes every
   hosting limit.
 - Stored bytes are the exact object bytes (`resource_usage`, kept by
