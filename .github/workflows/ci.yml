@@ -45,6 +45,31 @@ jobs:
       # Includes tests/dependency_policy.rs: no Automerge, no shared-objects.
       - run: cargo test --workspace
 
+  # The library's unit tests on Windows (the obsidian Platform smoke runs
+  # this server there): state directory, identity, configuration, admin.
+  # The integration tests are Unix-tested by the build job.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: server
+      - id: locks
+        run: |
+          echo "sdk=$(jq -er .commit sdk-rs.lock)" >> "$GITHUB_OUTPUT"
+          echo "spec=$(jq -er .tag spec.lock)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: openlfcp/sdk-rs
+          ref: ${{ steps.locks.outputs.sdk }}
+          path: sdk-rs
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --lib
+
   # LFCP-055: build the image and run the compose check (non-root, health,
   # wss through the proxy, restart on the same volume, a destroyed volume).
   docker:
