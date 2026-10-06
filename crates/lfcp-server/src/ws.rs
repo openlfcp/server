@@ -233,18 +233,32 @@ impl Outbound {
             .map_err(|_| Overloaded)
     }
 
-    /// Queue a message, waiting for room in the budgets and the queue;
-    /// [`Overloaded`] once the connection is closing.
+    /// Queue a control reply (anything but a GET page or a Snapshot),
+    /// waiting for room in the budgets, ahead of bulk replies, and in the
+    /// queue; [`Overloaded`] once the connection is closing.
     pub async fn send_wait(&self, message: Message) -> Result<(), Overloaded> {
+        let bytes = message.encode();
+        drop(message);
+        let reservation = self
+            .budgets
+            .reserve_control(bytes.len())
+            .await
+            .ok_or(Overloaded)?;
+        self.send_reserved(bytes, reservation).await
+    }
+
+    /// Queue a bulk reply (a Snapshot), waiting for room in the budgets
+    /// and the queue; [`Overloaded`] once the connection is closing.
+    pub async fn send_bulk(&self, message: Message) -> Result<(), Overloaded> {
         let bytes = message.encode();
         drop(message);
         let reservation = self.reserve(bytes.len()).await?;
         self.send_reserved(bytes, reservation).await
     }
 
-    /// Reserve `bytes` of the budgets, waiting for room, before building
-    /// a message of at most that size; [`Overloaded`] once the connection
-    /// is closing.
+    /// Reserve `bytes` of the budgets for a bulk reply, waiting for room,
+    /// before building a message of at most that size; [`Overloaded`] once
+    /// the connection is closing.
     pub async fn reserve(&self, bytes: usize) -> Result<Reservation, Overloaded> {
         self.budgets.reserve(bytes).await.ok_or(Overloaded)
     }
@@ -543,14 +557,21 @@ pub async fn serve<S: Session>(
             writer_budgets.halt();
         };
         while let Some(item) = outbox.recv().await {
-            let (frame, reservation, last) = match item {
+            let (written, last) = match item {
                 Out::Lfcp(bytes, reservation) => {
-                    (Frame::Binary(bytes.into()), Some(reservation), false)
+                    let write = sink.send(Frame::Binary(bytes.into()));
+                    let written = tokio::time::timeout(limits.write_timeout, write).await;
+                    drop(reservation);
+                    (written, false)
                 }
-                Out::Close(close) => (Frame::Close(Some(close)), None, true),
+                Out::Close(close) => {
+                    let write = sink.send(Frame::Close(Some(close)));
+                    (
+                        tokio::time::timeout(limits.write_timeout, write).await,
+                        true,
+                    )
+                }
             };
-            let written = tokio::time::timeout(limits.write_timeout, sink.send(frame)).await;
-            drop(reservation);
             match written {
                 Ok(Ok(())) if !last => {}
                 Ok(Ok(())) => break,

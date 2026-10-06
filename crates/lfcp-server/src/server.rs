@@ -101,7 +101,7 @@ impl Server {
         store: Arc<Store>,
     ) -> std::io::Result<Server> {
         let listener = TcpListener::bind(config.bind).await?;
-        let outbound = ByteBudget::new(config.max_total_outbound_bytes);
+        let outbound = ByteBudget::server(config.max_total_outbound_bytes);
         Ok(Server {
             admin: None,
             listener,

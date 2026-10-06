@@ -1126,16 +1126,19 @@ impl LfcpSession {
                 .map(|all| all.into_iter().next().map(|s| s.bytes)),
         };
         match found {
+            // A Snapshot is a bulk reply, up to the message size limit.
             Ok(Some(snapshot)) => {
-                self.send(
-                    out,
-                    Some(request),
-                    Body::Snapshot {
-                        resource_id,
-                        snapshot,
-                    },
-                )
-                .await
+                let body = Body::Snapshot {
+                    resource_id,
+                    snapshot,
+                };
+                let Some(message) = self.message(Some(request), body) else {
+                    return Flow::Close;
+                };
+                match out.send_bulk(message).await {
+                    Ok(()) => Flow::Continue,
+                    Err(_) => Flow::Close,
+                }
             }
             Ok(None) => self.nack(out, request, WireCode::MissingDependency).await,
             Err(error) => self.internal(out, request, &error).await,

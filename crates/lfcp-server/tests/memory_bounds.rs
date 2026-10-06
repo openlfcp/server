@@ -1,6 +1,8 @@
 //! Memory bounds on authenticated and admin peers (POST-004, security
 //! review H6): outbound bytes per connection and server-wide, a peer that
-//! stops reading, and the admin request body read timeout.
+//! stops reading, control replies while GET pages fill the server-wide
+//! budget, and the admin request body read timeout. Small caps and
+//! Resources: these tests show the bounds hold; they are not load tests.
 
 mod support;
 
@@ -52,11 +54,22 @@ async fn large_resource(
     units: u64,
     size: usize,
 ) -> (Running, std::path::PathBuf) {
+    resource_with(v, name, units, size, Some(small_budgets)).await
+}
+
+/// [`large_resource`] with another configuration change.
+async fn resource_with(
+    v: &Vectors,
+    name: &str,
+    units: u64,
+    size: usize,
+    configure: Option<fn(&mut Config)>,
+) -> (Running, std::path::PathBuf) {
     let dir = state_dir(name);
     let server = start(
         &dir,
         Options {
-            configure: Some(small_budgets),
+            configure,
             ..Options::default()
         },
     )
@@ -135,8 +148,8 @@ async fn eventually(limit: Duration, check: impl Fn() -> bool) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_that_stops_reading_is_closed_and_its_memory_freed() {
     let v = Vectors::load();
-    // 32 MiB of units: far more than the socket buffers and the caps.
-    let (server, dir) = large_resource(&v, "memory-stalled", 2048, 16 * 1024).await;
+    // 8 MiB of units: more than the socket buffers and the caps.
+    let (server, dir) = large_resource(&v, "memory-stalled", 512, 16 * 1024).await;
     let bob = v.principal("bob");
     let mut stalled = Client::connect(server.addr).await;
     stalled.handshake(&bob).await;
@@ -171,7 +184,7 @@ async fn a_peer_that_stops_reading_is_closed_and_its_memory_freed() {
         }
     }
     assert!(
-        frames < 2048 * 16 * 1024 / MESSAGE as u64,
+        frames < 512 * 16 * 1024 / MESSAGE as u64,
         "{frames} batches: not all of them"
     );
 
@@ -188,11 +201,21 @@ async fn a_peer_that_stops_reading_is_closed_and_its_memory_freed() {
 /// Read every DATA_BATCH answering `request` until `units` units arrived;
 /// returns the batches' objects.
 async fn read_batches(client: &mut Client, request: [u8; 16], units: usize) -> Vec<Vec<Vec<u8>>> {
+    read_batches_of(client, request, units, MESSAGE).await
+}
+
+/// [`read_batches`] of messages up to `limit` bytes.
+async fn read_batches_of(
+    client: &mut Client,
+    request: [u8; 16],
+    units: usize,
+    limit: usize,
+) -> Vec<Vec<Vec<u8>>> {
     let mut batches = Vec::new();
     let mut seen = 0;
     while seen < units {
         let bytes = client.next_frame().await.expect("the reply continues");
-        assert!(bytes.len() <= MESSAGE, "a batch of {} bytes", bytes.len());
+        assert!(bytes.len() <= limit, "a batch of {} bytes", bytes.len());
         let message = lfcp::wire::message::Message::decode(&bytes, &Default::default()).unwrap();
         assert_eq!(message.correlation_id, Some(request));
         let Body::DataBatch { units, .. } = message.body else {
@@ -208,9 +231,9 @@ async fn read_batches(client: &mut Client, request: [u8; 16], units: usize) -> V
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_resource_is_served_within_the_byte_caps() {
     let v = Vectors::load();
-    // 32 MiB of units: 128 × the message size, 32 × the connection cap,
-    // 8 × the server-wide cap.
-    let units = 2048u64;
+    // 8 MiB of units: 32 × the message size, 8 × the connection cap,
+    // 2 × the server-wide cap.
+    let units = 512u64;
     let (server, dir) = large_resource(&v, "memory-large", units, 16 * 1024).await;
     let bob = v.principal("bob");
     let actor = *bob.descriptor().id();
@@ -227,16 +250,16 @@ async fn a_large_resource_is_served_within_the_byte_caps() {
                 DataRange {
                     principal: actor,
                     start: 1,
-                    end: 700,
+                    end: 200,
                 },
                 DataRange {
                     principal: actor,
-                    start: 701,
-                    end: 701,
+                    start: 201,
+                    end: 201,
                 },
                 DataRange {
                     principal: actor,
-                    start: 702,
+                    start: 202,
                     end: u64::MAX,
                 },
             ],
@@ -308,6 +331,56 @@ async fn a_large_resource_is_served_within_the_byte_caps() {
     let reply = client.recv().await;
     assert_eq!(reply.correlation_id, Some(request));
     assert!(matches!(reply.body, Body::DataBatch { units, .. } if units.is_empty()));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Small caps with a long write timeout: stalled readers keep their
+/// bytes.
+fn tiny_budgets(config: &mut Config) {
+    config.max_message_bytes = 64 * 1024;
+    config.max_outbound_bytes = 128 * 1024;
+    config.max_total_outbound_bytes = 512 * 1024;
+    config.write_timeout_ms = 10_000;
+}
+
+/// GET pages of readers that stopped reading fill the server-wide budget.
+/// Another session's handshake and replies are control traffic: they never
+/// queue behind those pages, and get through at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handshake_gets_through_while_get_pages_fill_the_global_budget() {
+    let v = Vectors::load();
+    let (server, dir) =
+        resource_with(&v, "memory-control", 256, 16 * 1024, Some(tiny_budgets)).await;
+    let bob = v.principal("bob");
+    let mut stalled = Vec::new();
+    for _ in 0..16 {
+        let mut client = Client::connect(server.addr).await;
+        client.handshake(&bob).await;
+        client.request(get_all(&v, &bob)).await;
+        stalled.push(client);
+    }
+    // Pages waiting on the server-wide budget: it is full for bulk
+    // replies.
+    assert!(
+        eventually(Duration::from_secs(5), || server.outbound.waiting() > 0).await,
+        "pages wait on the global budget: {} used",
+        server.outbound.used()
+    );
+    let started = Instant::now();
+    let mut client = Client::connect(server.addr).await;
+    client.handshake(&bob).await;
+    client.request(Body::Ping([1; 8])).await;
+    assert!(matches!(client.recv().await.body, Body::Pong(_)));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(server.outbound.waiting() > 0, "the pages still wait");
+    assert!(server.outbound.peak() <= 512 * 1024);
+    drop(stalled);
 
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();

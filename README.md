@@ -106,7 +106,7 @@ cargo run -- --config server.toml
 | `max_connections` | | `1024` | Open TCP connections, WebSocket included; a connection past it gets HTTP 503 with `Retry-After: 5` and is closed. 1–1000000 |
 | `handshake_timeout_ms` | | `10000` | Time allowed for a request's HTTP headers, and for a WebSocket connection to reach READY; 1000–600000 |
 | `max_outbound_bytes` | | 4 × `max_message_bytes` | Outbound bytes one WebSocket connection may hold: queued replies, pushes and GET pages being built. At least 2 × `max_message_bytes` |
-| `max_total_outbound_bytes` | | `67108864` | Outbound bytes all connections may hold together; at least `max_outbound_bytes` (the default grows to it) |
+| `max_total_outbound_bytes` | | `67108864` | Outbound bytes all connections may hold together; at least `max_outbound_bytes` (the default grows to it). GET pages and Snapshots may use 7/8 of it, the rest stays free for control replies |
 | `write_timeout_ms` | | `10000` | Time the socket may take to accept one outbound message; a peer that stops reading is then closed and its queue freed. 1000–600000 |
 | `admin_body_timeout_ms` | | `10000` | Time allowed for a setup/admin request body; a slower body gets HTTP 408 and its connection is closed. 1000–600000 |
 | `log_level` | `--log-level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
@@ -246,10 +246,15 @@ WebSocket version 426.
 - Outbound memory is bounded in bytes (security review H6, POST-004).
   Messages are queued encoded, and each holds its size from two budgets
   until it is written: the connection's `max_outbound_bytes` and the
-  server-wide `max_total_outbound_bytes` (`src/budget.rs`). Replies and
-  GET pages wait for room, so a large reply is paced by the peer's
-  reading. A live push that does not fit closes its subscriber (1013), as
-  before. The queue also holds at most 256 messages.
+  server-wide `max_total_outbound_bytes` (`src/budget.rs`). Replies wait
+  for room, so a large reply is paced by the peer's reading. Waiting
+  parks the session: waiters are served in order, each woken once its
+  bytes fit. Bulk replies (GET pages, Snapshots) may use 7/8 of the
+  server-wide budget, and control replies (the handshake, ACK, NACK,
+  PONG, Have vectors) are served ahead of them. So another session's
+  handshake gets through while GET pages fill the server. A live push
+  that does not fit closes its subscriber (1013), as before. The queue
+  also holds at most 256 messages.
 - A write that takes longer than `write_timeout_ms` (10 s) ends the
   connection: its queue is dropped and every reserved byte released, and
   a reply waiting for room stops. A peer that stops reading is therefore
