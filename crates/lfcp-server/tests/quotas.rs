@@ -455,6 +455,8 @@ async fn low_disk_space_refuses_hosting_and_writes_but_not_reads() {
         quota_exceeded(refusal::DISK_LOW)
     );
     assert_eq!(put_d1(&server, &v).await, quota_exceeded(refusal::DISK_LOW));
+    // Key rotation still gets through above the hard floor (a quarter).
+    assert!(matches!(put_kp0(&server, &v).await, Body::Ack(_)));
     // Reads keep working.
     let mut bob = client(&server, &v.principal("bob")).await;
     bob.request(Body::ResourceOpen {
@@ -466,6 +468,13 @@ async fn low_disk_space_refuses_hosting_and_writes_but_not_reads() {
     })
     .await;
     assert!(matches!(bob.recv().await.body, Body::ResourceOpened { .. }));
+    // Under the hard floor nothing is stored.
+    disk.0.store((1 << 29) - 1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        put_kp0(&server, &v).await,
+        quota_exceeded(refusal::DISK_CRITICAL)
+    );
     // Space again: writes resume after the next reading.
     disk.0.store(3 << 30, Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -509,7 +518,236 @@ async fn the_total_cap_applies_in_every_mode() {
         host(&mut owner, other).await,
         quota_exceeded(refusal::SERVER_FULL)
     );
+    // Key rotation is exempt from the total.
+    assert!(matches!(put_kp0(&server, &v).await, Body::Ack(_)));
 
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revocation_and_key_rotation_get_through_at_quota() {
+    use lfcp::wire::control::body::{CapabilityRevokeBody, KeyEpochBody};
+    use lfcp::wire::control::ReceivedControlRecord;
+    use lfcp::wire::data_unit::{DataUnit, DataUnitHeader};
+    use lfcp::wire::frontier::Frontier;
+    use lfcp::wire::key_package::KeyPackage;
+    use lfcp::wire::keys::Dek;
+
+    let v = Vectors::load();
+    // The chain through C8: BOB owns the Resource (C4); CAROL reads
+    // through her claim (C3) and a grant (C7).
+    let dir = state_dir("quota-revocation");
+    let through_c8: u64 = CHAIN[..=8].iter().map(|c| v.cose(c).len() as u64).sum();
+    let units = [v.cose("D1_bob_epoch0_seq1"), v.cose("D2_bob_epoch0_seq2")];
+    let filled = through_c8 + units.iter().map(|u| u.len() as u64).sum::<u64>();
+    // The vectors' coordinator URLs: CONTROL_PUT is coordinated here.
+    let options = Options {
+        public_urls: vec![
+            "wss://sync-a.example.test/v1/ws".into(),
+            "wss://sync-b.example.test/v1/ws".into(),
+        ],
+        ..with(AbuseLimits {
+            quota_bytes_per_resource: filled,
+            ..AbuseLimits::default()
+        })
+    };
+    let server = start(&dir, options).await;
+    server
+        .store
+        .host_resource(
+            v.cose(CHAIN[0]),
+            Hosting {
+                host: *v.principal("owner").descriptor().id(),
+                durability: 2,
+            },
+        )
+        .await
+        .unwrap();
+    for i in 1..=8 {
+        server
+            .store
+            .commit_control_record(v.cose(CHAIN[i]), v.record_id(CHAIN[i - 1]))
+            .await
+            .unwrap();
+    }
+    let bob_keys = v.principal("bob");
+    let mut bob = client(&server, &bob_keys).await;
+    bob.request(Body::DataPut {
+        resource_id: v.resource(),
+        units: units.to_vec(),
+    })
+    .await;
+    assert!(matches!(bob.recv().await.body, Body::Ack(_)));
+    // The Resource is exactly at its quota: CAROL's next unit is refused.
+    let mut carol = client(&server, &v.principal("carol")).await;
+    carol
+        .request(Body::DataPut {
+            resource_id: v.resource(),
+            units: vec![v.cose("D4_carol_epoch1_seq1")],
+        })
+        .await;
+    assert_eq!(
+        carol.recv().await.body,
+        quota_exceeded(refusal::RESOURCE_BYTES)
+    );
+
+    // BOB revokes both of CAROL's read sources and rotates to epoch 2.
+    let mut head = v.record_id("C8_grant_owner_delegated");
+    let mut seq = 8;
+    let mut put = async |body: ControlBody| {
+        seq += 1;
+        let record = ControlRecord::sign(
+            ControlRecordHeader {
+                resource_id: v.resource(),
+                sequence: seq,
+                previous: Some(head),
+                issuer: *bob_keys.descriptor().id(),
+            },
+            body,
+            &bob_keys,
+        )
+        .unwrap()
+        .signed_object()
+        .bytes()
+        .to_vec();
+        bob.request(Body::ControlPut {
+            resource_id: v.resource(),
+            expected_head: head,
+            record: record.clone(),
+        })
+        .await;
+        let reply = bob.recv().await.body;
+        assert!(matches!(reply, Body::Ack(_)), "{reply:?}");
+        head = ReceivedControlRecord::parse(&record).unwrap().id();
+        head
+    };
+    for grant in ["C3_invite_claim_carol", "C7_grant_carol_delegator"] {
+        put(ControlBody::CapabilityRevoke(CapabilityRevokeBody {
+            grant: v.record_id(grant),
+        }))
+        .await;
+    }
+    let dek = Dek::from_bytes([8; 32]);
+    let epoch_head = put(ControlBody::KeyEpoch(KeyEpochBody {
+        epoch: 2,
+        dek_commitment: Hash32::from_bytes([8; 32]),
+        final_frontier: Frontier::new(vec![]).unwrap(),
+        reason: 1,
+    }))
+    .await;
+    let epoch_head = Hash32::from_bytes(*epoch_head.as_bytes());
+    // The new DEK reaches the remaining reader.
+    let package = KeyPackage::seal(
+        v.resource(),
+        2,
+        epoch_head,
+        &dek,
+        bob_keys.descriptor(),
+        &bob_keys,
+    )
+    .unwrap();
+    bob.request(Body::KeyPackagePut {
+        resource_id: v.resource(),
+        packages: vec![package.signed_object().bytes().to_vec()],
+    })
+    .await;
+    let reply = bob.recv().await.body;
+    assert!(matches!(reply, Body::Ack(_)), "{reply:?}");
+    assert!(
+        server.store.total_bytes().await.unwrap() > filled,
+        "past the quota"
+    );
+
+    // CAROL is cut off.
+    let mut carol = client(&server, &v.principal("carol")).await;
+    carol
+        .request(Body::ResourceOpen {
+            resource_id: v.resource(),
+            control_heads: vec![],
+            have: vec![],
+            grant_ids: None,
+            flags: Some(0),
+        })
+        .await;
+    match carol.recv().await.body {
+        Body::Nack(e) => assert_eq!(e.code, 4, "AUTHORIZATION_FAILED"),
+        other => panic!("{other:?}"),
+    }
+    // Bulk data in the new epoch is still held to the quota.
+    let unit = DataUnit::seal(
+        DataUnitHeader {
+            resource_id: v.resource(),
+            data_epoch: 2,
+            actor: *bob_keys.descriptor().id(),
+            sequence: 3,
+            previous: None,
+            control_head: epoch_head,
+        },
+        b"after the rotation",
+        &dek,
+        &bob_keys,
+    )
+    .unwrap();
+    bob.request(Body::DataPut {
+        resource_id: v.resource(),
+        units: vec![unit.signed_object().bytes().to_vec()],
+    })
+    .await;
+    assert_eq!(
+        bob.recv().await.body,
+        quota_exceeded(refusal::RESOURCE_BYTES)
+    );
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+async fn put_kp0(server: &Running, v: &Vectors) -> Body {
+    let mut owner = client(server, &v.principal("owner")).await;
+    owner
+        .request(Body::KeyPackagePut {
+            resource_id: v.resource(),
+            packages: vec![v.cose("KP0_bob_epoch0")],
+        })
+        .await;
+    owner.recv().await.body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_writes_past_the_quota_are_bounded_by_the_reserve() {
+    let v = Vectors::load();
+    let kp0 = v.cose("KP0_bob_epoch0").len() as u64;
+    // A reserve one byte short of the package: refused.
+    let (server, dir) = chain_server(
+        &v,
+        "quota-reserve",
+        AbuseLimits {
+            quota_bytes_per_resource: chain_bytes(&v),
+            quota_control_reserve_bytes: kp0 - 1,
+            ..AbuseLimits::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        put_kp0(&server, &v).await,
+        quota_exceeded(refusal::RESOURCE_BYTES)
+    );
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // Exactly enough: stored past the quota.
+    let (server, dir) = chain_server(
+        &v,
+        "quota-reserve-fits",
+        AbuseLimits {
+            quota_bytes_per_resource: chain_bytes(&v),
+            quota_control_reserve_bytes: kp0,
+            ..AbuseLimits::default()
+        },
+    )
+    .await;
+    assert!(matches!(put_kp0(&server, &v).await, Body::Ack(_)));
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }

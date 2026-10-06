@@ -24,6 +24,7 @@
 //! quota_bytes_per_principal = 268435456
 //! quota_bytes_per_resource = 134217728
 //! hosts_per_ip_per_day = 10
+//! quota_control_reserve_bytes = 16777216 # Control Records, Key Packages past the byte quotas
 //! max_total_bytes = 3221225472          # every mode; unset: no cap
 //! min_free_bytes = 2147483648           # every mode; 0 disables
 //! disk_check_interval_ms = 10000
@@ -163,6 +164,7 @@ struct File {
     quota_bytes_per_principal: Option<u64>,
     quota_bytes_per_resource: Option<u64>,
     hosts_per_ip_per_day: Option<u32>,
+    quota_control_reserve_bytes: Option<u64>,
     max_total_bytes: Option<u64>,
     min_free_bytes: Option<u64>,
     disk_check_interval_ms: Option<u64>,
@@ -345,6 +347,9 @@ fn abuse_limits(file: &File) -> Result<AbuseLimits, ConfigError> {
     if let Some(n) = file.quota_bytes_per_resource {
         limits.quota_bytes_per_resource = n;
     }
+    if let Some(n) = file.quota_control_reserve_bytes {
+        limits.quota_control_reserve_bytes = n;
+    }
     if file.max_total_bytes.is_some() {
         limits.max_total_bytes = file.max_total_bytes;
     }
@@ -485,6 +490,9 @@ mod tests {
         assert_eq!(defaults.quota_bytes_per_principal, 256 << 20);
         assert_eq!(defaults.quota_bytes_per_resource, 128 << 20);
         assert_eq!(defaults.hosts_per_ip_per_day, 10);
+        assert_eq!(defaults.quota_control_reserve_bytes, 16 << 20);
+        let config = Config::from_toml("quota_control_reserve_bytes = 0").unwrap();
+        assert_eq!(config.abuse.quota_control_reserve_bytes, 0);
         assert_eq!(defaults.max_total_bytes, None);
         assert_eq!(defaults.min_free_bytes, 2 << 30);
     }

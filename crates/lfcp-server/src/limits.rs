@@ -23,10 +23,20 @@
 //! the server's connection cap.
 //!
 //! **Storage floor** ([`Floor`]), in every hosting mode: new hosting and
-//! writes are refused with `QUOTA_EXCEEDED` when the store would pass
-//! [`AbuseLimits::max_total_bytes`], or when the free disk space of the
-//! state directory is under [`AbuseLimits::min_free_bytes`]. Reads keep
-//! working. The free space is read at most once per
+//! bulk writes ([`WriteClass::Bulk`]) are refused with `QUOTA_EXCEEDED`
+//! when the store would pass [`AbuseLimits::max_total_bytes`], or when
+//! the free disk space of the state directory is under
+//! [`AbuseLimits::min_free_bytes`]. Reads keep working.
+//!
+//! **Revocation always gets through** ([`WriteClass::Control`]): Control
+//! Records and Key Packages (a revocation, the Key Epoch that rotates the
+//! DEK, the packages that deliver it) are exempt from `max_total_bytes`
+//! and pass a low disk until the hard floor of a quarter of
+//! `min_free_bytes`, where the server stops every write to protect
+//! itself. In quota mode they may also use
+//! [`AbuseLimits::quota_control_reserve_bytes`] past the byte quotas of
+//! their Resource and Principal: bounded, because a free keypair owning
+//! its own Resource could otherwise write Control Records without end. The free space is read at most once per
 //! [`AbuseLimits::disk_check_interval_ms`] (one `statvfs`), not per write;
 //! a failed reading is logged and does not refuse.
 //!
@@ -72,6 +82,11 @@ pub struct AbuseLimits {
     pub quota_bytes_per_resource: u64,
     /// Quota mode: new Resources hosted per client IP per 24 hours.
     pub hosts_per_ip_per_day: u32,
+    /// Quota mode: the bytes [`WriteClass::Control`] writes (Control
+    /// Records, Key Packages) may store past the byte quotas of a Resource
+    /// and of its Principal, so revocation and key rotation still work at
+    /// quota.
+    pub quota_control_reserve_bytes: u64,
     /// Every mode: refuse new hosting and writes past this many stored
     /// bytes; `None` is no cap.
     pub max_total_bytes: Option<u64>,
@@ -100,6 +115,7 @@ impl Default for AbuseLimits {
             quota_bytes_per_principal: 256 * MIB,
             quota_bytes_per_resource: 128 * MIB,
             hosts_per_ip_per_day: 10,
+            quota_control_reserve_bytes: 16 * MIB,
             max_total_bytes: None,
             min_free_bytes: 2048 * MIB,
             disk_check_interval_ms: 10_000,
@@ -157,6 +173,12 @@ impl AbuseLimits {
             if value == 0 || value > i64::MAX as u64 {
                 return Err((field, "must be between 1 and 2^63-1"));
             }
+        }
+        if self.quota_control_reserve_bytes > i64::MAX as u64 {
+            return Err((
+                "quota_control_reserve_bytes",
+                "must be between 0 and 2^63-1",
+            ));
         }
         if self
             .max_total_bytes
@@ -296,9 +318,24 @@ pub mod refusal {
     pub const SERVER_FULL: &str = "quota exceeded: server storage full";
     /// `QUOTA_EXCEEDED`: the free disk space is under `min_free_bytes`.
     pub const DISK_LOW: &str = "quota exceeded: server disk space low";
+    /// `QUOTA_EXCEEDED`: the free disk space is under a quarter of
+    /// `min_free_bytes`; no write is stored.
+    pub const DISK_CRITICAL: &str = "quota exceeded: server disk space critically low";
     /// `RATE_LIMITED`: the client IP hosted its new Resources of the last
     /// 24 hours.
     pub const HOSTS_PER_IP: &str = "rate limited: new Resources per client address per day";
+}
+
+/// Which limits a write is held to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteClass {
+    /// New hosting, Data Units, Snapshots: every limit.
+    Bulk,
+    /// Control Records and Key Packages, which revocation and key
+    /// rotation need: no `max_total_bytes`, the hard disk floor only, and
+    /// the control reserve past the byte quotas (see the module
+    /// documentation).
+    Control,
 }
 
 /// The free disk space of a directory's file system.
@@ -388,21 +425,33 @@ impl Floor {
         free
     }
 
-    /// Whether `incoming` more bytes may be stored at `now`, the store
-    /// holding `total` (needed when [`Floor::needs_total`]); otherwise the
-    /// diagnostic.
+    /// Whether `incoming` more bytes of `class` may be stored at `now`,
+    /// the store holding `total` (needed when [`Floor::needs_total`]);
+    /// otherwise the diagnostic.
     pub fn check(
         &self,
         total: Option<u64>,
         incoming: u64,
+        class: WriteClass,
         now: Instant,
     ) -> Result<(), &'static str> {
-        if let (Some(max), Some(total)) = (self.max_total, total) {
-            if total.saturating_add(incoming) > max {
-                return Err(refusal::SERVER_FULL);
+        if class == WriteClass::Bulk {
+            if let (Some(max), Some(total)) = (self.max_total, total) {
+                if total.saturating_add(incoming) > max {
+                    return Err(refusal::SERVER_FULL);
+                }
             }
         }
-        if self.min_free > 0 && self.free(now).is_some_and(|free| free < self.min_free) {
+        if self.min_free == 0 {
+            return Ok(());
+        }
+        let Some(free) = self.free(now) else {
+            return Ok(());
+        };
+        if free < self.min_free / 4 {
+            return Err(refusal::DISK_CRITICAL);
+        }
+        if class == WriteClass::Bulk && free < self.min_free {
             return Err(refusal::DISK_LOW);
         }
         Ok(())
@@ -1119,12 +1168,15 @@ mod tests {
         );
         let now = Instant::now();
         assert!(floor.needs_total());
-        assert_eq!(floor.check(Some(900), 100, now), Ok(()));
-        assert_eq!(floor.check(Some(900), 101, now), Err(refusal::SERVER_FULL));
+        assert_eq!(floor.check(Some(900), 100, WriteClass::Bulk, now), Ok(()));
+        assert_eq!(
+            floor.check(Some(900), 101, WriteClass::Bulk, now),
+            Err(refusal::SERVER_FULL)
+        );
         // Low disk: refused only once the cached reading is refreshed.
         disk.free.store(4999, Ordering::SeqCst);
         for _ in 0..1000 {
-            assert_eq!(floor.check(Some(0), 1, now), Ok(()));
+            assert_eq!(floor.check(Some(0), 1, WriteClass::Bulk, now), Ok(()));
         }
         assert_eq!(
             disk.reads.load(Ordering::SeqCst),
@@ -1132,12 +1184,15 @@ mod tests {
             "one reading per interval"
         );
         let later = now + Duration::from_secs(1);
-        assert_eq!(floor.check(Some(0), 1, later), Err(refusal::DISK_LOW));
+        assert_eq!(
+            floor.check(Some(0), 1, WriteClass::Bulk, later),
+            Err(refusal::DISK_LOW)
+        );
         assert_eq!(disk.reads.load(Ordering::SeqCst), 2);
         // A failed reading does not refuse.
         disk.free.store(u64::MAX, Ordering::SeqCst);
         assert_eq!(
-            floor.check(Some(0), 1, later + Duration::from_secs(1)),
+            floor.check(Some(0), 1, WriteClass::Bulk, later + Duration::from_secs(1)),
             Ok(())
         );
         // Disabled: never read.
@@ -1150,8 +1205,47 @@ mod tests {
             disk.clone(),
         );
         assert!(!none.needs_total());
-        assert_eq!(none.check(None, u64::MAX, now), Ok(()));
+        assert_eq!(none.check(None, u64::MAX, WriteClass::Bulk, now), Ok(()));
         assert_eq!(disk.reads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn control_writes_pass_the_total_and_a_low_disk_until_the_hard_floor() {
+        use std::sync::atomic::Ordering;
+        let disk = Arc::new(FakeDisk {
+            free: 3999.into(),
+            reads: 0.into(),
+        });
+        let floor = Floor::new(
+            &AbuseLimits {
+                max_total_bytes: Some(1000),
+                min_free_bytes: 4000,
+                disk_check_interval_ms: 100,
+                ..AbuseLimits::default()
+            },
+            Path::new("."),
+            disk.clone(),
+        );
+        let now = Instant::now();
+        let (bulk, control) = (WriteClass::Bulk, WriteClass::Control);
+        // Under min_free_bytes and past the total: bulk is refused,
+        // revocation and key rotation are not.
+        assert_eq!(floor.check(Some(0), 1, bulk, now), Err(refusal::DISK_LOW));
+        assert_eq!(floor.check(Some(5000), 100, control, now), Ok(()));
+        // Under a quarter of it nothing is stored.
+        disk.free.store(999, Ordering::SeqCst);
+        let later = now + Duration::from_secs(1);
+        assert_eq!(
+            floor.check(Some(0), 1, control, later),
+            Err(refusal::DISK_CRITICAL)
+        );
+        assert_eq!(
+            floor.check(Some(0), 1, bulk, later),
+            Err(refusal::DISK_CRITICAL)
+        );
+        disk.free.store(1000, Ordering::SeqCst);
+        let later = later + Duration::from_secs(1);
+        assert_eq!(floor.check(Some(0), 1, control, later), Ok(()));
     }
 
     #[test]

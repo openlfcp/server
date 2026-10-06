@@ -12,7 +12,7 @@
 //! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature, ws/wss URLs), hosting policy (the storage floor, and a quota of Resources and bytes per hosting Principal: `NACK(QUOTA_EXCEEDED)` with a diagnostic; new Resources per client IP per day: `NACK(RATE_LIMITED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
 //! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read`, or be an invitation subject, at the accepted Control Head, else `NACK(AUTHORIZATION_FAILED)`; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator | §41, §42, §84, §73 |
 //! | RESOURCE_CLOSE | drops the session's subscription only; `ACK` | §43 |
-//! | CONTROL_PUT | the storage quota as for puts; [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
+//! | CONTROL_PUT | the storage floor and quota as for puts, with the control reserve (revocation always gets through, [`crate::limits::WriteClass`]); [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
 //! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows | §44 |
 //! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)` | §45, §46 |
 //! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details), then the storage floor ([`crate::limits::Floor`]) and the storage quota of the hosting Principal and of the Resource (`NACK(QUOTA_EXCEEDED)` with a diagnostic), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60, §84 |
@@ -59,7 +59,7 @@ use crate::config::Config;
 use crate::coordinator::{Chain, Coordinator, Failure};
 use crate::identity::ServerId;
 use crate::ingest::{self, IngestPolicy, ObjectKind, Unlimited};
-use crate::limits::{refusal, Floor, OsDiskSpace, Quota};
+use crate::limits::{refusal, Floor, OsDiskSpace, Quota, WriteClass};
 use crate::rng::{OsRandom, Random};
 use crate::store::{Hosting, Put, Store, StoreError, StoredObject, DURABILITY};
 use crate::ws::{ConnectionContext, Flow, Outbound, Session, SessionFactory};
@@ -113,6 +113,7 @@ pub struct Lfcp {
     random: Arc<dyn Random>,
     hosting: Arc<dyn HostingPolicy>,
     floor: Arc<Floor>,
+    control_reserve: u64,
     ready: ReadyParams,
 }
 
@@ -130,6 +131,7 @@ impl Lfcp {
                 &config.state_dir,
                 Arc::new(OsDiskSpace),
             )),
+            control_reserve: config.abuse.quota_control_reserve_bytes,
             ready: ReadyParams {
                 max_message_bytes: config.max_message_bytes as u64,
                 heartbeat_ms: config.heartbeat_ms,
@@ -283,7 +285,12 @@ impl LfcpSession {
             false => None,
         };
         floor
-            .check(total, size as u64, std::time::Instant::now())
+            .check(
+                total,
+                size as u64,
+                WriteClass::Bulk,
+                std::time::Instant::now(),
+            )
             .map_err(|diagnostic| Ok((WireCode::QuotaExceeded, diagnostic)))?;
         let Some(quota) = self.shared.hosting.quota(&host) else {
             return Ok(());
@@ -305,28 +312,35 @@ impl LfcpSession {
         &self,
         resource: ResourceId,
         size: usize,
+        class: WriteClass,
     ) -> Result<(), Result<Limit, StoreError>> {
         let floor = &self.shared.floor;
         let size = size as u64;
         let now = std::time::Instant::now();
         let full = |diagnostic| Ok((WireCode::QuotaExceeded, diagnostic));
         if !self.shared.hosting.has_quotas() && !floor.needs_total() {
-            return floor.check(None, size, now).map_err(full);
+            return floor.check(None, size, class, now).map_err(full);
         }
         let store = self.shared.coordinator.store();
         let Some(usage) = store.usage(resource).await.map_err(Err)? else {
             return Ok(());
         };
         floor
-            .check(Some(usage.total_bytes), size, now)
+            .check(Some(usage.total_bytes), size, class, now)
             .map_err(full)?;
         let Some(quota) = self.shared.hosting.quota(&usage.host) else {
             return Ok(());
         };
-        if usage.resource_bytes.saturating_add(size) > quota.resource_bytes {
+        // Revocation and key rotation may use the control reserve.
+        let reserve = match class {
+            WriteClass::Bulk => 0,
+            WriteClass::Control => self.shared.control_reserve,
+        };
+        if usage.resource_bytes.saturating_add(size) > quota.resource_bytes.saturating_add(reserve)
+        {
             return Err(Ok((WireCode::QuotaExceeded, refusal::RESOURCE_BYTES)));
         }
-        if usage.host_bytes.saturating_add(size) > quota.bytes {
+        if usage.host_bytes.saturating_add(size) > quota.bytes.saturating_add(reserve) {
             return Err(Ok((WireCode::QuotaExceeded, refusal::PRINCIPAL_BYTES)));
         }
         Ok(())
@@ -629,7 +643,10 @@ impl LfcpSession {
         record: Vec<u8>,
         out: &Outbound,
     ) -> Flow {
-        if let Err(failure) = self.may_store(resource_id, record.len()).await {
+        if let Err(failure) = self
+            .may_store(resource_id, record.len(), WriteClass::Control)
+            .await
+        {
             return self.refuse_or_fail(out, request, failure);
         }
         let committed = self
@@ -750,7 +767,11 @@ impl LfcpSession {
             }
         }
         let size = objects.iter().map(Vec::len).sum();
-        if let Err(failure) = self.may_store(resource_id, size).await {
+        let class = match kind {
+            ObjectKind::KeyPackage => WriteClass::Control,
+            ObjectKind::DataUnit | ObjectKind::Snapshot => WriteClass::Bulk,
+        };
+        if let Err(failure) = self.may_store(resource_id, size, class).await {
             return Err(self.refuse_or_fail(out, request, failure));
         }
         if let Err(refusal) = self
