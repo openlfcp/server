@@ -34,6 +34,7 @@ not claim full LFCP-WIRE-01 conformance.
 - Catch-up, deduplication and restart durability (LFCP-051, 052, 054).
 - Docker image and compose (LFCP-055).
 - Setup and admin HTTP (LFCP-046): first-run pairing, hosting policy.
+- `lfcp-admin` CLI (POST-014): pairing and signed admin calls.
 - Abuse limits (POST-003): quota hosting mode by default, client IP behind
   a trusted proxy, per-IP and rate limits, a global storage floor.
 
@@ -497,6 +498,7 @@ proxy in front (LFCP-055).
 | `serde`, `toml` | The configuration file |
 | `serde_json` | The setup/admin HTTP API |
 | `rusqlite` (bundled SQLite) | The store |
+| `zeroize` (`lfcp-admin` only) | Key bytes and the setup code are wiped after use |
 | `fs4` (`sync`; `rustix`, on Windows `windows-sys`) | Free disk space for the storage floor, without `unsafe` here |
 
 97 unique crates (on macOS) in the normal dependency tree. No web framework, no ORM,
@@ -510,6 +512,57 @@ touches Resource data and is never LFCP Resource authority. An
 administrator gets no Resource ability, and is not even allowed to host
 unless the hosting policy allows it. There is no account system and no
 REST access to Resources: they are synchronized over the WebSocket only.
+
+### lfcp-admin
+
+`lfcp-admin` (`crates/lfcp-admin`, POST-014) is the administration CLI: it
+holds the administrator's LFCP Principal key and signs every proof the API
+asks for. Build it with `cargo build --release -p lfcp-admin` and run it
+on the administrator's machine. It speaks plain `http://` only and is
+meant for the server's loopback port over an SSH tunnel; an `https://`
+URL is refused.
+
+```sh
+ssh -N -L 17820:127.0.0.1:17820 admin@sync-host &   # the tunnel
+export LFCP_ADMIN_KEY=~/.config/lfcp/admin.key       # or --key FILE on every call
+lfcp-admin keygen                                    # mode 0600; prints the Principal ID
+ssh admin@sync-host sudo cat /var/lib/lfcp/setup-code | lfcp-admin pair --setup-code -
+lfcp-admin status
+lfcp-admin hosting get
+lfcp-admin hosting set quota                         # or open
+lfcp-admin hosting set allow_list --principal <id> --credentials-file deploy-keys.txt
+lfcp-admin quota list
+lfcp-admin quota get <id>
+lfcp-admin quota set <id> --resources 50 --bytes 1073741824
+lfcp-admin quota set <id> --resources 0 --bytes 0    # stop a Principal's hosting and writes
+lfcp-admin quota clear <id>
+```
+
+- `--url` defaults to `http://127.0.0.1:17820`; `--key` defaults to
+  `$LFCP_ADMIN_KEY`.
+- The key file is JSON with the Principal ID and its two secrets. `keygen`
+  creates it with mode 0600 and never replaces a file. Every command
+  refuses a key that its group or others can read. Keep a backup: losing
+  the key leaves no administrator, and a new pairing needs a new state
+  directory.
+- `pair --setup-code -` reads the code from stdin, so it stays out of
+  shell history and `ps`; `--setup-code-file PATH` reads it from a file.
+  `--setup-code CODE` works too.
+- Hosting credentials are read from a file, one hex credential per line.
+- Each command opens its own admin session; tokens are never written to
+  disk. Answers print as JSON on stdout. Refusals print the server's
+  error and HTTP status on stderr, with exit status 1; usage errors exit
+  with 2.
+- No secret is printed: not the key, the setup code, credentials or
+  tokens.
+- The image does not ship `lfcp-admin`. The admin key stays on the
+  administrator's machine and never on the server host, and the tunnel
+  needs nothing in the container.
+
+### The HTTP API
+
+`lfcp-admin` is a client of this API, and the description is for other
+clients.
 
 First run (WIRE-01 §92). While no administrator is paired, each start
 creates a one-time pairing code (`XXXX-XXXX`, from the OS random source).
@@ -640,10 +693,14 @@ curl --cacert root.crt https://localhost/health
   writes a one-time admin pairing code to `/var/lib/lfcp/setup-code` in
   the state volume (mode 0600), never to `docker logs`. The image has no
   shell; read the code with `docker compose -f deploy/compose.yaml cp
-  lfcp-server:/var/lib/lfcp/setup-code - | tar -xO`. Pairing goes to
-  `https://<host>/setup/pair` through the proxy (see "Administration").
-  Recreating the containers on the same volume keeps the pairing; a new
-  volume is a new server with a new code.
+  lfcp-server:/var/lib/lfcp/setup-code - | tar -xO`. `lfcp-admin`
+  speaks plain http to the server's own port, which this Compose file
+  does not publish. Publish it on the host's loopback only (`ports:
+  ["127.0.0.1:17820:7820"]` on `lfcp-server`, as `compose.check.yaml`
+  does), then pair over an SSH tunnel to that port:
+  `docker compose -f deploy/compose.yaml cp lfcp-server:/var/lib/lfcp/setup-code - | tar -xO | lfcp-admin pair --setup-code -`
+  (see "Administration"). Recreating the containers on the same volume
+  keeps the pairing; a new volume is a new server with a new code.
 
 `deploy/check.sh` builds the image and checks it end to end. It verifies:
 - the user is non-root and the container is healthy;
