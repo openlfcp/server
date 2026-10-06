@@ -109,10 +109,9 @@ impl FileIdentity {
         let path = state_dir.join(SERVER_ID_FILE);
         match create(&path) {
             Ok(id) => {
-                // Make the new directory entry durable too.
-                File::open(state_dir)
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(io(state_dir))?;
+                // Make the new directory entry durable too (Unix only:
+                // Windows cannot open a directory as a file).
+                crate::private::sync_dir(state_dir).map_err(io(state_dir))?;
                 Ok(FileIdentity { id, path })
             }
             Err(Created::Exists) => Ok(FileIdentity {
@@ -216,6 +215,23 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every platform (the Windows CI job included): a state directory that
+    /// does not exist yet, several levels deep, is created with the
+    /// identity, and the identity loads again from it. On Windows this
+    /// failed with "Access is denied" (os error 5) when the directory was
+    /// opened as a file to sync it.
+    #[test]
+    fn creates_a_fresh_nested_state_directory_and_loads_it_again() {
+        let root = temp_dir("identity-nested");
+        let dir = root.join("a").join("b").join("state");
+        let created = FileIdentity::load_or_create(&dir).unwrap();
+        assert!(created.path().is_file());
+        let loaded = FileIdentity::load_or_create(&dir).unwrap();
+        assert_eq!(created.server_id(), loaded.server_id());
+        crate::private::sync_dir(&dir).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

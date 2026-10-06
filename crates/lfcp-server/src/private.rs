@@ -20,6 +20,20 @@ pub fn create_dir(dir: &Path) -> io::Result<()> {
     builder.create(dir)
 }
 
+/// Make the entries of `dir` durable, so that a file just created in it
+/// survives a crash: an fsync of the directory on Unix. Windows has no
+/// portable equivalent: a directory cannot be opened as a file (that is
+/// `Access is denied`, os error 5, unless the handle is opened with
+/// FILE_FLAG_BACKUP_SEMANTICS), and NTFS journals its metadata. There this
+/// does nothing.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Create `path` empty with mode 0600 if it does not exist.
 pub fn create_file(path: &Path) -> io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
