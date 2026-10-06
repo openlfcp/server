@@ -102,8 +102,42 @@ pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 pub const MAX_BODY: usize = 16 * 1024;
 
 const SETUP_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-const PROOF_LABEL: &str = "LFCP-ADMIN-v1";
 const HOSTING_SETTING: &str = "hosting_policy";
+
+/// The label that opens every admin proof transcript.
+pub const PROOF_LABEL: &str = "LFCP-ADMIN-v1";
+/// The proof purpose of `POST /setup/pair`.
+pub const PURPOSE_PAIR: &str = "pair";
+/// The proof purpose of `POST /admin/session`.
+pub const PURPOSE_SESSION: &str = "session";
+
+/// The bytes an admin proof signs: the deterministic CBOR
+/// `["LFCP-ADMIN-v1", purpose, server_id, challenge]`.
+pub fn proof_transcript(purpose: &str, server_id: &[u8; 32], challenge: &[u8; 32]) -> Vec<u8> {
+    cbor::encode(&Value::Array(vec![
+        Value::text(PROOF_LABEL),
+        Value::text(purpose),
+        Value::bytes(server_id.to_vec()),
+        Value::bytes(challenge.to_vec()),
+    ]))
+    .expect("the transcript encodes")
+}
+
+/// An admin proof by `keys`: the COSE_Sign1 bytes over
+/// [`proof_transcript`], as `/setup/pair` and `/admin/session` take it
+/// (hex in their `proof` field). For tools such as `lfcp-admin`.
+pub fn sign_proof(
+    keys: &lfcp::principal::PrincipalKeys,
+    purpose: &str,
+    server_id: &[u8; 32],
+    challenge: &[u8; 32],
+) -> Vec<u8> {
+    let transcript = proof_transcript(purpose, server_id, challenge);
+    cose::sign(&transcript, keys)
+        .expect("signing a transcript cannot fail")
+        .bytes()
+        .to_vec()
+}
 
 /// The one-time setup code, also written to [`SETUP_CODE_FILE`]. It
 /// redacts itself in `Debug`.
@@ -533,13 +567,7 @@ impl Admin {
         if self.challenges.valid(&challenge, Instant::now()).is_none() {
             return Err(refused);
         }
-        let transcript = cbor::encode(&Value::Array(vec![
-            Value::text(PROOF_LABEL),
-            Value::text(purpose),
-            Value::bytes(self.server_id.as_bytes().to_vec()),
-            Value::bytes(challenge.to_vec()),
-        ]))
-        .expect("the transcript encodes");
+        let transcript = proof_transcript(purpose, self.server_id.as_bytes(), &challenge);
         let object = cose::parse(&proof).map_err(|_| refused.clone())?;
         if object.kid() != descriptor.id() || object.payload_bytes() != transcript {
             return Err(refused);
@@ -551,7 +579,7 @@ impl Admin {
     async fn pair(&self, body: &[u8]) -> Result<Response<Full<Bytes>>, Failure> {
         let request: PairRequest = parse(body)?;
         // Single use through the code: a pairing destroys it.
-        let (descriptor, _) = self.verify("pair", &request.proof)?;
+        let (descriptor, _) = self.verify(PURPOSE_PAIR, &request.proof)?;
         let outcome = self
             .store
             .pair_admin(
@@ -585,7 +613,7 @@ impl Admin {
 
     async fn session(&self, body: &[u8]) -> Result<Response<Full<Bytes>>, Failure> {
         let request: ProofRequest = parse(body)?;
-        let (descriptor, challenge) = self.verify("session", &request)?;
+        let (descriptor, challenge) = self.verify(PURPOSE_SESSION, &request)?;
         let admins = self.store.admins().await.map_err(internal)?;
         if !admins.contains(descriptor.id()) {
             return Err(Failure(StatusCode::FORBIDDEN, "not a server administrator"));
@@ -957,6 +985,19 @@ mod tests {
             format!("{:?}", SetupCode("X7KM-P9LA".into())),
             "SetupCode(<redacted>)"
         );
+    }
+
+    #[test]
+    fn a_signed_proof_carries_the_transcript() {
+        let keys = lfcp::principal::PrincipalKeys::from_secrets(&[1; 32], [2; 32]);
+        let proof = sign_proof(&keys, PURPOSE_SESSION, &[3; 32], &[4; 32]);
+        let object = cose::parse(&proof).unwrap();
+        assert_eq!(object.kid(), keys.descriptor().id());
+        assert_eq!(
+            object.payload_bytes(),
+            proof_transcript(PURPOSE_SESSION, &[3; 32], &[4; 32])
+        );
+        cose::verify(&object, keys.descriptor()).unwrap();
     }
 
     #[test]
