@@ -14,3 +14,10 @@ public_urls = [
     "wss://sync-a.example.test/v1/ws",
     "wss://sync-b.example.test/v1/ws",
 ]
+
+# Abuse limits (POST-003; README "Running"). Only the proxy, at its fixed
+# address on the compose network (compose.yaml), may report the client
+# address, in X-Forwarded-For (deploy/Caddyfile overwrites it). Every
+# other per-IP, rate, quota and storage limit keeps its default.
+trusted_proxies = ["172.30.78.10"]
+client_ip_header = "x-forwarded-for"

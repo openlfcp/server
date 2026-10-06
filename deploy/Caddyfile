@@ -11,7 +11,17 @@
 #                     here with ports 80 and 443 reachable;
 #   /certs/fullchain.pem /certs/privkey.pem
 #                     production with your own certificate (mount /certs).
+#
+# Client address (POST-003): the server applies its per-IP limits to the
+# address in X-Forwarded-For, believed only from this proxy (server.toml
+# trusted_proxies, the proxy's fixed address in compose.yaml). header_up
+# replaces whatever X-Forwarded-For the client sent with one address:
+# {client_ip}, the TCP peer. Behind another proxy such as Cloudflare, set
+# Caddy's global trusted_proxies and client_ip_headers (e.g.
+# CF-Connecting-IP) so {client_ip} is the real client; see README "Docker".
 {$LFCP_SITE:localhost} {
 	tls {$LFCP_TLS:internal}
-	reverse_proxy lfcp-server:7820
+	reverse_proxy lfcp-server:7820 {
+		header_up X-Forwarded-For {client_ip}
+	}
 }

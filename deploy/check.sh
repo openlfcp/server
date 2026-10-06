@@ -94,6 +94,19 @@ curl --silent --http1.1 --cacert "$work/root.crt" --max-time 2 --dump-header "$w
 grep -q '^HTTP/1.1 101' "$work/upgrade" || fail "no 101 through the proxy: $(head -1 "$work/upgrade")"
 grep -qi '^sec-websocket-protocol: lfcp-1' "$work/upgrade" || fail "lfcp-1 not selected"
 
+# POST-003: the server believes the client address only from the proxy,
+# and the proxy replaces a forged X-Forwarded-For with the real peer.
+echo "check: the server sees the client address the proxy reports"
+curl --silent --http1.1 --cacert "$work/root.crt" --max-time 2 -o /dev/null \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Protocol: lfcp-1' \
+    -H 'X-Forwarded-For: 203.0.113.77' https://localhost:18443/v1/ws || true
+opened="$("${compose[@]}" logs lfcp-server 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep 'websocket open' | tail -1)"
+grep -q 'peer=172\.30\.78\.10:' <<<"$opened" || fail "the WebSocket did not come from the proxy: $opened"
+if grep -q 'client=172\.30\.78\.10' <<<"$opened"; then fail "the client is the proxy: $opened"; fi
+if grep -q 'client=203\.0\.113\.77' <<<"$opened"; then fail "a forged X-Forwarded-For was believed: $opened"; fi
+grep -q 'client=[0-9a-f.:]*' <<<"$opened" || fail "no client address: $opened"
+
 # First-run pairing (LFCP-046) over https through the proxy, with the code
 # read from its private file; the code is never echoed, and it is never
 # in the logs.

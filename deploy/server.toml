@@ -13,3 +13,12 @@ log_level = "info"
 # Resource whose Control Coordinator URL is one of them is coordinated
 # here (WIRE-01 §21). Set your host name for a real deployment.
 public_urls = ["wss://localhost/v1/ws"]
+
+# Abuse limits (POST-003; README "Running"). Only the proxy, at its fixed
+# address on the compose network (compose.yaml), may report the client
+# address, in X-Forwarded-For (deploy/Caddyfile overwrites it). Every
+# other per-IP, rate, quota and storage limit keeps its default.
+trusted_proxies = ["172.30.78.10"]
+client_ip_header = "x-forwarded-for"
+# The store's total cap, unset by default; set it below the volume size.
+# max_total_bytes = 3221225472

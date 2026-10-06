@@ -20,6 +20,8 @@ services:
     restart: unless-stopped
     # Not published: clients reach it through the proxy only. The image's
     # HEALTHCHECK probes /health.
+    networks:
+      - lfcp
 
   proxy:
     image: caddy:2.10-alpine
@@ -37,6 +39,20 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     restart: unless-stopped
+    networks:
+      lfcp:
+        # The one address server.toml trusts to report client IPs
+        # (trusted_proxies). Change both together.
+        ipv4_address: 172.30.78.10
+
+# A fixed subnet, so the proxy has a fixed address (POST-003). Pick
+# another if 172.30.78.0/24 is in use on the host, and update the proxy's
+# address and server.toml.
+networks:
+  lfcp:
+    ipam:
+      config:
+        - subnet: 172.30.78.0/24
 
 volumes:
   lfcp-state:
