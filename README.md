@@ -34,6 +34,8 @@ not claim full LFCP-WIRE-01 conformance.
 - Catch-up, deduplication and restart durability (LFCP-051, 052, 054).
 - Docker image and compose (LFCP-055).
 - Setup and admin HTTP (LFCP-046): first-run pairing, hosting policy.
+- Abuse limits (POST-003): quota hosting mode by default, client IP behind
+  a trusted proxy, per-IP and rate limits, a global storage floor.
 
 ## Store
 
@@ -75,6 +77,11 @@ acknowledged after its transaction commits.
 - Hosting metadata (who hosted a Resource here, the promised durability)
   is infrastructure only. Resource authority always comes from the stored
   Control Chain.
+- Storage accounting (migration 3, POST-003): `resource_usage` holds each
+  Resource's stored bytes, kept by insert triggers in the writing
+  transaction and backfilled from an older database when it migrates;
+  `quota_overrides` holds the administrator's per-Principal quotas. No
+  client IP is stored.
 - Migrations: `schema_version` and an append-only list
   (`store/schema.rs`), applied in order when the database opens.
 
@@ -99,6 +106,21 @@ cargo run -- --config server.toml
 | `max_connections` | | `1024` | Open TCP connections, WebSocket included; a connection past it gets HTTP 503 with `Retry-After: 5` and is closed. 1–1000000 |
 | `handshake_timeout_ms` | | `10000` | Time allowed for a request's HTTP headers, and for a WebSocket connection to reach READY; 1000–600000 |
 | `log_level` | `--log-level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
+| `trusted_proxies` | | `[]` | Proxies (IPv4/IPv6 CIDRs or addresses) whose `client_ip_header` is believed; see "Abuse limits" |
+| `client_ip_header` | | `x-forwarded-for` | The header a trusted proxy puts the client IP in: `x-forwarded-for`, `x-real-ip`, `cf-connecting-ip` or any other |
+| `max_connections_per_ip` | | `32` | Open WebSocket connections per client IP; `0` disables |
+| `connections_per_ip_per_minute` | | `20` | New WebSocket connections per client IP per minute (burst the same); `0` disables |
+| `ws_messages_per_second` | | `50` | LFCP messages per second on one WebSocket connection; `0` disables |
+| `ws_message_burst` | | `200` | The burst of `ws_messages_per_second` |
+| `admin_requests_per_ip_per_minute` | | `60` | `/setup` and `/admin/*` requests per client IP per minute; `0` disables |
+| `max_tracked_ips` | | `65536` | Client IPs tracked at once (bounded memory); 1024–10000000 |
+| `quota_resources_per_principal` | | `20` | Quota mode: Resources one hosting Principal may host |
+| `quota_bytes_per_principal` | | `268435456` (256 MiB) | Quota mode: stored bytes across one hosting Principal's Resources |
+| `quota_bytes_per_resource` | | `134217728` (128 MiB) | Quota mode: stored bytes of one Resource |
+| `hosts_per_ip_per_day` | | `10` | Quota mode: new Resources hosted per client IP per 24 hours; `0` disables, at most 10000 |
+| `max_total_bytes` | | unset | Every mode: the store's total stored bytes; unset is no cap |
+| `min_free_bytes` | | `2147483648` (2 GiB) | Every mode: the least free disk space on `state_dir`; `0` disables |
+| `disk_check_interval_ms` | | `10000` | How long a free disk space reading is reused; 100–3600000 |
 
 `GET /health` answers `{"status":"ok"}` and nothing else.
 `lfcp-server --health-check [--config FILE]` probes it for the configured
@@ -110,6 +132,75 @@ The server ID (WIRE-01 §35, §37) is 32 random bytes created on first start
 in `<state_dir>/server-id` (mode 0600). It never changes afterwards, is the
 same for every connection, and is never derived from the host name or an
 address. A corrupt file stops the server instead of being replaced.
+
+## Abuse limits
+
+A server open to unknown clients (POST-003; security review H5, M2, M3)
+has these limits, all server infrastructure, never LFCP Resource
+authority. Every number is a setting (see "Running"). Refusals use the
+WIRE-01 §62 codes, with a diagnostic (§60 field 1, §61 field 1); HTTP
+refusals are 429 with `Retry-After` (seconds).
+
+**Client IP.** Behind a reverse proxy every TCP peer is the proxy. The
+server believes `client_ip_header` only when the TCP peer is in
+`trusted_proxies`, and otherwise uses the peer address, so a client
+cannot forge its address. A trusted header is read as a comma-separated
+list (every line of it, in order) from the right: the rightmost entry
+that is not itself a trusted proxy is the client; if every entry is
+trusted, the leftmost. An entry that is not an IP address (`1.2.3.4`,
+`1.2.3.4:5678` and `[2001:db8::1]:443` are) makes the server use the peer
+address. Per-IP limits group IPv6 clients by their /64. The "websocket
+open" log line carries both: `peer=<TCP peer> client=<client IP>`.
+
+What the proxy must do: overwrite (not append) the header with the
+address it sees, and be the only way in. nginx:
+`proxy_set_header X-Forwarded-For $remote_addr;` (or `X-Real-IP
+$remote_addr` with `client_ip_header = "x-real-ip"`), with
+`trusted_proxies` set to the address or network nginx reaches the server
+from (for a container on a Docker bridge network, that network's subnet
+or gateway, from `docker network inspect`). Behind Cloudflare either let
+the proxy resolve the client (nginx `real_ip_header CF-Connecting-IP`
+with `set_real_ip_from` for Cloudflare's ranges, Caddy's global
+`trusted_proxies` with `client_ip_headers CF-Connecting-IP`), or set
+`client_ip_header = "cf-connecting-ip"` and make sure only Cloudflare
+reaches the proxy. `deploy/` does this for Caddy (see "Docker").
+
+| Limit | Default | Over it |
+| --- | --- | --- |
+| open WebSockets per client IP (`max_connections_per_ip`) | 32 | the upgrade gets HTTP 429, `Retry-After: 5`, `too many connections from this address` |
+| new WebSockets per client IP (`connections_per_ip_per_minute`, token bucket) | 20/min | HTTP 429, `Retry-After` until a token refills, `too many new connections from this address` |
+| messages per WebSocket connection (`ws_messages_per_second`, `ws_message_burst`, token bucket) | 50/s, burst 200 | `ERROR(RATE_LIMITED)`, `message rate limit exceeded`, close 1008 |
+| admin requests per client IP (`admin_requests_per_ip_per_minute`; `/setup`, `/admin/*`, not `/health`) | 60/min | HTTP 429, `Retry-After`, `{"error": "too many admin requests from this address; retry later"}`, before the body is read |
+| quota mode: Resources per hosting Principal (`quota_resources_per_principal`) | 20 | `RESOURCE_HOST`: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: Resources per hosting Principal` |
+| quota mode: stored bytes per hosting Principal (`quota_bytes_per_principal`) | 256 MiB | `RESOURCE_HOST` and puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: stored bytes per hosting Principal` |
+| quota mode: stored bytes per Resource (`quota_bytes_per_resource`) | 128 MiB | puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: stored bytes per Resource` |
+| quota mode: new Resources per client IP per 24 h (`hosts_per_ip_per_day`) | 10 | `RESOURCE_HOST`: `NACK(RATE_LIMITED)`, `rate limited: new Resources per client address per day` |
+| every mode: the store's total (`max_total_bytes`) | unset | `RESOURCE_HOST` and puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: server storage full` |
+| every mode: free disk on `state_dir` (`min_free_bytes`) | 2 GiB | `RESOURCE_HOST` and puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: server disk space low` |
+
+- "Puts" are `CONTROL_PUT`, `DATA_PUT`, `KEY_PACKAGE_PUT` and
+  `SNAPSHOT_PUT`: a write is refused when it would pass a byte limit
+  (stored bytes plus the request's objects). At its quota a Resource takes
+  no Control Record either, a revocation included: raise the quota (an
+  override) to let it continue. Reads (`RESOURCE_OPEN`, `*_HAVE`,
+  `*_GET`) keep working.
+- Hosting the same Genesis again is not a new Resource: it passes every
+  hosting limit.
+- Stored bytes are the exact object bytes (`resource_usage`, kept by
+  SQLite triggers in the writing transaction), attributed to the
+  Principal that hosted the Resource here, whoever writes. Checks run
+  before the write; concurrent writes to different Resources of one
+  Principal can pass a Principal quota by at most one request each.
+- The free disk space is read at most once per `disk_check_interval_ms`
+  (one `statvfs`); a failed reading is logged and refuses nothing.
+- The per-IP state is in memory: at most `max_tracked_ips` entries
+  (IPv6 per /64). When full, entries with nothing to remember are
+  dropped, then the least recently seen ones without an open connection,
+  down to 7/8 of the cap; an entry with an open connection is kept, so
+  the table is bounded by `max_tracked_ips` plus `max_connections`. A
+  restart forgets it (the hosting count per IP included).
+- Admin challenges cannot be exhausted (see "Administration").
+- `max_connections` (1024, every TCP connection) still applies first.
 
 ## WebSocket
 
@@ -150,6 +241,10 @@ WebSocket version 426.
   messages are read before READY; the 17th gets `ERROR(RATE_LIMITED)` and
   close 1008. A message over 64 KiB gets `ERROR(MESSAGE_TOO_LARGE)` and
   close 1009 without being decoded.
+- After READY, a connection may send `ws_messages_per_second` messages
+  (burst `ws_message_burst`); the next gets `ERROR(RATE_LIMITED)`
+  (`message rate limit exceeded`) and close 1008. A WebSocket upgrade past
+  the per-IP connection limits gets HTTP 429 (see "Abuse limits").
 - An HTTP request whose headers do not arrive within
   `handshake_timeout_ms` has its connection closed.
 - Shutdown sends every WebSocket close 1001, drains its queue, and waits
@@ -177,8 +272,9 @@ server's random source; the server ID from `<state_dir>/server-id`.
 After READY:
 
 - `RESOURCE_HOST`: sdk-rs validates the Genesis (sequence 0, signed by the
-  owner in its body, ws/wss URLs), the hosting policy is applied, the
-  Genesis is committed to the store, and only then `RESOURCE_HOSTED`
+  owner in its body, ws/wss URLs), the hosting policy is applied (with the
+  quotas and the storage floor of "Abuse limits"), the Genesis is
+  committed to the store, and only then `RESOURCE_HOSTED`
   (durability 2) is sent. Hosting the same Genesis again succeeds; another
   Genesis for the same Resource is `NACK(CONTROL_CONFLICT)`.
 - `RESOURCE_OPEN`: a Resource this server does not host is
@@ -199,8 +295,9 @@ After READY:
 Authority: AUTH proves possession of the session key and nothing more. The
 hosting credential (in AUTH or RESOURCE_HOST) is server policy only
 (`session::HostingPolicy`). The server runs the admin-managed policy
-(`admin::ManagedHosting`, see "Administration"): open by default, so any
-authenticated Principal may host, with or without a credential. Neither a credential nor
+(`admin::ManagedHosting`, see "Administration"): quota mode by default, so
+any authenticated Principal may host, with or without a credential,
+within its quota. Neither a credential nor
 the hosting row ever grants a Resource ability: authority always comes from
 the Control Chain. Credentials and proofs are never logged.
 
@@ -266,7 +363,8 @@ server never decrypts and never holds a DEK.
 | Data Unit: a closed epoch beyond the actor's cutoff (latest state) | `STALE_DATA_EPOCH` |
 | Key Package: sender `key/distribute`, recipient `data/read` or an invitation subject, at its head | `AUTHORIZATION_FAILED` |
 | Snapshot: `snapshot/publish` at its head; a closed epoch's frontier beyond the cutoff | `AUTHORIZATION_FAILED`, `STALE_DATA_EPOCH` |
-| `ingest::IngestPolicy` (quotas, rate limits; unlimited by default) | `QUOTA_EXCEEDED`, `RATE_LIMITED` |
+| the storage floor and quotas of "Abuse limits" | `QUOTA_EXCEEDED` with a diagnostic |
+| `ingest::IngestPolicy` (a hook for further limits; unlimited by default) | `QUOTA_EXCEEDED`, `RATE_LIMITED` |
 
 AEAD failures, an HPKE package sealed to someone else and actor hash chain
 gaps are detectable only by clients and are accepted. A Data Unit that
@@ -309,8 +407,9 @@ proxy in front (LFCP-055).
 | `serde`, `toml` | The configuration file |
 | `serde_json` | The setup/admin HTTP API |
 | `rusqlite` (bundled SQLite) | The store |
+| `fs4` (`sync`; `rustix`, on Windows `windows-sys`) | Free disk space for the storage floor, without `unsafe` here |
 
-95 unique crates in the normal dependency tree. No web framework, no ORM,
+97 unique crates (on macOS) in the normal dependency tree. No web framework, no ORM,
 no clap.
 
 ## Administration
@@ -342,10 +441,14 @@ the pairing. The log never contains the code, proofs or tokens.
 Pairing binds an LFCP Principal to the administrator role, proven with the
 Principal's own key; there are no passwords.
 
-1. `POST /admin/challenge` answers `{"challenge": <32 bytes hex>}`. A
-   challenge can be used once, within 5 minutes. At most 1024 are
-   outstanding; past that the endpoint answers 429 until some are used or
-   expire.
+1. `POST /admin/challenge` answers `{"challenge": <32 bytes hex>}`,
+   valid for 5 minutes (and until a restart). Challenges are stateless
+   (POST-003): one is its expiry, a nonce and an HMAC-SHA256 tag under a
+   key drawn at start, so issuing one stores nothing, and no flood can
+   use them up for the administrator; floods are also bounded by the
+   per-IP admin rate limit. A proof that opened a session is remembered
+   until its challenge expires, so it cannot be replayed; a refused proof
+   leaves nothing behind. The pairing is single use through its code.
 2. `POST /setup/pair` with `{"code", "principal", "challenge", "proof"}`:
    - `principal` is the encoded Principal Descriptor, in hex;
    - `proof` is a COSE_Sign1 by that Principal (hex) over the
@@ -360,14 +463,34 @@ Later administration:
   a bearer token, valid 15 minutes and kept only as a hash in memory.
 - `GET /admin/status`: server ID, limits, public URLs, durability,
   administrators, number of hosted Resources.
-- `GET` and `PUT /admin/hosting`: `{"mode": "open"}`, or
-  `{"mode": "allow_list", "principals": [<id hex>], "credentials": [<hex>]}`.
-  Credentials are stored as SHA-256 hashes and only counted when read. The
-  change takes effect on the next `RESOURCE_HOST` and persists.
+- `GET` and `PUT /admin/hosting`:
+  - `{"mode": "quota"}`, the default of a server that never set a policy
+    (POST-003; 0.1.0 defaulted to open): any authenticated Principal may
+    host within its quota ("Abuse limits");
+  - `{"mode": "open"}`: anyone, without quotas;
+  - `{"mode": "allow_list", "principals": [<id hex>], "credentials": [<hex>]}`,
+    without quotas. Credentials are stored as SHA-256 hashes and only
+    counted when read.
+  The change takes effect on the next request and persists. The storage
+  floor applies in every mode.
+- `GET /admin/quotas`: the mode, the configured default quota
+  (`{"resources", "bytes", "resource_bytes"}`) and every override.
+- `GET /admin/quotas/<principal id hex>`: that Principal's `override`
+  (or `null`), its effective `quota`, and its `usage`
+  (`{"resources", "bytes"}`: the Resources it hosts and their stored
+  bytes).
+- `PUT /admin/quotas/<principal id hex>` with any of `{"resources",
+  "bytes", "resource_bytes"}` (a missing or `null` field keeps the
+  default) sets its override, which persists; `DELETE` removes it. Both
+  answer as `GET`.
 - `GET /admin/resources`: per Resource, its ID, Control Head sequence,
   object counts and bytes; never contents.
 
 `GET /health` stays `{"status":"ok"}`.
+
+`/setup` and `/admin/*` requests count against
+`admin_requests_per_ip_per_minute` (default 60) per client IP; past it,
+HTTP 429 with `Retry-After`.
 
 ## Docker
 
@@ -400,7 +523,16 @@ curl --cacert root.crt https://localhost/health
   against `/health`. The proxy starts once the server is healthy.
 - Configuration: `deploy/server.toml`, mounted read-only. Set
   `public_urls` to the `wss://` URL clients use, so the server coordinates
-  the Resources that name it.
+  the Resources that name it, and consider `max_total_bytes`.
+- Client IP: the compose network has a fixed subnet (`172.30.78.0/24`)
+  and the proxy a fixed address (`172.30.78.10`), the only
+  `trusted_proxies` entry of `server.toml`. The Caddyfile replaces any
+  client-sent `X-Forwarded-For` with `{client_ip}`, the address Caddy
+  sees. If the subnet is taken on the host, change it, the proxy's
+  address and `trusted_proxies` together. Behind Cloudflare, give Caddy a
+  global `servers { trusted_proxies static <Cloudflare ranges>
+  client_ip_headers CF-Connecting-IP }` so `{client_ip}` is the real
+  client.
 - Endpoints: `https://<host>/health` and `wss://<host>/v1/ws` through the
   proxy. The server's own port is not published.
 - TLS: by default (`LFCP_TLS=internal`) Caddy issues certificates from its
@@ -426,7 +558,9 @@ curl --cacert root.crt https://localhost/health
 - a Resource populated over the protocol (as in
   `tests/process_restart.rs`) survives recreating the containers on the
   same volume;
-- after `down -v` the server is new and the Resource is gone.
+- after `down -v` the server is new and the Resource is gone;
+- the server logs the proxy as the peer and a client address that is not
+  the proxy, and ignores a forged `X-Forwarded-For`.
 
 CI runs it in the `docker` job.
 
