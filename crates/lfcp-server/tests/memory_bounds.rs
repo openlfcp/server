@@ -1,12 +1,189 @@
 //! Memory bounds on authenticated and admin peers (POST-004, security
-//! review H6): the admin request body read timeout.
+//! review H6): outbound bytes per connection and server-wide, a peer that
+//! stops reading, and the admin request body read timeout.
 
 mod support;
 
 use std::time::{Duration, Instant};
 
-use support::lfcp::{start, state_dir, Options};
+use lfcp::base::Hash32;
+use lfcp::principal::PrincipalKeys;
+use lfcp::wire::data_unit::{DataUnit, DataUnitHeader};
+use lfcp::wire::keys::Dek;
+use lfcp::wire::message::{Body, DataRange};
+use lfcp_server::config::Config;
+use lfcp_server::store::Hosting;
+use support::lfcp::{start, state_dir, Client, Options, Running};
+use support::vectors::Vectors;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// The published chain through C10 (bob may read and write, epoch 1).
+const CHAIN: [&str; 11] = [
+    "C0_genesis",
+    "C1_grant_bob",
+    "C2_invite_grant",
+    "C3_invite_claim_carol",
+    "C4_owner_transfer_commit",
+    "C5_route_update",
+    "C6_key_epoch_1",
+    "C7_grant_carol_delegator",
+    "C8_grant_owner_delegated",
+    "C9_grant_invite_grandchild",
+    "C10_revoke_grandchild",
+];
+
+/// Scaled down: 256 KiB messages, a 1 MiB connection cap, 4 MiB in all.
+const MESSAGE: usize = 256 * 1024;
+const CONNECTION_CAP: usize = 1024 * 1024;
+const TOTAL_CAP: usize = 4 * 1024 * 1024;
+
+fn small_budgets(config: &mut Config) {
+    config.max_message_bytes = MESSAGE;
+    config.max_outbound_bytes = CONNECTION_CAP;
+    config.max_total_outbound_bytes = TOTAL_CAP;
+    config.write_timeout_ms = 1_000;
+}
+
+/// A server hosting the published Resource with `units` Data Units of
+/// `size` bytes by bob, stored directly (the store checks structure only).
+async fn large_resource(
+    v: &Vectors,
+    name: &str,
+    units: u64,
+    size: usize,
+) -> (Running, std::path::PathBuf) {
+    let dir = state_dir(name);
+    let server = start(
+        &dir,
+        Options {
+            configure: Some(small_budgets),
+            ..Options::default()
+        },
+    )
+    .await;
+    let store = &server.store;
+    store
+        .host_resource(
+            v.cose(CHAIN[0]),
+            Hosting {
+                host: *v.principal("owner").descriptor().id(),
+                durability: 2,
+            },
+        )
+        .await
+        .unwrap();
+    for i in 1..CHAIN.len() {
+        store
+            .commit_control_record(v.cose(CHAIN[i]), v.record_id(CHAIN[i - 1]))
+            .await
+            .unwrap();
+    }
+    let bob = v.principal("bob");
+    let head = Hash32::from_bytes(*v.record_id(CHAIN[10]).as_bytes());
+    let payload = vec![7u8; size];
+    let mut batch = Vec::new();
+    for sequence in 1..=units {
+        let unit = DataUnit::seal(
+            DataUnitHeader {
+                resource_id: v.resource(),
+                data_epoch: 1,
+                actor: *bob.descriptor().id(),
+                sequence,
+                previous: None,
+                control_head: head,
+            },
+            &payload,
+            &Dek::from_bytes([1; 32]),
+            &bob,
+        )
+        .unwrap();
+        batch.push(unit.signed_object().bytes().to_vec());
+        if batch.len() == 256 {
+            store
+                .put_data_units(std::mem::take(&mut batch))
+                .await
+                .unwrap();
+        }
+    }
+    store.put_data_units(batch).await.unwrap();
+    (server, dir)
+}
+
+fn get_all(v: &Vectors, keys: &PrincipalKeys) -> Body {
+    Body::DataGet {
+        resource_id: v.resource(),
+        ranges: vec![DataRange {
+            principal: *keys.descriptor().id(),
+            start: 1,
+            end: u64::MAX,
+        }],
+    }
+}
+
+/// Wait until `check` holds, for at most `limit`.
+async fn eventually(limit: Duration, check: impl Fn() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    check()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_stops_reading_is_closed_and_its_memory_freed() {
+    let v = Vectors::load();
+    // 32 MiB of units: far more than the socket buffers and the caps.
+    let (server, dir) = large_resource(&v, "memory-stalled", 2048, 16 * 1024).await;
+    let bob = v.principal("bob");
+    let mut stalled = Client::connect(server.addr).await;
+    stalled.handshake(&bob).await;
+    let asked = Instant::now();
+    stalled.request(get_all(&v, &bob)).await;
+    // The client never reads. The server fills its budget, then its writer
+    // times out (write_timeout_ms = 1000) and the connection is dropped.
+    assert!(
+        eventually(Duration::from_secs(10), || server.outbound.used() == 0
+            && asked.elapsed() > Duration::from_millis(1_000))
+        .await,
+        "{} bytes still held",
+        server.outbound.used()
+    );
+    assert!(
+        server.outbound.peak() <= CONNECTION_CAP,
+        "{}",
+        server.outbound.peak()
+    );
+    assert!(server.outbound.connection_peak() <= CONNECTION_CAP);
+    assert!(
+        server.outbound.connection_peak() > CONNECTION_CAP / 2,
+        "the cap was reached"
+    );
+    // What the socket had taken is still readable, then the stream ends.
+    let mut frames = 0u64;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stalled.next_frame()).await {
+            Ok(Some(_)) => frames += 1,
+            Ok(None) => break,
+            Err(_) => panic!("the server did not close the connection"),
+        }
+    }
+    assert!(
+        frames < 2048 * 16 * 1024 / MESSAGE as u64,
+        "{frames} batches: not all of them"
+    );
+
+    // The server still serves others.
+    let mut other = Client::connect(server.addr).await;
+    other.handshake(&bob).await;
+    other.request(Body::Ping([1; 8])).await;
+    assert!(matches!(other.recv().await.body, Body::Pong(_)));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_admin_body_is_closed_after_the_timeout() {

@@ -234,16 +234,39 @@ impl LfcpSession {
         &self.subscriptions
     }
 
-    fn send(&self, out: &Outbound, correlation: Option<[u8; 16]>, body: Body) -> Flow {
+    /// A message with a fresh ID; `None` without randomness.
+    fn message(&self, correlation: Option<[u8; 16]>, body: Body) -> Option<Message> {
         let id = match self.shared.random.nonce16() {
             Ok(id) => id,
             Err(error) => {
                 tracing::error!(conn = self.conn, %error, "no randomness; closing");
-                return Flow::Close;
+                return None;
             }
         };
         let mut message = Message::new(id, body);
         message.correlation_id = correlation;
+        Some(message)
+    }
+
+    /// Send a reply, waiting for outbound room (backpressure).
+    async fn send(&self, out: &Outbound, correlation: Option<[u8; 16]>, body: Body) -> Flow {
+        let Some(message) = self.message(correlation, body) else {
+            return Flow::Close;
+        };
+        match out.send_wait(message).await {
+            Ok(()) => Flow::Continue,
+            Err(_) => {
+                tracing::info!(conn = self.conn, "connection closing; reply dropped");
+                Flow::Close
+            }
+        }
+    }
+
+    /// Send without waiting, for an ERROR before closing.
+    fn send_now(&self, out: &Outbound, correlation: Option<[u8; 16]>, body: Body) -> Flow {
+        let Some(message) = self.message(correlation, body) else {
+            return Flow::Close;
+        };
         match out.send(message) {
             Ok(()) => Flow::Continue,
             Err(_) => {
@@ -253,13 +276,14 @@ impl LfcpSession {
         }
     }
 
-    fn nack(&self, out: &Outbound, request: [u8; 16], code: WireCode) -> Flow {
+    async fn nack(&self, out: &Outbound, request: [u8; 16], code: WireCode) -> Flow {
         tracing::debug!(conn = self.conn, code = code.name(), "NACK");
         self.send(out, Some(request), Body::Nack(code_body(code)))
+            .await
     }
 
     /// A NACK refusing a request by a server limit, with its diagnostic.
-    fn refuse(&self, out: &Outbound, request: [u8; 16], (code, diagnostic): Limit) -> Flow {
+    async fn refuse(&self, out: &Outbound, request: [u8; 16], (code, diagnostic): Limit) -> Flow {
         tracing::info!(
             conn = self.conn,
             code = code.name(),
@@ -268,7 +292,7 @@ impl LfcpSession {
         );
         let mut body = code_body(code);
         body.diagnostic = Some(diagnostic.to_owned());
-        self.send(out, Some(request), Body::Nack(body))
+        self.send(out, Some(request), Body::Nack(body)).await
     }
 
     /// Whether `host` may host one more Resource whose Genesis is `size`
@@ -348,25 +372,25 @@ impl LfcpSession {
 
     /// The answer to a failed [`LfcpSession::may_host`] or
     /// [`LfcpSession::may_store`].
-    fn refuse_or_fail(
+    async fn refuse_or_fail(
         &self,
         out: &Outbound,
         request: [u8; 16],
         failure: Result<Limit, StoreError>,
     ) -> Flow {
         match failure {
-            Ok(limit) => self.refuse(out, request, limit),
-            Err(error) => self.internal(out, request, &error),
+            Ok(limit) => self.refuse(out, request, limit).await,
+            Err(error) => self.internal(out, request, &error).await,
         }
     }
 
-    fn nack_error(&self, out: &Outbound, request: [u8; 16], error: &Error) -> Flow {
+    async fn nack_error(&self, out: &Outbound, request: [u8; 16], error: &Error) -> Flow {
         match ErrorBody::for_error(error) {
             Some(body) => {
                 tracing::debug!(conn = self.conn, code = error.code(), "NACK");
-                self.send(out, Some(request), Body::Nack(body))
+                self.send(out, Some(request), Body::Nack(body)).await
             }
-            None => self.nack(out, request, WireCode::InternalError),
+            None => self.nack(out, request, WireCode::InternalError).await,
         }
     }
 
@@ -379,11 +403,11 @@ impl LfcpSession {
         );
         self.state = ServerSession::Closed;
         self.pending = None;
-        let _ = self.send(out, None, Body::Error(code_body(code)));
+        let _ = self.send_now(out, None, Body::Error(code_body(code)));
         Flow::Close
     }
 
-    fn on_hello(&mut self, request: [u8; 16], hello: HelloBody, out: &Outbound) -> Flow {
+    async fn on_hello(&mut self, request: [u8; 16], hello: HelloBody, out: &Outbound) -> Flow {
         let wire_profile = match select_wire_profile(&hello, &[WIRE_PROFILE]) {
             Ok(profile) => profile,
             Err(error) => return self.fatal(out, session_code(&error)),
@@ -405,9 +429,10 @@ impl LfcpSession {
             .unwrap_or(ServerSession::Closed);
         self.pending = Some((hello, challenge.clone()));
         self.send(out, Some(request), Body::Challenge(challenge))
+            .await
     }
 
-    fn on_auth(&mut self, request: [u8; 16], auth: AuthBody, out: &Outbound) -> Flow {
+    async fn on_auth(&mut self, request: [u8; 16], auth: AuthBody, out: &Outbound) -> Flow {
         let Some((hello, challenge)) = self.pending.take() else {
             return self.fatal(out, WireCode::MalformedMessage);
         };
@@ -444,6 +469,7 @@ impl LfcpSession {
                 extensions: Some(Vec::new()),
             }),
         )
+        .await
     }
 
     async fn on_host(
@@ -454,18 +480,18 @@ impl LfcpSession {
         out: &Outbound,
     ) -> Flow {
         let Some(auth) = self.authenticated.as_ref() else {
-            return self.nack(out, request, WireCode::AuthorizationFailed);
+            return self.nack(out, request, WireCode::AuthorizationFailed).await;
         };
         // §39 steps 1–3: Genesis structure, Resource ID and signature.
         let resource_id = match validate_genesis(&genesis) {
             Ok(resource_id) => resource_id,
-            Err(error) => return self.nack_error(out, request, &error),
+            Err(error) => return self.nack_error(out, request, &error).await,
         };
         // Step 4: hosting policy, never Resource authority.
         let host = *auth.principal.id();
         let credential = credential.as_ref().or(auth.hosting_credential.as_ref());
         if !self.shared.hosting.allows(&host, credential) {
-            return self.nack(out, request, WireCode::HostingDenied);
+            return self.nack(out, request, WireCode::HostingDenied).await;
         }
         // Server limits (POST-003), for a Resource not hosted yet: hosting
         // the same Genesis again changes nothing.
@@ -475,19 +501,19 @@ impl LfcpSession {
             Ok(Some(_)) => {}
             Ok(None) => {
                 if let Err(failure) = self.may_host(host, genesis.len()).await {
-                    return self.refuse_or_fail(out, request, failure);
+                    return self.refuse_or_fail(out, request, failure).await;
                 }
                 // Keypairs are free: in quota mode, new Resources per client
                 // IP per day damp a Sybil flood.
                 if self.shared.hosting.quota(&host).is_some() {
                     if !self.client.try_host() {
                         let limit = (WireCode::RateLimited, refusal::HOSTS_PER_IP);
-                        return self.refuse(out, request, limit);
+                        return self.refuse(out, request, limit).await;
                     }
                     counted = true;
                 }
             }
-            Err(error) => return self.internal(out, request, &error),
+            Err(error) => return self.internal(out, request, &error).await,
         }
         // Step 5: persisted (committed, WAL synchronous=FULL) before the
         // reply.
@@ -515,12 +541,13 @@ impl LfcpSession {
                         durability: u64::from(DURABILITY),
                     },
                 )
+                .await
             }
             // §13.2, G-CP5: a second Genesis is a fork at the root.
             Err(StoreError::GenesisConflict { .. }) => {
-                self.nack(out, request, WireCode::ControlConflict)
+                self.nack(out, request, WireCode::ControlConflict).await
             }
-            Err(error) => self.internal(out, request, &error),
+            Err(error) => self.internal(out, request, &error).await,
         }
     }
 
@@ -532,7 +559,7 @@ impl LfcpSession {
         out: &Outbound,
     ) -> Flow {
         let Some(auth) = self.authenticated.as_ref() else {
-            return self.nack(out, request, WireCode::AuthorizationFailed);
+            return self.nack(out, request, WireCode::AuthorizationFailed).await;
         };
         let principal = *auth.principal.id();
         let chain = match self.readable(request, resource_id, &principal, out).await {
@@ -542,11 +569,11 @@ impl LfcpSession {
         let store = self.shared.coordinator.store();
         let heads = match self.shared.coordinator.heads(resource_id).await {
             Ok(heads) => heads,
-            Err(error) => return self.internal(out, request, &error),
+            Err(error) => return self.internal(out, request, &error).await,
         };
         let have = match store.data_sequences(resource_id).await {
             Ok(sequences) => have_of(&sequences),
-            Err(error) => return self.internal(out, request, &error),
+            Err(error) => return self.internal(out, request, &error).await,
         };
         let snapshot = match store.snapshots(resource_id).await {
             Ok(snapshots) => snapshots
@@ -557,7 +584,7 @@ impl LfcpSession {
                     data_epoch: s.header().data_epoch,
                     frontier: HaveVector::from_frontier(&s.header().frontier).to_wire(),
                 }),
-            Err(error) => return self.internal(out, request, &error),
+            Err(error) => return self.internal(out, request, &error).await,
         };
         let flags = flags.unwrap_or(0);
         self.subscriptions
@@ -582,9 +609,15 @@ impl LfcpSession {
                 coordinator: Some(chain.coordinator),
             },
         )
+        .await
     }
 
-    fn on_close(&mut self, request: [u8; 16], resource_id: ResourceId, out: &Outbound) -> Flow {
+    async fn on_close(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        out: &Outbound,
+    ) -> Flow {
         // §43: session state only; nothing persistent is touched.
         self.subscriptions.remove(&resource_id);
         self.shared
@@ -600,6 +633,7 @@ impl LfcpSession {
                 durable: None,
             }),
         )
+        .await
     }
 
     /// The accepted chain of `resource`, if `principal` may read it (§84);
@@ -613,25 +647,25 @@ impl LfcpSession {
     ) -> Result<Chain, Flow> {
         match self.shared.coordinator.chain(resource).await {
             Ok(Some(chain)) if chain.may_read(principal) => Ok(chain),
-            Ok(Some(_)) => Err(self.nack(out, request, WireCode::AuthorizationFailed)),
-            Ok(None) => Err(self.nack(out, request, WireCode::ResourceNotHosted)),
-            Err(failure) => Err(self.nack_failure(out, request, failure)),
+            Ok(Some(_)) => Err(self.nack(out, request, WireCode::AuthorizationFailed).await),
+            Ok(None) => Err(self.nack(out, request, WireCode::ResourceNotHosted).await),
+            Err(failure) => Err(self.nack_failure(out, request, failure).await),
         }
     }
 
-    fn nack_failure(&self, out: &Outbound, request: [u8; 16], failure: Failure) -> Flow {
+    async fn nack_failure(&self, out: &Outbound, request: [u8; 16], failure: Failure) -> Flow {
         match failure {
-            Failure::NotHosted => self.nack(out, request, WireCode::ResourceNotHosted),
+            Failure::NotHosted => self.nack(out, request, WireCode::ResourceNotHosted).await,
             // §21: and the currently known coordinator URL.
             Failure::NotCoordinator(url) => {
                 let mut body = code_body(WireCode::NotControlCoordinator);
                 body.details = Some(Value::text(url));
-                self.send(out, Some(request), Body::Nack(body))
+                self.send(out, Some(request), Body::Nack(body)).await
             }
             // §47: Genesis uses RESOURCE_HOST.
-            Failure::Genesis => self.nack(out, request, WireCode::MalformedMessage),
-            Failure::Lfcp(error) => self.nack_error(out, request, &error),
-            Failure::Store(error) => self.internal(out, request, &error),
+            Failure::Genesis => self.nack(out, request, WireCode::MalformedMessage).await,
+            Failure::Lfcp(error) => self.nack_error(out, request, &error).await,
+            Failure::Store(error) => self.internal(out, request, &error).await,
         }
     }
 
@@ -647,7 +681,7 @@ impl LfcpSession {
             .may_store(resource_id, record.len(), WriteClass::Control)
             .await
         {
-            return self.refuse_or_fail(out, request, failure);
+            return self.refuse_or_fail(out, request, failure).await;
         }
         let committed = self
             .shared
@@ -678,8 +712,9 @@ impl LfcpSession {
                         durable: Some(true),
                     }),
                 )
+                .await
             }
-            Err(failure) => self.nack_failure(out, request, failure),
+            Err(failure) => self.nack_failure(out, request, failure).await,
         }
     }
 
@@ -694,15 +729,18 @@ impl LfcpSession {
             return flow;
         }
         match self.shared.coordinator.heads(resource_id).await {
-            Ok(control_heads) => self.send(
-                out,
-                Some(request),
-                Body::ControlHave {
-                    resource_id,
-                    control_heads,
-                },
-            ),
-            Err(error) => self.internal(out, request, &error),
+            Ok(control_heads) => {
+                self.send(
+                    out,
+                    Some(request),
+                    Body::ControlHave {
+                        resource_id,
+                        control_heads,
+                    },
+                )
+                .await
+            }
+            Err(error) => self.internal(out, request, &error).await,
         }
     }
 
@@ -718,7 +756,7 @@ impl LfcpSession {
         out: &Outbound,
     ) -> Flow {
         if end < start {
-            return self.nack(out, request, WireCode::MalformedMessage);
+            return self.nack(out, request, WireCode::MalformedMessage).await;
         }
         let principal = self.principal();
         if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
@@ -732,13 +770,14 @@ impl LfcpSession {
             .await
         {
             Ok(records) => records,
-            Err(error) => return self.internal(out, request, &error),
+            Err(error) => return self.internal(out, request, &error).await,
         };
         let records = records.into_iter().map(|r| r.bytes).collect();
         self.reply_in_batches(out, request, records, |records| Body::ControlBatch {
             resource_id,
             records,
         })
+        .await
     }
 
     /// Validate every object first (nothing is stored if one fails), then
@@ -754,16 +793,16 @@ impl LfcpSession {
     ) -> Result<(crate::coordinator::Locked, Vec<T>), Flow> {
         let locked = match self.shared.coordinator.lock(resource_id).await {
             Ok(locked) => locked,
-            Err(failure) => return Err(self.nack_failure(out, request, failure)),
+            Err(failure) => return Err(self.nack_failure(out, request, failure).await),
         };
         let Some(chain) = locked.chain.as_ref() else {
-            return Err(self.nack(out, request, WireCode::ResourceNotHosted));
+            return Err(self.nack(out, request, WireCode::ResourceNotHosted).await);
         };
         let mut valid = Vec::with_capacity(objects.len());
         for bytes in objects {
             match validate(chain, resource_id, bytes) {
                 Ok(object) => valid.push(object),
-                Err(error) => return Err(self.nack_error(out, request, &error)),
+                Err(error) => return Err(self.nack_error(out, request, &error).await),
             }
         }
         let size = objects.iter().map(Vec::len).sum();
@@ -772,19 +811,25 @@ impl LfcpSession {
             ObjectKind::DataUnit | ObjectKind::Snapshot => WriteClass::Bulk,
         };
         if let Err(failure) = self.may_store(resource_id, size, class).await {
-            return Err(self.refuse_or_fail(out, request, failure));
+            return Err(self.refuse_or_fail(out, request, failure).await);
         }
         if let Err(refusal) = self
             .shared
             .ingest
             .admit(&resource_id, kind, objects.len(), size)
         {
-            return Err(self.nack(out, request, refusal.code()));
+            return Err(self.nack(out, request, refusal.code()).await);
         }
         Ok((locked, valid))
     }
 
-    fn ack(&self, out: &Outbound, request: [u8; 16], request_type: u64, ids: Vec<Hash32>) -> Flow {
+    async fn ack(
+        &self,
+        out: &Outbound,
+        request: [u8; 16],
+        request_type: u64,
+        ids: Vec<Hash32>,
+    ) -> Flow {
         self.send(
             out,
             Some(request),
@@ -794,6 +839,7 @@ impl LfcpSession {
                 durable: Some(true),
             }),
         )
+        .await
     }
 
     /// DATA_PUT (§51): all-or-nothing. Every unit is validated, then
@@ -836,7 +882,7 @@ impl LfcpSession {
                     .await
                 {
                     Ok(ids) => entry.insert(ids.into_iter().collect()),
-                    Err(error) => return self.internal(out, request, &error),
+                    Err(error) => return self.internal(out, request, &error).await,
                 },
             };
             ids.insert(Hash32::from_bytes(*unit.id.as_bytes()));
@@ -858,14 +904,14 @@ impl LfcpSession {
                 );
             }
             if let Err(error) = store.put_data_units(evidence).await {
-                return self.internal(out, request, &error);
+                return self.internal(out, request, &error).await;
             }
             drop(locked);
-            return self.nack(out, request, WireCode::ActorEquivocation);
+            return self.nack(out, request, WireCode::ActorEquivocation).await;
         }
         let puts = match store.put_data_units(units.clone()).await {
             Ok(puts) => puts,
-            Err(error) => return self.internal(out, request, &error),
+            Err(error) => return self.internal(out, request, &error).await,
         };
         let fresh: Vec<Vec<u8>> = units
             .into_iter()
@@ -884,7 +930,7 @@ impl LfcpSession {
             .iter()
             .map(|u| Hash32::from_bytes(*u.id.as_bytes()))
             .collect();
-        self.ack(out, request, 33, ids)
+        self.ack(out, request, 33, ids).await
     }
 
     /// KEY_PACKAGE_PUT (§54): validated, stored, `ACK` (type 42).
@@ -912,10 +958,10 @@ impl LfcpSession {
         let store = self.shared.coordinator.store();
         for bytes in packages {
             if let Err(error) = store.put_key_package(bytes).await {
-                return self.internal(out, request, &error);
+                return self.internal(out, request, &error).await;
             }
         }
-        self.ack(out, request, 42, ids)
+        self.ack(out, request, 42, ids).await
     }
 
     /// SNAPSHOT_PUT (§57): validated, stored, `ACK` (type 52). The
@@ -944,9 +990,9 @@ impl LfcpSession {
         };
         let [snapshot] = objects;
         if let Err(error) = self.shared.coordinator.store().put_snapshot(snapshot).await {
-            return self.internal(out, request, &error);
+            return self.internal(out, request, &error).await;
         }
-        self.ack(out, request, 52, ids)
+        self.ack(out, request, 52, ids).await
     }
 
     /// DATA_HAVE (§48): the client's Have must normalize (a reversed
@@ -959,7 +1005,7 @@ impl LfcpSession {
         out: &Outbound,
     ) -> Flow {
         if HaveVector::from_wire(&have).is_err() {
-            return self.nack(out, request, WireCode::MalformedMessage);
+            return self.nack(out, request, WireCode::MalformedMessage).await;
         }
         let principal = self.principal();
         if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
@@ -972,15 +1018,18 @@ impl LfcpSession {
             .data_sequences(resource_id)
             .await
         {
-            Ok(sequences) => self.send(
-                out,
-                Some(request),
-                Body::DataHave {
-                    resource_id,
-                    have: have_of(&sequences),
-                },
-            ),
-            Err(error) => self.internal(out, request, &error),
+            Ok(sequences) => {
+                self.send(
+                    out,
+                    Some(request),
+                    Body::DataHave {
+                        resource_id,
+                        have: have_of(&sequences),
+                    },
+                )
+                .await
+            }
+            Err(error) => self.internal(out, request, &error).await,
         }
     }
 
@@ -996,7 +1045,7 @@ impl LfcpSession {
         out: &Outbound,
     ) -> Flow {
         if ranges.len() > MAX_GET_RANGES || ranges.iter().any(|r| r.start == 0 || r.start > r.end) {
-            return self.nack(out, request, WireCode::MalformedMessage);
+            return self.nack(out, request, WireCode::MalformedMessage).await;
         }
         let ranges = merge_ranges(ranges);
         let principal = self.principal();
@@ -1011,7 +1060,7 @@ impl LfcpSession {
                 .await
             {
                 Ok(found) => units.extend(found),
-                Err(error) => return self.internal(out, request, &error),
+                Err(error) => return self.internal(out, request, &error).await,
             }
         }
         let units = unique(units);
@@ -1019,6 +1068,7 @@ impl LfcpSession {
             resource_id,
             units,
         })
+        .await
     }
 
     /// KEY_PACKAGE_GET (§52): every stored package for the requested
@@ -1036,21 +1086,21 @@ impl LfcpSession {
         epochs.sort_unstable();
         epochs.dedup();
         if epochs.len() > MAX_GET_EPOCHS {
-            return self.nack(out, request, WireCode::MalformedMessage);
+            return self.nack(out, request, WireCode::MalformedMessage).await;
         }
         let principal = self.principal();
         if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
             return flow;
         }
         if recipient != principal {
-            return self.nack(out, request, WireCode::AuthorizationFailed);
+            return self.nack(out, request, WireCode::AuthorizationFailed).await;
         }
         let store = self.shared.coordinator.store();
         let mut packages = Vec::new();
         for epoch in epochs {
             match store.key_packages_for(resource_id, epoch, recipient).await {
                 Ok(found) => packages.extend(found),
-                Err(error) => return self.internal(out, request, &error),
+                Err(error) => return self.internal(out, request, &error).await,
             }
         }
         let packages = unique(packages);
@@ -1058,6 +1108,7 @@ impl LfcpSession {
             resource_id,
             packages,
         })
+        .await
     }
 
     /// SNAPSHOT_GET (§55): the named Snapshot of this Resource, or the
@@ -1086,21 +1137,24 @@ impl LfcpSession {
                 .map(|all| all.into_iter().next().map(|s| s.bytes)),
         };
         match found {
-            Ok(Some(snapshot)) => self.send(
-                out,
-                Some(request),
-                Body::Snapshot {
-                    resource_id,
-                    snapshot,
-                },
-            ),
-            Ok(None) => self.nack(out, request, WireCode::MissingDependency),
-            Err(error) => self.internal(out, request, &error),
+            Ok(Some(snapshot)) => {
+                self.send(
+                    out,
+                    Some(request),
+                    Body::Snapshot {
+                        resource_id,
+                        snapshot,
+                    },
+                )
+                .await
+            }
+            Ok(None) => self.nack(out, request, WireCode::MissingDependency).await,
+            Err(error) => self.internal(out, request, &error).await,
         }
     }
 
     /// Send `objects` as correlated batches within the message size limit.
-    fn reply_in_batches(
+    async fn reply_in_batches(
         &self,
         out: &Outbound,
         request: [u8; 16],
@@ -1111,7 +1165,7 @@ impl LfcpSession {
             .unwrap_or(usize::MAX)
             .saturating_sub(BATCH_OVERHEAD);
         for batch in batches(objects, budget) {
-            if self.send(out, Some(request), body(batch)) == Flow::Close {
+            if self.send(out, Some(request), body(batch)).await == Flow::Close {
                 return Flow::Close;
             }
         }
@@ -1125,9 +1179,9 @@ impl LfcpSession {
             .expect("Control messages pass server_accepts only after READY")
     }
 
-    fn internal(&self, out: &Outbound, request: [u8; 16], error: &StoreError) -> Flow {
+    async fn internal(&self, out: &Outbound, request: [u8; 16], error: &StoreError) -> Flow {
         tracing::error!(conn = self.conn, %error, "store failure");
-        self.nack(out, request, WireCode::InternalError)
+        self.nack(out, request, WireCode::InternalError).await
     }
 }
 
@@ -1145,21 +1199,21 @@ impl Session for LfcpSession {
         // §64: Resource, Control, Data, Key and Snapshot messages before
         // READY are rejected; the connection stays open.
         if let Err(error) = server_accepts(self.state, body.message_type()) {
-            return self.nack_error(out, id, &error);
+            return self.nack_error(out, id, &error).await;
         }
         let ready = self.state == ServerSession::Ready;
         match body {
-            Body::Ping(payload) => self.send(out, Some(id), Body::Pong(payload)),
+            Body::Ping(payload) => self.send(out, Some(id), Body::Pong(payload)).await,
             Body::Pong(_) | Body::Ack(_) | Body::Nack(_) => Flow::Continue,
             Body::Error(error) => {
                 tracing::info!(conn = self.conn, code = error.code, "peer sent ERROR");
                 Flow::Continue
             }
             Body::Hello(hello) if self.state == ServerSession::WaitHello => {
-                self.on_hello(id, hello, out)
+                self.on_hello(id, hello, out).await
             }
             Body::Auth(auth) if self.state == ServerSession::WaitAuth => {
-                self.on_auth(id, auth, out)
+                self.on_auth(id, auth, out).await
             }
             // A handshake message out of order, or anything else before
             // READY (§64: MALFORMED_MESSAGE, close; a server never accepts
@@ -1175,7 +1229,7 @@ impl Session for LfcpSession {
             Body::ResourceOpen {
                 resource_id, flags, ..
             } => self.on_open(id, resource_id, flags, out).await,
-            Body::ResourceClose { resource_id } => self.on_close(id, resource_id, out),
+            Body::ResourceClose { resource_id } => self.on_close(id, resource_id, out).await,
             Body::ControlPut {
                 resource_id,
                 expected_head,
@@ -1230,11 +1284,11 @@ impl Session for LfcpSession {
             }
             // Server-to-client responses.
             Body::ResourceHosted { .. } | Body::ResourceOpened { .. } => {
-                self.nack(out, id, WireCode::MalformedMessage)
+                self.nack(out, id, WireCode::MalformedMessage).await
             }
             // Mirror seeding (client CONTROL/DATA/KEY_PACKAGE_BATCH and
             // SNAPSHOT, §46) and presence (§58) are not offered.
-            _ => self.nack(out, id, WireCode::ProtocolUnsupported),
+            _ => self.nack(out, id, WireCode::ProtocolUnsupported).await,
         }
     }
 
@@ -1242,7 +1296,7 @@ impl Session for LfcpSession {
         if self.state == ServerSession::Ready {
             let body =
                 ErrorBody::for_error(&error).unwrap_or(code_body(WireCode::MalformedMessage));
-            let _ = self.send(out, None, Body::Error(body));
+            let _ = self.send_now(out, None, Body::Error(body));
             return if error.closes_connection() {
                 Flow::Close
             } else {
@@ -1481,6 +1535,7 @@ mod tests {
             client: crate::limits::Client::detached("127.0.0.1".parse().unwrap()),
             server_id: ServerId::from_bytes([9; 32]),
             limits: crate::ws::Limits::new(1 << 20, 0),
+            outbound: crate::budget::ByteBudget::new(1 << 30),
         };
         let mut session = factory.open(&context);
         let (out, mut inbox) = test_outbound(8);

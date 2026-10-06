@@ -15,10 +15,20 @@
 //! payloads.
 //!
 //! Limits: a slow reader cannot grow memory without bound. Inbound
-//! messages are handled one at a time; the outbound queue holds
-//! [`Limits::outbound_queue`] messages, and a session that finds it full
-//! must close the connection; a write that does not finish within
-//! [`Limits::write_timeout`] closes it too. A connection with no inbound
+//! messages are handled one at a time. Outbound messages are queued encoded,
+//! and each holds a [`Reservation`] of its size from the connection's
+//! [`Limits::max_outbound_bytes`] and from the server-wide budget
+//! ([`ConnectionContext::outbound`]), released once it is written
+//! ([`crate::budget`], security review H6). [`Outbound::send`] never waits:
+//! a live push that does not fit gets [`Overloaded`] and closes its
+//! subscriber. [`Outbound::send_wait`] and [`Outbound::reserve`] wait for
+//! room, so a session's replies and GET pages are paced by the peer's
+//! reading (backpressure). The queue also holds at most
+//! [`Limits::outbound_queue`] messages. A write that does not finish within
+//! [`Limits::write_timeout`] ends the connection: the queue is dropped, its
+//! reservations are released, and a waiting session gets [`Overloaded`], so
+//! a peer that stops reading is closed and its memory freed after that
+//! timeout. At shutdown a waiting session is released the same way. A connection with no inbound
 //! LFCP message for [`Limits::idle_timeout`] (three READY heartbeat
 //! intervals, §37) is closed. Only LFCP messages (an LFCP `PING` included)
 //! count as liveness; WebSocket-level ping and pong frames do not.
@@ -73,6 +83,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig
 use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::budget::{Budgets, ByteBudget, Reservation};
 use crate::identity::ServerId;
 use crate::rng;
 
@@ -90,6 +101,9 @@ pub struct Limits {
     pub max_message_bytes: usize,
     /// Outbound messages that may wait for the socket.
     pub outbound_queue: usize,
+    /// Outbound bytes the connection may hold: queued messages and GET
+    /// pages being built.
+    pub max_outbound_bytes: usize,
     /// Close a connection with no inbound LFCP message for this long.
     pub idle_timeout: Option<Duration>,
     /// Close a connection whose socket does not take a message this fast.
@@ -119,6 +133,7 @@ impl Limits {
         Limits {
             max_message_bytes,
             outbound_queue: 256,
+            max_outbound_bytes: max_message_bytes.saturating_mul(4),
             idle_timeout: (heartbeat_ms > 0)
                 .then(|| Duration::from_millis(heartbeat_ms.saturating_mul(3))),
             write_timeout: Duration::from_secs(10),
@@ -143,6 +158,13 @@ impl Limits {
         self.handshake_timeout = timeout;
         self
     }
+
+    /// The same limits with another outbound byte cap and write timeout.
+    pub fn with_outbound(mut self, max_outbound_bytes: usize, write_timeout: Duration) -> Limits {
+        self.max_outbound_bytes = max_outbound_bytes;
+        self.write_timeout = write_timeout;
+        self
+    }
 }
 
 /// What the transport knows about a connection, for its session.
@@ -159,6 +181,8 @@ pub struct ConnectionContext {
     pub server_id: ServerId,
     /// The transport limits.
     pub limits: Limits,
+    /// The server-wide outbound byte budget every connection draws on.
+    pub outbound: Arc<ByteBudget>,
 }
 
 /// Whether the connection continues after a message.
@@ -181,6 +205,7 @@ pub struct Overloaded;
 pub struct Outbound {
     queue: mpsc::Sender<Out>,
     abort: Arc<Abort>,
+    budgets: Budgets,
 }
 
 #[derive(Debug, Default)]
@@ -190,18 +215,68 @@ struct Abort {
 }
 
 impl Outbound {
-    fn new(queue: mpsc::Sender<Out>) -> Outbound {
+    fn new(queue: mpsc::Sender<Out>, budgets: Budgets) -> Outbound {
         Outbound {
             queue,
             abort: Arc::default(),
+            budgets,
         }
     }
 
-    /// Queue a message without waiting.
+    /// Queue a message without waiting: [`Overloaded`] when its bytes do
+    /// not fit the budgets or the queue is full.
     pub fn send(&self, message: Message) -> Result<(), Overloaded> {
+        let bytes = message.encode();
+        let reservation = self.budgets.try_reserve(bytes.len()).ok_or(Overloaded)?;
         self.queue
-            .try_send(Out::Lfcp(Box::new(message)))
+            .try_send(Out::Lfcp(bytes, reservation))
             .map_err(|_| Overloaded)
+    }
+
+    /// Queue a message, waiting for room in the budgets and the queue;
+    /// [`Overloaded`] once the connection is closing.
+    pub async fn send_wait(&self, message: Message) -> Result<(), Overloaded> {
+        let bytes = message.encode();
+        drop(message);
+        let reservation = self.reserve(bytes.len()).await?;
+        self.send_reserved(bytes, reservation).await
+    }
+
+    /// Reserve `bytes` of the budgets, waiting for room, before building
+    /// a message of at most that size; [`Overloaded`] once the connection
+    /// is closing.
+    pub async fn reserve(&self, bytes: usize) -> Result<Reservation, Overloaded> {
+        self.budgets.reserve(bytes).await.ok_or(Overloaded)
+    }
+
+    /// Queue an encoded message under `reservation`, waiting for a place in
+    /// the queue. The reservation shrinks to the message's size; if it is
+    /// too small, it is released and the size reserved again.
+    pub async fn send_reserved(
+        &self,
+        bytes: Vec<u8>,
+        mut reservation: Reservation,
+    ) -> Result<(), Overloaded> {
+        if reservation.bytes() < bytes.len() {
+            drop(reservation);
+            reservation = self.reserve(bytes.len()).await?;
+        }
+        reservation.shrink_to(bytes.len());
+        self.queue
+            .send(Out::Lfcp(bytes, reservation))
+            .await
+            .map_err(|_| Overloaded)
+    }
+
+    /// The bytes this connection holds now (queued, being written, or
+    /// reserved for a message being built).
+    pub fn buffered_bytes(&self) -> usize {
+        self.budgets.connection().used()
+    }
+
+    /// The most bytes this connection has held at once.
+    pub fn peak_bytes(&self) -> usize {
+        self.budgets.connection().peak()
     }
 
     /// Close the connection from outside its session, for example when a
@@ -210,6 +285,7 @@ impl Outbound {
     pub fn abort(&self) {
         self.abort.requested.store(true, Ordering::SeqCst);
         self.abort.notify.notify_one();
+        self.budgets.halt();
     }
 
     /// Whether [`Outbound::abort`] was called.
@@ -218,17 +294,30 @@ impl Outbound {
     }
 }
 
+/// A queued item: an encoded LFCP message with the bytes it holds, or the
+/// close frame.
 #[derive(Debug)]
 pub(crate) enum Out {
-    Lfcp(Box<Message>),
+    Lfcp(Vec<u8>, Reservation),
     Close(CloseFrame),
+}
+
+/// An [`Outbound`] whose messages a unit test reads back, with budgets of
+/// `bytes`.
+#[cfg(test)]
+pub(crate) fn test_outbound_bytes(
+    capacity: usize,
+    bytes: usize,
+) -> (Outbound, mpsc::Receiver<Out>) {
+    let (queue, inbox) = mpsc::channel(capacity);
+    let budgets = Budgets::new(bytes, ByteBudget::new(bytes));
+    (Outbound::new(queue, budgets), inbox)
 }
 
 /// An [`Outbound`] whose messages a unit test reads back.
 #[cfg(test)]
 pub(crate) fn test_outbound(capacity: usize) -> (Outbound, mpsc::Receiver<Out>) {
-    let (queue, inbox) = mpsc::channel(capacity);
-    (Outbound::new(queue), inbox)
+    test_outbound_bytes(capacity, 1 << 30)
 }
 
 #[cfg(test)]
@@ -236,7 +325,13 @@ impl Out {
     /// The LFCP message, if this is one.
     pub(crate) fn into_message(self) -> Option<Message> {
         match self {
-            Out::Lfcp(message) => Some(*message),
+            Out::Lfcp(bytes, _) => {
+                let options = DecodeOptions {
+                    max_message_bytes: usize::MAX,
+                    ..DecodeOptions::default()
+                };
+                Some(Message::decode_frame(FrameKind::Binary, &bytes, &options).unwrap())
+            }
             Out::Close(_) => None,
         }
     }
@@ -435,22 +530,38 @@ pub async fn serve<S: Session>(
     tracing::info!(conn = id, peer = %connection.peer, client = %connection.client.ip(), "websocket open");
 
     // The writer: the only task touching the sink; bounded queue in front.
+    // A message's reservation is released once its frame is written. When
+    // the writer gives up, the queue and its reservations are dropped and
+    // the budgets halted, so a waiting session stops.
+    let budgets = Budgets::new(limits.max_outbound_bytes, connection.outbound.clone());
     let (queue, mut outbox) = mpsc::channel::<Out>(limits.outbound_queue);
+    let writer_budgets = budgets.clone();
     let writer = tokio::spawn(async move {
+        let halt = |outbox: &mut mpsc::Receiver<Out>| {
+            outbox.close();
+            while outbox.try_recv().is_ok() {}
+            writer_budgets.halt();
+        };
         while let Some(item) = outbox.recv().await {
-            let (frame, last) = match item {
-                Out::Lfcp(message) => (Frame::Binary(message.encode().into()), false),
-                Out::Close(close) => (Frame::Close(Some(close)), true),
+            let (frame, reservation, last) = match item {
+                Out::Lfcp(bytes, reservation) => {
+                    (Frame::Binary(bytes.into()), Some(reservation), false)
+                }
+                Out::Close(close) => (Frame::Close(Some(close)), None, true),
             };
-            match tokio::time::timeout(limits.write_timeout, sink.send(frame)).await {
+            let written = tokio::time::timeout(limits.write_timeout, sink.send(frame)).await;
+            drop(reservation);
+            match written {
                 Ok(Ok(())) if !last => {}
                 Ok(Ok(())) => break,
                 Ok(Err(error)) => {
                     tracing::debug!(conn = id, %error, "write failed");
+                    halt(&mut outbox);
                     return None;
                 }
                 Err(_) => {
                     tracing::info!(conn = id, "write timed out; closing a slow connection");
+                    halt(&mut outbox);
                     return None;
                 }
             }
@@ -460,7 +571,7 @@ pub async fn serve<S: Session>(
         // Handed back for the lingering close.
         Some(sink)
     });
-    let out = Outbound::new(queue.clone());
+    let out = Outbound::new(queue.clone(), budgets.clone());
     let abort = out.abort.clone();
     let close = |code: CloseCode, reason: &'static str| {
         let _ = queue.try_send(Out::Close(CloseFrame {
@@ -604,7 +715,20 @@ pub async fn serve<S: Session>(
                     message_type = message.body.message_type(),
                     "message"
                 );
-                if session.handle(message, &out).await == Flow::Close {
+                // A session waiting for outbound room is released at
+                // shutdown (its sends fail), then the connection closes.
+                let handled = session.handle(message, &out);
+                tokio::pin!(handled);
+                let flow = tokio::select! {
+                    flow = &mut handled => flow,
+                    () = stopped(&mut shutdown) => {
+                        budgets.halt();
+                        handled.await;
+                        close(CloseCode::Away, "server shutting down");
+                        break;
+                    }
+                };
+                if flow == Flow::Close {
                     close(CloseCode::Normal, "");
                     break;
                 }

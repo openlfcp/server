@@ -114,6 +114,8 @@ pub struct Running {
     pub setup_code: Option<String>,
     pub store: Arc<Store>,
     pub server_id: ServerId,
+    /// The server-wide outbound byte budget (POST-004).
+    pub outbound: Arc<lfcp_server::budget::ByteBudget>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -170,6 +172,7 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         .unwrap();
     let addr = server.local_addr().unwrap();
     let server_id = server.server_id();
+    let outbound = server.outbound();
     let (admin, setup_code) = lfcp_server::admin::Admin::open(
         store.clone(),
         server_id,
@@ -205,6 +208,7 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         setup_code: setup_code.map(|c| c.expose().to_owned()),
         store,
         server_id,
+        outbound,
         stop: Some(stop),
         task,
     }
@@ -299,6 +303,18 @@ impl Client {
 
     pub async fn recv(&mut self) -> Message {
         Message::decode(&self.recv_bytes().await, &DecodeOptions::default()).expect("decodes")
+    }
+
+    /// The next data frame's bytes, or `None` once the connection has
+    /// ended (a close frame, EOF or an error).
+    pub async fn next_frame(&mut self) -> Option<Vec<u8>> {
+        loop {
+            match self.socket.next().await {
+                Some(Ok(Frame::Binary(bytes))) => return Some(bytes.to_vec()),
+                Some(Ok(Frame::Ping(_) | Frame::Pong(_))) => continue,
+                _ => return None,
+            }
+        }
     }
 
     /// Expect the server to close the connection.

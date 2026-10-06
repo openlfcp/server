@@ -13,6 +13,7 @@
 //! | [`server`] | listener, connections, graceful shutdown | LFCP-044 |
 //! | [`store`] | the SQLite store of exact LFCP objects | LFCP-045 |
 //! | [`ws`] | the LFCP WebSocket transport: framing, limits, session hook | LFCP-047 |
+//! | [`budget`] | per-connection and server-wide outbound byte budgets | POST-004 |
 //! | [`session`] | the LFCP session: handshake, Resource host/open/close, Control Plane | LFCP-048, LFCP-049 |
 //! | [`coordinator`] | Control Coordinator CAS, Control state cache, live pushes | LFCP-049 |
 //! | [`ingest`] | Data Unit, Key Package and Snapshot validation, ingest policy | LFCP-050 |
@@ -27,6 +28,7 @@
 #![deny(missing_docs)]
 
 pub mod admin;
+pub mod budget;
 pub mod config;
 pub mod coordinator;
 pub mod http;

@@ -7,6 +7,11 @@
 //! an `mpsc` sender, so the server knows when the last one has ended, and
 //! waits for that at most [`SHUTDOWN_GRACE`].
 //!
+//! Outbound memory (security review H6): every WebSocket connection draws
+//! its outbound bytes from one server-wide [`ByteBudget`] of
+//! [`Config::max_total_outbound_bytes`] besides its own
+//! [`Config::max_outbound_bytes`] ([`crate::budget`]).
+//!
 //! Connection cap (security review M2): each TCP connection holds a permit
 //! of a semaphore of [`Config::max_connections`] for its whole life, a
 //! WebSocket after the upgrade included. A connection accepted past the
@@ -40,6 +45,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
+use crate::budget::ByteBudget;
 use crate::config::Config;
 use crate::http;
 use crate::identity::{ServerId, ServerIdentity};
@@ -67,6 +73,7 @@ pub struct Server {
     identity: Arc<dyn ServerIdentity>,
     store: Arc<Store>,
     config: Config,
+    outbound: Arc<ByteBudget>,
 }
 
 /// What every connection task shares.
@@ -77,6 +84,7 @@ struct Shared<F> {
     sessions: F,
     next_id: AtomicU64,
     connections: Arc<Semaphore>,
+    outbound: Arc<ByteBudget>,
     busy_answers: Arc<Semaphore>,
     proxies: Proxies,
     ips: Arc<IpTable>,
@@ -93,12 +101,14 @@ impl Server {
         store: Arc<Store>,
     ) -> std::io::Result<Server> {
         let listener = TcpListener::bind(config.bind).await?;
+        let outbound = ByteBudget::new(config.max_total_outbound_bytes);
         Ok(Server {
             admin: None,
             listener,
             identity,
             store,
             config,
+            outbound,
         })
     }
 
@@ -128,6 +138,11 @@ impl Server {
         &self.config
     }
 
+    /// The server-wide outbound byte budget, with its usage and peaks.
+    pub fn outbound(&self) -> Arc<ByteBudget> {
+        self.outbound.clone()
+    }
+
     /// Serve until `shutdown` completes, with `sessions` creating the
     /// session of each WebSocket connection. Then stop accepting, ask every
     /// connection to close, and wait for them at most [`SHUTDOWN_GRACE`].
@@ -141,6 +156,7 @@ impl Server {
             sessions,
             next_id: AtomicU64::new(1),
             connections: Arc::new(Semaphore::new(self.config.max_connections)),
+            outbound: self.outbound.clone(),
             busy_answers: Arc::new(Semaphore::new(BUSY_ANSWERS)),
             proxies: Proxies::new(&self.config.abuse),
             ips: IpTable::new(&self.config.abuse),
@@ -279,7 +295,12 @@ async fn route<F: SessionFactory>(
                 shared.config.abuse.ws_messages_per_second,
                 Duration::from_secs(1),
                 shared.config.abuse.ws_message_burst,
-            )),
+            ))
+            .with_outbound(
+                shared.config.max_outbound_bytes,
+                Duration::from_millis(shared.config.write_timeout_ms),
+            ),
+        outbound: shared.outbound.clone(),
     };
     let session = shared.sessions.open(&connection);
     let alive = shared.alive.clone();

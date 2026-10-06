@@ -10,6 +10,9 @@
 //! handshake_timeout_ms = 10000     # HTTP request headers and the LFCP handshake (to READY)
 //! max_connections = 1024           # open TCP connections; more get HTTP 503
 //! admin_body_timeout_ms = 10000    # reading a setup/admin request body; then HTTP 408, close
+//! max_outbound_bytes = 33554432    # outbound bytes one connection may hold (default 4 × max_message_bytes)
+//! max_total_outbound_bytes = 67108864  # outbound bytes all connections may hold together
+//! write_timeout_ms = 10000         # a peer that does not take a message this fast is closed
 //! public_urls = ["wss://sync.example.org/v1/ws"]  # this server's WebSocket URLs (§21)
 //! log_level = "info"               # error | warn | info | debug | trace
 //! # Abuse limits (POST-003; crate::limits). 0 disables a per-IP or rate limit.
@@ -50,6 +53,13 @@ pub const MIN_MESSAGE_BYTES: usize = 64 * 1024;
 /// unbounded messages.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// The default `max_total_outbound_bytes` (unless `max_outbound_bytes` is
+/// larger): 64 MiB, which with the idle server fits a 128 MB container.
+pub const DEFAULT_TOTAL_OUTBOUND_BYTES: usize = 64 * 1024 * 1024;
+
+/// The largest `max_total_outbound_bytes`.
+pub const MAX_TOTAL_OUTBOUND_BYTES: usize = 1 << 36;
+
 /// The largest `max_connections`.
 pub const MAX_CONNECTIONS: usize = 1_000_000;
 
@@ -77,6 +87,19 @@ pub struct Config {
     /// How long a client may take to send a setup/admin request body (at
     /// most 16 KiB); then it gets HTTP 408 and the connection is closed.
     pub admin_body_timeout_ms: u64,
+    /// The outbound bytes one WebSocket connection may hold: encoded
+    /// messages queued for the socket and GET pages being built. A reply
+    /// waits for room; a live push that does not fit closes its
+    /// subscriber. Default 4 × `max_message_bytes`; at least
+    /// 2 × `max_message_bytes`, so a full GET page fits.
+    pub max_outbound_bytes: usize,
+    /// The outbound bytes all connections may hold together, so the total
+    /// stays bounded whatever `max_connections` is. Default 64 MiB, or
+    /// `max_outbound_bytes` if larger.
+    pub max_total_outbound_bytes: usize,
+    /// How long the socket may take to accept one outbound message; a peer
+    /// that stops reading is closed after it, and its queue freed.
+    pub write_timeout_ms: u64,
     /// The WebSocket URLs clients reach this server at. A Resource whose
     /// Control Coordinator URL (§15, §20) names one of them, compared after
     /// [`crate::coordinator::normalize_url`], is coordinated here (§21);
@@ -99,6 +122,9 @@ impl Default for Config {
             handshake_timeout_ms: 10_000,
             max_connections: 1024,
             admin_body_timeout_ms: 10_000,
+            max_outbound_bytes: 4 * lfcp::wire::message::DEFAULT_MAX_MESSAGE_BYTES,
+            max_total_outbound_bytes: DEFAULT_TOTAL_OUTBOUND_BYTES,
+            write_timeout_ms: 10_000,
             public_urls: Vec::new(),
             log_level: tracing::Level::INFO,
             abuse: AbuseLimits::default(),
@@ -155,6 +181,9 @@ struct File {
     handshake_timeout_ms: Option<u64>,
     max_connections: Option<u64>,
     admin_body_timeout_ms: Option<u64>,
+    max_outbound_bytes: Option<u64>,
+    max_total_outbound_bytes: Option<u64>,
+    write_timeout_ms: Option<u64>,
     public_urls: Option<Vec<String>>,
     log_level: Option<String>,
     // The abuse limits (POST-003).
@@ -208,6 +237,18 @@ impl Config {
         }
         if let Some(ms) = file.admin_body_timeout_ms {
             config.admin_body_timeout_ms = ms;
+        }
+        let bytes = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        config.max_outbound_bytes = match file.max_outbound_bytes {
+            Some(n) => bytes(n),
+            None => config.max_message_bytes.saturating_mul(4),
+        };
+        config.max_total_outbound_bytes = match file.max_total_outbound_bytes {
+            Some(n) => bytes(n),
+            None => DEFAULT_TOTAL_OUTBOUND_BYTES.max(config.max_outbound_bytes),
+        };
+        if let Some(ms) = file.write_timeout_ms {
+            config.write_timeout_ms = ms;
         }
         if let Some(urls) = file.public_urls {
             config.public_urls = urls;
@@ -284,6 +325,23 @@ impl Config {
         }
         if !(1_000..=600_000).contains(&self.admin_body_timeout_ms) {
             return invalid("admin_body_timeout_ms", "must be between 1000 and 600000");
+        }
+        if !(1_000..=600_000).contains(&self.write_timeout_ms) {
+            return invalid("write_timeout_ms", "must be between 1000 and 600000");
+        }
+        if self.max_outbound_bytes < self.max_message_bytes.saturating_mul(2) {
+            return invalid(
+                "max_outbound_bytes",
+                "must be at least 2 × max_message_bytes",
+            );
+        }
+        if !(self.max_outbound_bytes..=MAX_TOTAL_OUTBOUND_BYTES)
+            .contains(&self.max_total_outbound_bytes)
+        {
+            return invalid(
+                "max_total_outbound_bytes",
+                "must be between max_outbound_bytes and 68719476736",
+            );
         }
         if !(1..=MAX_CONNECTIONS).contains(&self.max_connections) {
             return invalid("max_connections", "must be between 1 and 1000000");
@@ -411,7 +469,7 @@ mod tests {
     #[test]
     fn parses_every_field() {
         let config = Config::from_toml(
-            "bind = \"0.0.0.0:9000\"\nws_path = \"/ws\"\nstate_dir = \"/var/lib/lfcp\"\nmax_message_bytes = 1048576\nheartbeat_ms = 0\nhandshake_timeout_ms = 5000\nmax_connections = 64\nadmin_body_timeout_ms = 2000\npublic_urls = [\"wss://sync.example.org/v1/ws\"]\nlog_level = \"debug\"\n",
+            "bind = \"0.0.0.0:9000\"\nws_path = \"/ws\"\nstate_dir = \"/var/lib/lfcp\"\nmax_message_bytes = 1048576\nheartbeat_ms = 0\nhandshake_timeout_ms = 5000\nmax_connections = 64\nadmin_body_timeout_ms = 2000\nmax_outbound_bytes = 4194304\nmax_total_outbound_bytes = 16777216\nwrite_timeout_ms = 3000\npublic_urls = [\"wss://sync.example.org/v1/ws\"]\nlog_level = \"debug\"\n",
         )
         .unwrap();
         assert_eq!(config.bind, "0.0.0.0:9000".parse().unwrap());
@@ -422,8 +480,24 @@ mod tests {
         assert_eq!(config.handshake_timeout_ms, 5_000);
         assert_eq!(config.max_connections, 64);
         assert_eq!(config.admin_body_timeout_ms, 2_000);
+        assert_eq!(config.max_outbound_bytes, 4 << 20);
+        assert_eq!(config.max_total_outbound_bytes, 16 << 20);
+        assert_eq!(config.write_timeout_ms, 3_000);
         assert_eq!(config.public_urls, vec!["wss://sync.example.org/v1/ws"]);
         assert_eq!(config.log_level, tracing::Level::DEBUG);
+    }
+
+    #[test]
+    fn outbound_budgets_follow_the_message_size() {
+        let config = Config::default();
+        assert_eq!(config.max_outbound_bytes, 32 << 20);
+        assert_eq!(config.max_total_outbound_bytes, 64 << 20);
+        let small = Config::from_toml("max_message_bytes = 1048576").unwrap();
+        assert_eq!(small.max_outbound_bytes, 4 << 20);
+        assert_eq!(small.max_total_outbound_bytes, 64 << 20);
+        let large = Config::from_toml("max_message_bytes = 67108864").unwrap();
+        assert_eq!(large.max_outbound_bytes, 256 << 20);
+        assert_eq!(large.max_total_outbound_bytes, 256 << 20);
     }
 
     #[test]
@@ -450,6 +524,12 @@ mod tests {
         assert_eq!(
             field("admin_body_timeout_ms = 999"),
             "admin_body_timeout_ms"
+        );
+        assert_eq!(field("write_timeout_ms = 999"), "write_timeout_ms");
+        assert_eq!(field("max_outbound_bytes = 16777215"), "max_outbound_bytes");
+        assert_eq!(
+            field("max_outbound_bytes = 67108864\nmax_total_outbound_bytes = 33554432"),
+            "max_total_outbound_bytes"
         );
         assert_eq!(field("public_urls = [\"https://x/v1/ws\"]"), "public_urls");
         assert_eq!(field("public_urls = [\"wss://u@x/v1/ws\"]"), "public_urls");
