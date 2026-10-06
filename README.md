@@ -259,6 +259,13 @@ WebSocket version 426.
   connection: its queue is dropped and every reserved byte released, and
   a reply waiting for room stops. A peer that stops reading is therefore
   closed after that timeout.
+- A message over 64 KiB is sent as WebSocket fragments of 64 KiB (§31
+  allows it). tungstenite copies each frame into a write buffer that
+  keeps its largest size for the life of the connection, so a whole 8 MiB
+  frame left every connection holding 8 MiB or more outside the budgets.
+  The peer reassembles the message, and its size limits apply to the
+  whole message. sdk-ts (WHATWG WebSocket), the plugin E2E and tungstenite
+  clients receive them unchanged.
 - A connection that sends no LFCP message for three heartbeats is closed
   (1001). Only LFCP messages count, an LFCP `PING` included; WebSocket
   ping and pong frames do not.

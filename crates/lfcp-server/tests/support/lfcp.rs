@@ -264,6 +264,23 @@ impl Client {
         }
     }
 
+    /// Connect with these WebSocket limits.
+    pub async fn connect_with(
+        addr: SocketAddr,
+        config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+    ) -> Client {
+        let mut request = format!("ws://{addr}/v1/ws").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "lfcp-1".parse().unwrap());
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (socket, _) =
+            tokio_tungstenite::client_async_with_config(request, stream, Some(config))
+                .await
+                .expect("handshake");
+        Client { socket, next_id: 0 }
+    }
+
     /// A fresh message ID for a request.
     pub fn id(&mut self) -> [u8; 16] {
         self.next_id += 1;

@@ -1,8 +1,9 @@
 //! Memory bounds on authenticated and admin peers (POST-004, security
 //! review H6): outbound bytes per connection and server-wide, a peer that
 //! stops reading, control replies while GET pages fill the server-wide
-//! budget, and the admin request body read timeout. Small caps and
-//! Resources: these tests show the bounds hold; they are not load tests.
+//! budget, large messages sent as WebSocket fragments, and the admin
+//! request body read timeout. Small caps and Resources: these tests show
+//! the bounds hold; they are not load tests.
 
 mod support;
 
@@ -331,6 +332,36 @@ async fn a_large_resource_is_served_within_the_byte_caps() {
     let reply = client.recv().await;
     assert_eq!(reply.correlation_id, Some(request));
     assert!(matches!(reply.body, Body::DataBatch { units, .. } if units.is_empty()));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_8_mib_message_arrives_whole_in_64_kib_fragments() {
+    let v = Vectors::load();
+    // Default limits: 8 MiB messages. Nine units of about 1 MiB: the first
+    // batch is just under 8 MiB.
+    let (server, dir) = resource_with(&v, "memory-fragments", 9, 1_047_800, None).await;
+    let bob = v.principal("bob");
+    // This client refuses any frame over 64 KiB, and any message over
+    // 8 MiB once reassembled: the limits apply to the whole message.
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_frame_size(Some(lfcp_server::ws::FRAGMENT_BYTES))
+        .max_message_size(Some(8 << 20));
+    let mut client = Client::connect_with(server.addr, config).await;
+    client.handshake(&bob).await;
+    let request = client.request(get_all(&v, &bob)).await;
+    let batches = read_batches_of(&mut client, request, 9, 8 << 20).await;
+    let first: usize = batches[0].iter().map(Vec::len).sum();
+    assert!(first > 8_000_000, "{first}");
+    let stored = server
+        .store
+        .data_units_in(v.resource(), *bob.descriptor().id(), 1, 9)
+        .await
+        .unwrap();
+    let stored: Vec<Vec<u8>> = stored.into_iter().map(|o| o.bytes).collect();
+    assert_eq!(batches.concat(), stored, "unchanged");
 
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();

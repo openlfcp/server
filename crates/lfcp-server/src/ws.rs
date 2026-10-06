@@ -78,7 +78,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio_tungstenite::tungstenite::error::{CapacityError, Error as WsError};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{
+    CloseCode, Data as DataCode, OpCode,
+};
+use tokio_tungstenite::tungstenite::protocol::frame::Frame as RawFrame;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::WebSocketStream;
@@ -559,7 +562,7 @@ pub async fn serve<S: Session>(
         while let Some(item) = outbox.recv().await {
             let (written, last) = match item {
                 Out::Lfcp(bytes, reservation) => {
-                    let write = sink.send(Frame::Binary(bytes.into()));
+                    let write = write_message(&mut sink, bytes.into());
                     let written = tokio::time::timeout(limits.write_timeout, write).await;
                     drop(reservation);
                     (written, false)
@@ -786,6 +789,38 @@ pub async fn serve<S: Session>(
     tracing::info!(conn = id, "websocket closed");
 }
 
+/// Outbound LFCP messages larger than this go as WebSocket fragments of
+/// this size (§31: the transport may fragment). tungstenite copies each
+/// frame into a write buffer that keeps its largest size for the life of
+/// the connection, so whole 8 MiB frames left every connection holding
+/// 8 MiB or more. The peer reassembles the message, and its size limits
+/// apply to the whole message.
+pub const FRAGMENT_BYTES: usize = 64 * 1024;
+
+/// Write one encoded LFCP message as a binary WebSocket message, in
+/// fragments of [`FRAGMENT_BYTES`] when it is larger.
+async fn write_message<S>(sink: &mut S, bytes: Bytes) -> Result<(), WsError>
+where
+    S: futures_util::Sink<Frame, Error = WsError> + Unpin,
+{
+    if bytes.len() <= FRAGMENT_BYTES {
+        return sink.send(Frame::Binary(bytes)).await;
+    }
+    let mut start = 0;
+    while start < bytes.len() {
+        let end = (start + FRAGMENT_BYTES).min(bytes.len());
+        let opcode = if start == 0 {
+            OpCode::Data(DataCode::Binary)
+        } else {
+            OpCode::Data(DataCode::Continue)
+        };
+        let fragment = RawFrame::message(bytes.slice(start..end), opcode, end == bytes.len());
+        sink.send(Frame::Frame(fragment)).await?;
+        start = end;
+    }
+    Ok(())
+}
+
 /// The lingering close (see the module documentation): shut down the write
 /// half, then read and discard the peer's bytes until EOF, within
 /// `linger_timeout` and `linger_bytes`, or until the server shuts down.
@@ -815,4 +850,64 @@ async fn linger<S: AsyncRead + AsyncWrite + Unpin>(
 /// Completes once the server is shutting down (or gone).
 async fn stopped(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A sink that keeps the frames written to it.
+    #[derive(Default)]
+    struct Frames(Vec<Frame>);
+
+    impl futures_util::Sink<Frame> for Frames {
+        type Error = WsError;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(mut self: Pin<&mut Self>, frame: Frame) -> Result<(), WsError> {
+            self.0.push(frame);
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn large_messages_go_as_fragments() {
+        for len in [0, 1, FRAGMENT_BYTES, FRAGMENT_BYTES + 1, 8 << 20] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + i / 251) as u8).collect();
+            let mut sink = Frames::default();
+            write_message(&mut sink, Bytes::from(bytes.clone()))
+                .await
+                .unwrap();
+            if len <= FRAGMENT_BYTES {
+                assert!(matches!(&sink.0[..], [Frame::Binary(b)] if b[..] == bytes[..]));
+                continue;
+            }
+            assert_eq!(sink.0.len(), len.div_ceil(FRAGMENT_BYTES));
+            let mut joined = Vec::new();
+            for (i, frame) in sink.0.iter().enumerate() {
+                let Frame::Frame(frame) = frame else {
+                    panic!("a raw fragment")
+                };
+                let expected = if i == 0 {
+                    OpCode::Data(DataCode::Binary)
+                } else {
+                    OpCode::Data(DataCode::Continue)
+                };
+                assert_eq!(frame.header().opcode, expected);
+                assert_eq!(frame.header().is_final, i + 1 == sink.0.len());
+                assert!(frame.payload().len() <= FRAGMENT_BYTES);
+                joined.extend_from_slice(frame.payload());
+            }
+            assert_eq!(joined, bytes);
+        }
+    }
 }
