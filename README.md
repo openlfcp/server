@@ -218,6 +218,49 @@ reaches the proxy. `deploy/` does this for Caddy (see "Docker").
 - Admin challenges cannot be exhausted (see "Administration").
 - `max_connections` (1024, every TCP connection) still applies first.
 
+## Memory
+
+The server's memory is bounded by its configuration, not by the size of
+the Resources it serves (security review H6, POST-004). As a rule of
+thumb:
+
+```text
+RSS ≈ idle (about 6 MiB)
+    + SQLite page cache (2 MiB: SQLite defaults, no mmap)
+    + max_total_outbound_bytes                    (every queued reply and GET page)
+    + max_connections × (3 × max_message_bytes + 256 KiB)  (a message being read and decoded, WebSocket buffers)
+```
+
+- The outbound term is a hard bound: replies, GET pages and live pushes
+  all hold their bytes in the budgets until they are written.
+- The inbound term is a worst case. It needs every connection to be
+  receiving a maximum-size message at the same moment (security review
+  M5, after READY).
+
+Measured on macOS (arm64, release build). Peak RSS of the server
+process, with clients on loopback reading as fast as they can:
+
+| Load | 0.1.0 | Now |
+| --- | --- | --- |
+| idle | 5 MiB | 5–8 MiB |
+| 1 client, `DATA_GET` of a 256 MiB Resource, defaults | 619 MiB | 41 MiB |
+| the same, with the small-host settings below | – | 13 MiB |
+| 50 clients, each `DATA_GET` of a 16 MiB Resource, defaults | 750 MiB | 41 MiB |
+| the same, with the small-host settings below | 117 MiB | 25 MiB |
+
+For a container limited to 128 MB:
+
+```toml
+max_message_bytes = 1048576          # 1 MiB: also the largest Snapshot or DATA_PUT clients can send
+max_connections = 24
+max_outbound_bytes = 4194304         # 4 MiB per connection
+max_total_outbound_bytes = 25165824  # 24 MiB in all
+```
+
+That gives 6 + 2 + 24 + 24 × 3.25 ≈ 110 MiB in the worst case. With
+`max_connections = 32` it is about 136 MiB in the worst case, so only if
+the inbound worst case is accepted as unlikely.
+
 ## WebSocket
 
 `GET <ws_path>` upgrades to WebSocket with the `lfcp-1` subprotocol
