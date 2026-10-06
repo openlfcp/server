@@ -430,6 +430,14 @@ curl --cacert root.crt https://localhost/health
 
 CI runs it in the `docker` job.
 
+Prebuilt images are published to `ghcr.io/openlfcp/lfcp-server` for
+`linux/amd64` and `linux/arm64` by `.github/workflows/image.yml`: a pushed
+`v*` tag publishes the version (`v0.1.0` → `0.1.0`) and `latest`, and a
+manual run publishes a chosen tag. Each architecture is built natively,
+with sdk-rs at the commit in `sdk-rs.lock`, and must turn healthy before
+anything is tagged. A host that cannot build Rust pulls the image instead
+and mounts its own `server.toml`; pin a version, not `latest`.
+
 ## sdk-rs and the spec
 
 sdk-rs is consumed from a sibling checkout, `../sdk-rs`, as a path
