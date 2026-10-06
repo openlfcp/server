@@ -638,3 +638,83 @@ fn migrating_an_empty_database_is_deterministic() {
     };
     assert_eq!(schema_of("migrate-a"), schema_of("migrate-b"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_bytes_are_accounted_and_backfilled() {
+    use lfcp_server::store::QuotaOverride;
+    let v = Vectors::load();
+    let dir = temp_dir("usage");
+    let store = chain_store(&v, &dir).await;
+    let resource = v.resource();
+    let owner = *v.principal("owner").descriptor().id();
+    for id in UNITS {
+        store.put_data_unit(v.cose(id)).await.unwrap();
+    }
+    for id in SNAPSHOTS {
+        store.put_snapshot(v.cose(id)).await.unwrap();
+    }
+    for id in PACKAGES {
+        store.put_key_package(v.cose(id)).await.unwrap();
+    }
+    // Duplicates add nothing.
+    store.put_data_unit(v.cose(UNITS[0])).await.unwrap();
+    store.put_snapshot(v.cose(SNAPSHOTS[0])).await.unwrap();
+    let sizes = store.resource_sizes().await.unwrap();
+    let bytes = sizes[0].bytes;
+    assert!(bytes > 0);
+    let usage = store.usage(resource).await.unwrap().expect("hosted");
+    assert_eq!(usage.host, owner);
+    assert_eq!(usage.resource_bytes, bytes);
+    assert_eq!((usage.host_resources, usage.host_bytes), (1, bytes));
+    assert_eq!(usage.total_bytes, bytes);
+    assert_eq!(store.principal_usage(owner).await.unwrap(), (1, bytes));
+    assert_eq!(
+        store
+            .principal_usage(lfcp::base::PrincipalId::from_bytes([9; 32]))
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+    assert_eq!(store.total_bytes().await.unwrap(), bytes);
+    assert_eq!(
+        store.usage(ResourceId::from_bytes([9; 32])).await.unwrap(),
+        None
+    );
+
+    // Overrides round-trip.
+    let quota = QuotaOverride {
+        resources: Some(3),
+        bytes: None,
+        resource_bytes: Some(1 << 30),
+    };
+    store.set_quota_override(owner, quota).await.unwrap();
+    assert_eq!(store.quota_overrides().await.unwrap(), vec![(owner, quota)]);
+    assert!(store.delete_quota_override(owner).await.unwrap());
+    assert!(!store.delete_quota_override(owner).await.unwrap());
+    let path = store.path().to_path_buf();
+    drop(store);
+
+    // A database from before migration 3 is backfilled when it opens.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER resource_usage_on_host; DROP TRIGGER resource_usage_on_control;
+         DROP TRIGGER resource_usage_on_data; DROP TRIGGER resource_usage_on_key_package;
+         DROP TRIGGER resource_usage_on_snapshot; DROP INDEX hosting_by_host;
+         DROP TABLE resource_usage; DROP TABLE quota_overrides;
+         UPDATE schema_version SET version = 2;",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        schema::latest_version()
+    );
+    assert_eq!(store.total_bytes().await.unwrap(), bytes);
+    assert_eq!(
+        store.usage(resource).await.unwrap().unwrap().resource_bytes,
+        bytes
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

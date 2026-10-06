@@ -765,6 +765,34 @@ pub struct ResourceSize {
     pub bytes: u64,
 }
 
+/// What a Resource's quota check needs (POST-003): its stored bytes, its
+/// hosting Principal's Resources and bytes, and the store's total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    /// The Principal that hosted the Resource here.
+    pub host: PrincipalId,
+    /// The Resource's stored bytes.
+    pub resource_bytes: u64,
+    /// The Resources `host` hosts here.
+    pub host_resources: u64,
+    /// The stored bytes of those Resources.
+    pub host_bytes: u64,
+    /// The stored bytes of every Resource.
+    pub total_bytes: u64,
+}
+
+/// A Principal's quota override (admin API, POST-003); `None` keeps the
+/// configured default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaOverride {
+    /// Resources it may host.
+    pub resources: Option<u64>,
+    /// Stored bytes across its Resources.
+    pub bytes: Option<u64>,
+    /// Stored bytes of each of its Resources.
+    pub resource_bytes: Option<u64>,
+}
+
 /// Failed setup code attempts after which the code is destroyed.
 pub const SETUP_ATTEMPTS: u32 = 5;
 
@@ -901,6 +929,118 @@ impl Store {
                 })
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+}
+
+impl Store {
+    /// The quota figures of a hosted Resource; `None` if it is not hosted.
+    pub async fn usage(&self, resource: ResourceId) -> Result<Option<Usage>, StoreError> {
+        self.call(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT h.host, u.bytes,
+                       (SELECT COUNT(*) FROM hosting h2 WHERE h2.host = h.host),
+                       (SELECT COALESCE(SUM(u2.bytes), 0) FROM hosting h2
+                          JOIN resource_usage u2 ON u2.resource_id = h2.resource_id
+                          WHERE h2.host = h.host),
+                       (SELECT COALESCE(SUM(bytes), 0) FROM resource_usage)
+                     FROM hosting h JOIN resource_usage u ON u.resource_id = h.resource_id
+                     WHERE h.resource_id = ?1",
+                    [resource.as_bytes().as_slice()],
+                    |row| {
+                        Ok(Usage {
+                            host: PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                            resource_bytes: row.get::<_, i64>(1)? as u64,
+                            host_resources: row.get::<_, i64>(2)? as u64,
+                            host_bytes: row.get::<_, i64>(3)? as u64,
+                            total_bytes: row.get::<_, i64>(4)? as u64,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// The Resources `principal` hosts here and their stored bytes.
+    pub async fn principal_usage(&self, principal: PrincipalId) -> Result<(u64, u64), StoreError> {
+        self.call(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(u.bytes), 0) FROM hosting h
+                   JOIN resource_usage u ON u.resource_id = h.resource_id WHERE h.host = ?1",
+                [principal.as_bytes().as_slice()],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            )?)
+        })
+        .await
+    }
+
+    /// The stored bytes of every Resource.
+    pub async fn total_bytes(&self) -> Result<u64, StoreError> {
+        self.call(|conn| {
+            Ok(conn.query_row(
+                "SELECT COALESCE(SUM(bytes), 0) FROM resource_usage",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? as u64)
+        })
+        .await
+    }
+
+    /// Every quota override.
+    pub async fn quota_overrides(&self) -> Result<Vec<(PrincipalId, QuotaOverride)>, StoreError> {
+        self.call(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT principal, resources, bytes, resource_bytes FROM quota_overrides ORDER BY principal",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let n = |i: usize| row.get::<_, Option<i64>>(i).map(|v| v.map(|v| v as u64));
+                Ok((
+                    PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                    QuotaOverride {
+                        resources: n(1)?,
+                        bytes: n(2)?,
+                        resource_bytes: n(3)?,
+                    },
+                ))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    /// Set `principal`'s quota override.
+    pub async fn set_quota_override(
+        &self,
+        principal: PrincipalId,
+        quota: QuotaOverride,
+    ) -> Result<(), StoreError> {
+        let n = |v: Option<u64>| v.map(i64_of).transpose();
+        let (resources, bytes, resource_bytes) = (
+            n(quota.resources)?,
+            n(quota.bytes)?,
+            n(quota.resource_bytes)?,
+        );
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO quota_overrides (principal, resources, bytes, resource_bytes) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (principal) DO UPDATE SET resources = ?2, bytes = ?3, resource_bytes = ?4",
+                params![principal.as_bytes().as_slice(), resources, bytes, resource_bytes],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Remove `principal`'s quota override; whether there was one.
+    pub async fn delete_quota_override(&self, principal: PrincipalId) -> Result<bool, StoreError> {
+        self.call(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM quota_overrides WHERE principal = ?1",
+                [principal.as_bytes().as_slice()],
+            )? == 1)
         })
         .await
     }

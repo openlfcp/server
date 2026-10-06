@@ -118,6 +118,52 @@ pub const MIGRATIONS: &[&str] = &[
         value         TEXT NOT NULL
     ) STRICT;
     "#,
+    // 3: storage accounting for quotas (POST-003). Infrastructure only.
+    r#"
+    -- The stored bytes of each Resource: the sum of length(bytes) over its
+    -- Control Records, Data Units, Key Packages and Snapshots, kept by the
+    -- triggers below in the inserting transaction (an INSERT OR IGNORE of
+    -- a duplicate inserts nothing and adds nothing). Objects are never
+    -- deleted.
+    CREATE TABLE resource_usage (
+        resource_id   BLOB PRIMARY KEY REFERENCES resources (resource_id),
+        bytes         INTEGER NOT NULL DEFAULT 0 CHECK (bytes >= 0)
+    ) STRICT;
+    INSERT INTO resource_usage (resource_id, bytes)
+    SELECT r.resource_id,
+        (SELECT COALESCE(SUM(length(bytes)), 0) FROM control_records c WHERE c.resource_id = r.resource_id)
+      + (SELECT COALESCE(SUM(length(bytes)), 0) FROM data_units d WHERE d.resource_id = r.resource_id)
+      + (SELECT COALESCE(SUM(length(bytes)), 0) FROM key_packages k WHERE k.resource_id = r.resource_id)
+      + (SELECT COALESCE(SUM(length(bytes)), 0) FROM snapshots s WHERE s.resource_id = r.resource_id)
+    FROM resources r;
+    CREATE TRIGGER resource_usage_on_host AFTER INSERT ON resources BEGIN
+        INSERT INTO resource_usage (resource_id, bytes) VALUES (NEW.resource_id, 0);
+    END;
+    CREATE TRIGGER resource_usage_on_control AFTER INSERT ON control_records BEGIN
+        UPDATE resource_usage SET bytes = bytes + length(NEW.bytes) WHERE resource_id = NEW.resource_id;
+    END;
+    CREATE TRIGGER resource_usage_on_data AFTER INSERT ON data_units BEGIN
+        UPDATE resource_usage SET bytes = bytes + length(NEW.bytes) WHERE resource_id = NEW.resource_id;
+    END;
+    CREATE TRIGGER resource_usage_on_key_package AFTER INSERT ON key_packages BEGIN
+        UPDATE resource_usage SET bytes = bytes + length(NEW.bytes) WHERE resource_id = NEW.resource_id;
+    END;
+    CREATE TRIGGER resource_usage_on_snapshot AFTER INSERT ON snapshots BEGIN
+        UPDATE resource_usage SET bytes = bytes + length(NEW.bytes) WHERE resource_id = NEW.resource_id;
+    END;
+
+    -- The Resources each Principal hosts, for its quota.
+    CREATE INDEX hosting_by_host ON hosting (host);
+
+    -- Per-Principal quota overrides set through the admin API; NULL keeps
+    -- the configured default.
+    CREATE TABLE quota_overrides (
+        principal       BLOB PRIMARY KEY CHECK (length(principal) = 32),
+        resources       INTEGER CHECK (resources IS NULL OR resources >= 0),
+        bytes           INTEGER CHECK (bytes IS NULL OR bytes >= 0),
+        resource_bytes  INTEGER CHECK (resource_bytes IS NULL OR resource_bytes >= 0)
+    ) STRICT;
+    "#,
 ];
 
 /// The schema version a fully migrated database has.
