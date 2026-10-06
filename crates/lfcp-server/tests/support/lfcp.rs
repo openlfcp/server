@@ -79,6 +79,8 @@ pub struct Options {
     /// Overrides of the configuration defaults.
     pub handshake_timeout_ms: Option<u64>,
     pub max_connections: Option<usize>,
+    /// The abuse limits (POST-003); default `AbuseLimits::default()`.
+    pub abuse: Option<lfcp_server::limits::AbuseLimits>,
 }
 
 impl Default for Options {
@@ -93,6 +95,7 @@ impl Default for Options {
             setup_ttl: None,
             handshake_timeout_ms: None,
             max_connections: None,
+            abuse: None,
         }
     }
 }
@@ -140,6 +143,7 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         max_connections: options
             .max_connections
             .unwrap_or(Config::default().max_connections),
+        abuse: options.abuse.unwrap_or_default(),
         ..Config::default()
     };
     let identity: Arc<dyn ServerIdentity> = match options.identity {
@@ -190,17 +194,49 @@ pub struct Client {
     next_id: u8,
 }
 
+/// A refused WebSocket upgrade: the HTTP status, `Retry-After` and body.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub status: u16,
+    pub retry_after: Option<String>,
+    pub body: String,
+}
+
 impl Client {
     pub async fn connect(addr: SocketAddr) -> Client {
+        Client::try_connect(addr, &[]).await.expect("handshake")
+    }
+
+    /// Upgrade with extra request headers; the HTTP refusal if any.
+    pub async fn try_connect(
+        addr: SocketAddr,
+        headers: &[(&str, &str)],
+    ) -> Result<Client, Refused> {
         let mut request = format!("ws://{addr}/v1/ws").into_client_request().unwrap();
         request
             .headers_mut()
             .insert("sec-websocket-protocol", "lfcp-1".parse().unwrap());
+        for (name, value) in headers {
+            request.headers_mut().append(
+                tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                    .unwrap(),
+                value.parse().unwrap(),
+            );
+        }
         let stream = TcpStream::connect(addr).await.unwrap();
-        let (socket, _) = tokio_tungstenite::client_async(request, stream)
-            .await
-            .expect("handshake");
-        Client { socket, next_id: 0 }
+        match tokio_tungstenite::client_async(request, stream).await {
+            Ok((socket, _)) => Ok(Client { socket, next_id: 0 }),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => Err(Refused {
+                status: response.status().as_u16(),
+                retry_after: response
+                    .headers()
+                    .get("retry-after")
+                    .map(|v| v.to_str().unwrap().to_owned()),
+                body: String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
+                    .into_owned(),
+            }),
+            Err(error) => panic!("handshake: {error}"),
+        }
     }
 
     /// A fresh message ID for a request.

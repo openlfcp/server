@@ -12,6 +12,12 @@
 //! WebSocket after the upgrade included. A connection accepted past the
 //! cap gets `503 Service Unavailable` with `Retry-After` and is closed,
 //! without its request being read.
+//!
+//! Per client IP (POST-003, [`crate::limits`]): the client of each request
+//! is the TCP peer, or the address a trusted proxy reports. A WebSocket
+//! upgrade past [`crate::limits::AbuseLimits::max_connections_per_ip`]
+//! open WebSockets of its client gets `429 Too Many Requests` with
+//! `Retry-After`, and no WebSocket.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -32,6 +38,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use crate::config::Config;
 use crate::http;
 use crate::identity::{ServerId, ServerIdentity};
+use crate::limits::{Client, IpTable, Proxies, Refused};
 use crate::store::Store;
 use crate::ws::{self, ConnectionContext, Limits, SessionFactory};
 
@@ -63,6 +70,8 @@ struct Shared<F> {
     next_id: AtomicU64,
     connections: Arc<Semaphore>,
     busy_answers: Arc<Semaphore>,
+    proxies: Proxies,
+    ips: Arc<IpTable>,
     shutdown: watch::Receiver<bool>,
     alive: mpsc::Sender<()>,
 }
@@ -125,6 +134,8 @@ impl Server {
             next_id: AtomicU64::new(1),
             connections: Arc::new(Semaphore::new(self.config.max_connections)),
             busy_answers: Arc::new(Semaphore::new(BUSY_ANSWERS)),
+            proxies: Proxies::new(&self.config.abuse),
+            ips: IpTable::new(&self.config.abuse),
             shutdown: stopping,
             alive,
         });
@@ -233,9 +244,18 @@ async fn route<F: SessionFactory>(
         ws::Upgrade::Accept(response) => response,
         ws::Upgrade::Reject(rejection) => return Ok(rejection),
     };
+    let client_ip = shared.proxies.client_ip(peer.ip(), request.headers());
+    let place = match shared.ips.connect(client_ip, std::time::Instant::now()) {
+        Ok(place) => place,
+        Err(refused) => {
+            tracing::info!(%peer, client = %client_ip, ?refused, "per-IP connection limit; refusing");
+            return Ok(too_many(refused));
+        }
+    };
     let connection = ConnectionContext {
         id: shared.next_id.fetch_add(1, Ordering::Relaxed),
         peer,
+        client: Client::new(client_ip, shared.ips.clone()),
         server_id: shared.server_id,
         limits: Limits::new(shared.config.max_message_bytes, shared.config.heartbeat_ms)
             .with_handshake_timeout(Duration::from_millis(shared.config.handshake_timeout_ms)),
@@ -246,7 +266,21 @@ async fn route<F: SessionFactory>(
     tokio::spawn(async move {
         let _alive = alive;
         let _permit = permit;
+        let _place = place;
         ws::serve(request, connection, session, shutdown).await;
     });
     Ok(response)
+}
+
+/// The answer to a WebSocket upgrade refused by a per-IP limit.
+fn too_many(refused: Refused) -> Response<Full<Bytes>> {
+    let (retry, body) = match refused {
+        Refused::TooMany => (5, "too many connections from this address\n"),
+    };
+    Response::builder()
+        .status(hyper::StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "text/plain")
+        .header("retry-after", retry.to_string())
+        .body(Full::new(Bytes::from_static(body.as_bytes())))
+        .expect("a static response is valid")
 }

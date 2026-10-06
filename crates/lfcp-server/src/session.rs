@@ -1306,6 +1306,7 @@ mod tests {
         let context = ConnectionContext {
             id: 1,
             peer: "127.0.0.1:1".parse().unwrap(),
+            client: crate::limits::Client::detached("127.0.0.1".parse().unwrap()),
             server_id: ServerId::from_bytes([9; 32]),
             limits: crate::ws::Limits::new(1 << 20, 0),
         };

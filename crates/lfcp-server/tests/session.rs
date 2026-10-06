@@ -61,6 +61,7 @@ fn vector_options(v: &Vectors) -> (Options, Arc<Script>) {
         setup_ttl: None,
         handshake_timeout_ms: None,
         max_connections: None,
+        abuse: None,
     };
     (options, script)
 }

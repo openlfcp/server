@@ -134,6 +134,9 @@ pub struct ConnectionContext {
     pub id: u64,
     /// The peer address.
     pub peer: SocketAddr,
+    /// The client: the peer, or the address a trusted proxy reported
+    /// (POST-003, [`crate::limits::Proxies`]).
+    pub client: crate::limits::Client,
     /// The server ID (§35, §37).
     pub server_id: ServerId,
     /// The transport limits.
@@ -406,7 +409,7 @@ pub async fn serve<S: Session>(
     let socket =
         WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(config)).await;
     let (mut sink, mut stream) = socket.split();
-    tracing::info!(conn = id, peer = %connection.peer, "websocket open");
+    tracing::info!(conn = id, peer = %connection.peer, client = %connection.client.ip(), "websocket open");
 
     // The writer: the only task touching the sink; bounded queue in front.
     let (queue, mut outbox) = mpsc::channel::<Out>(limits.outbound_queue);

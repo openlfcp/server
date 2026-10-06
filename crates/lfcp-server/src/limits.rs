@@ -2,13 +2,38 @@
 //! review H5, M2, M3): the client address behind a trusted proxy, and the
 //! configured limits.
 //!
+//! **Client IP.** Behind a reverse proxy every TCP peer is the proxy, so
+//! [`Proxies::client_ip`] believes the configured header
+//! ([`AbuseLimits::client_ip_header`], default `X-Forwarded-For`) only
+//! when the TCP peer is in [`AbuseLimits::trusted_proxies`]; otherwise the
+//! peer address is the client. The header is read as a comma-separated
+//! list (every line of it, in order) from the right: the rightmost entry
+//! that is not itself a trusted proxy is the client, because entries left
+//! of it were written by parties the server does not trust. If every
+//! entry is trusted, the leftmost is the client. An entry that is not an
+//! IP address stops the walk and the peer address is used.
+//!
+//! **Per-IP state** ([`IpTable`]) is keyed by the client IP, IPv6 by its
+//! /64 prefix (one site gets a whole /64, so a single host could otherwise
+//! spray addresses). It holds at most [`AbuseLimits::max_tracked_ips`]
+//! entries: when full, entries with no open connection and nothing to
+//! remember are dropped, then the least recently seen entries without an
+//! open connection, down to 7/8 of the cap. An entry with an open
+//! connection is never dropped, so the table is bounded by the cap plus
+//! the server's connection cap.
+//!
 //! Every limit here is server infrastructure, never LFCP Resource
 //! authority. Refusals use the WIRE-01 §62 codes `RATE_LIMITED` and
 //! `QUOTA_EXCEEDED` on the WebSocket, and HTTP 429 on HTTP.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use hyper::header::HeaderMap;
 
 /// The abuse limits of [`crate::config::Config`]. For the per-IP and rate
 /// limits, 0 disables the limit.
@@ -214,6 +239,235 @@ fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
     }
 }
 
+/// Where the client IP of a request comes from.
+#[derive(Clone, Debug)]
+pub struct Proxies {
+    trusted: Vec<Cidr>,
+    header: String,
+}
+
+impl Proxies {
+    /// The proxies and header of `limits`.
+    pub fn new(limits: &AbuseLimits) -> Proxies {
+        Proxies {
+            trusted: limits.trusted_proxies.clone(),
+            header: limits.client_ip_header.clone(),
+        }
+    }
+
+    fn trusts(&self, ip: IpAddr) -> bool {
+        self.trusted.iter().any(|net| net.contains(ip))
+    }
+
+    /// The client IP of a request from TCP peer `peer` (see the module
+    /// documentation).
+    pub fn client_ip(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+        let peer = canonical(peer);
+        if !self.trusts(peer) {
+            return peer;
+        }
+        let mut entries = Vec::new();
+        for value in headers.get_all(self.header.as_str()) {
+            let Ok(value) = value.to_str() else {
+                return peer;
+            };
+            entries.extend(value.split(',').map(str::trim));
+        }
+        let mut client = None;
+        for entry in entries.iter().rev() {
+            let Some(ip) = parse_entry(entry) else {
+                return peer;
+            };
+            client = Some(ip);
+            if !self.trusts(ip) {
+                break;
+            }
+        }
+        client.unwrap_or(peer)
+    }
+}
+
+/// One client-IP header entry: an address, possibly with a port
+/// (`1.2.3.4:5678`, `[2001:db8::1]:443`).
+fn parse_entry(entry: &str) -> Option<IpAddr> {
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        return Some(canonical(ip));
+    }
+    entry
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|s| canonical(s.ip()))
+}
+
+/// The per-IP key: the address, an IPv6 one cut to its /64 prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IpKey(IpAddr);
+
+impl IpKey {
+    /// The key of `ip`.
+    pub fn of(ip: IpAddr) -> IpKey {
+        match canonical(ip) {
+            v4 @ IpAddr::V4(_) => IpKey(v4),
+            v6 => IpKey(mask(v6, 64)),
+        }
+    }
+}
+
+/// Why [`IpTable::connect`] refused a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// [`AbuseLimits::max_connections_per_ip`] connections are open.
+    TooMany,
+}
+
+#[derive(Debug)]
+struct Entry {
+    open: usize,
+    seen: Instant,
+}
+
+impl Entry {
+    fn new(now: Instant) -> Entry {
+        Entry { open: 0, seen: now }
+    }
+
+    /// Nothing to remember: dropping it changes no decision.
+    fn is_idle(&self, _now: Instant) -> bool {
+        self.open == 0
+    }
+}
+
+/// Per-client-IP state (see the module documentation).
+#[derive(Debug)]
+pub struct IpTable {
+    max_open: usize,
+    max_tracked: usize,
+    entries: Mutex<HashMap<IpKey, Entry>>,
+}
+
+impl IpTable {
+    /// A table enforcing `limits`.
+    pub fn new(limits: &AbuseLimits) -> Arc<IpTable> {
+        Arc::new(IpTable {
+            max_open: limits.max_connections_per_ip,
+            max_tracked: limits.max_tracked_ips,
+            entries: Mutex::default(),
+        })
+    }
+
+    /// How many IPs are tracked.
+    pub fn len(&self) -> usize {
+        self.entries.lock().expect("never poisoned").len()
+    }
+
+    /// Whether no IP is tracked.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Run `f` on the entry of `ip`, created (with eviction) if new.
+    fn with<R>(&self, ip: IpAddr, now: Instant, f: impl FnOnce(&mut Entry) -> R) -> R {
+        let key = IpKey::of(ip);
+        let mut entries = self.entries.lock().expect("never poisoned");
+        if !entries.contains_key(&key) && entries.len() >= self.max_tracked {
+            evict(&mut entries, self.max_tracked, now);
+        }
+        let entry = entries.entry(key).or_insert_with(|| Entry::new(now));
+        entry.seen = now;
+        f(entry)
+    }
+
+    /// Open a WebSocket connection for `ip`: refused past
+    /// [`AbuseLimits::max_connections_per_ip`]. The permit holds the place
+    /// until dropped.
+    pub fn connect(self: &Arc<Self>, ip: IpAddr, now: Instant) -> Result<IpPermit, Refused> {
+        let max_open = self.max_open;
+        self.with(ip, now, |entry| {
+            if max_open > 0 && entry.open >= max_open {
+                return Err(Refused::TooMany);
+            }
+            entry.open += 1;
+            Ok(())
+        })?;
+        Ok(IpPermit {
+            table: self.clone(),
+            key: IpKey::of(ip),
+        })
+    }
+}
+
+/// Drop idle entries, then the least recently seen entries without an
+/// open connection, until at most 7/8 of `cap` remain.
+fn evict(entries: &mut HashMap<IpKey, Entry>, cap: usize, now: Instant) {
+    let target = cap - cap / 8;
+    entries.retain(|_, entry| !entry.is_idle(now));
+    if entries.len() <= target {
+        return;
+    }
+    let mut closed: Vec<(Instant, IpKey)> = entries
+        .iter()
+        .filter(|(_, entry)| entry.open == 0)
+        .map(|(key, entry)| (entry.seen, *key))
+        .collect();
+    let excess = (entries.len() - target).min(closed.len());
+    if excess == 0 {
+        return;
+    }
+    closed.select_nth_unstable_by_key(excess - 1, |(seen, _)| *seen);
+    for (_, key) in &closed[..excess] {
+        entries.remove(key);
+    }
+}
+
+/// A place under [`AbuseLimits::max_connections_per_ip`], released on drop.
+#[derive(Debug)]
+pub struct IpPermit {
+    table: Arc<IpTable>,
+    key: IpKey,
+}
+
+impl Drop for IpPermit {
+    fn drop(&mut self) {
+        let mut entries = self.table.entries.lock().expect("never poisoned");
+        if let Some(entry) = entries.get_mut(&self.key) {
+            entry.open = entry.open.saturating_sub(1);
+        }
+    }
+}
+
+/// A connection's client: its IP and the per-IP table it is counted in.
+#[derive(Clone, Debug)]
+pub struct Client {
+    ip: IpAddr,
+    table: Arc<IpTable>,
+}
+
+impl Client {
+    /// The client `ip`, tracked in `table`.
+    pub fn new(ip: IpAddr, table: Arc<IpTable>) -> Client {
+        Client {
+            ip: canonical(ip),
+            table,
+        }
+    }
+
+    /// The client `ip` with a table of its own under default limits (for
+    /// tests and tools).
+    pub fn detached(ip: IpAddr) -> Client {
+        Client::new(ip, IpTable::new(&AbuseLimits::default()))
+    }
+
+    /// The client IP.
+    pub fn ip(&self) -> IpAddr {
+        self.ip
+    }
+
+    /// The per-IP table the client is counted in.
+    pub fn table(&self) -> &Arc<IpTable> {
+        &self.table
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +504,161 @@ mod tests {
         ] {
             assert!(bad.parse::<Cidr>().is_err(), "{bad}");
         }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    fn proxies(trusted: &[&str], header: &str) -> Proxies {
+        Proxies::new(&AbuseLimits {
+            trusted_proxies: trusted.iter().map(|t| t.parse().unwrap()).collect(),
+            client_ip_header: header.into(),
+            ..AbuseLimits::default()
+        })
+    }
+
+    #[test]
+    fn the_header_is_believed_only_from_a_trusted_peer() {
+        let xff = proxies(&["172.18.0.0/16"], "x-forwarded-for");
+        let forged = headers(&[("x-forwarded-for", "203.0.113.9")]);
+        // An untrusted peer: the header is ignored.
+        assert_eq!(
+            xff.client_ip(ip("198.51.100.1"), &forged),
+            ip("198.51.100.1")
+        );
+        assert_eq!(
+            proxies(&[], "x-forwarded-for").client_ip(ip("172.18.0.2"), &forged),
+            ip("172.18.0.2"),
+            "nothing is trusted by default"
+        );
+        // The proxy: the client it reports.
+        assert_eq!(xff.client_ip(ip("172.18.0.2"), &forged), ip("203.0.113.9"));
+        // No header from the proxy: the proxy itself.
+        assert_eq!(
+            xff.client_ip(ip("172.18.0.2"), &headers(&[])),
+            ip("172.18.0.2")
+        );
+    }
+
+    #[test]
+    fn the_rightmost_untrusted_entry_is_the_client() {
+        let xff = proxies(&["172.18.0.0/16", "10.0.0.0/8"], "x-forwarded-for");
+        let peer = ip("172.18.0.2");
+        // The client prepended a forged entry; the proxy appended the real one.
+        let h = headers(&[("x-forwarded-for", "1.1.1.1, 203.0.113.9")]);
+        assert_eq!(xff.client_ip(peer, &h), ip("203.0.113.9"));
+        // Trusted hops on the right are skipped, lines are joined in order.
+        let h = headers(&[
+            ("x-forwarded-for", "1.1.1.1, 203.0.113.9"),
+            ("x-forwarded-for", "10.1.1.1"),
+        ]);
+        assert_eq!(xff.client_ip(peer, &h), ip("203.0.113.9"));
+        // All trusted: the leftmost.
+        let h = headers(&[("x-forwarded-for", "10.0.0.5, 10.0.0.6")]);
+        assert_eq!(xff.client_ip(peer, &h), ip("10.0.0.5"));
+        // Ports and brackets are accepted; garbage falls back to the peer.
+        let h = headers(&[("x-forwarded-for", "[2001:db8::1]:443")]);
+        assert_eq!(xff.client_ip(peer, &h), ip("2001:db8::1"));
+        let h = headers(&[("x-forwarded-for", "203.0.113.9:5000")]);
+        assert_eq!(xff.client_ip(peer, &h), ip("203.0.113.9"));
+        let h = headers(&[("x-forwarded-for", "unknown, 203.0.113.9, junk")]);
+        assert_eq!(xff.client_ip(peer, &h), peer);
+        // Another header can be configured; X-Forwarded-For is then ignored.
+        let cf = proxies(&["172.18.0.0/16"], "cf-connecting-ip");
+        let h = headers(&[
+            ("cf-connecting-ip", "198.51.100.7"),
+            ("x-forwarded-for", "1.1.1.1"),
+        ]);
+        assert_eq!(cf.client_ip(peer, &h), ip("198.51.100.7"));
+        let real = proxies(&["172.18.0.0/16"], "x-real-ip");
+        let h = headers(&[("x-real-ip", "198.51.100.8")]);
+        assert_eq!(real.client_ip(peer, &h), ip("198.51.100.8"));
+        // An IPv4-mapped peer is matched as IPv4.
+        assert_eq!(xff.client_ip(ip("::ffff:172.18.0.2"), &h), ip("172.18.0.2"));
+    }
+
+    #[test]
+    fn ipv6_clients_are_grouped_by_their_64_prefix() {
+        assert_eq!(
+            IpKey::of(ip("2001:db8:1:2:aaaa::1")),
+            IpKey::of(ip("2001:db8:1:2:bbbb::2"))
+        );
+        assert_ne!(
+            IpKey::of(ip("2001:db8:1:2::1")),
+            IpKey::of(ip("2001:db8:1:3::1"))
+        );
+        assert_ne!(IpKey::of(ip("192.0.2.1")), IpKey::of(ip("192.0.2.2")));
+    }
+
+    fn table(limits: AbuseLimits) -> Arc<IpTable> {
+        IpTable::new(&limits)
+    }
+
+    #[test]
+    fn open_connections_per_ip_are_capped_and_released() {
+        let t = table(AbuseLimits {
+            max_connections_per_ip: 2,
+            ..AbuseLimits::default()
+        });
+        let now = Instant::now();
+        let a = t.connect(ip("192.0.2.1"), now).unwrap();
+        let _b = t.connect(ip("192.0.2.1"), now).unwrap();
+        assert_eq!(
+            t.connect(ip("192.0.2.1"), now).unwrap_err(),
+            Refused::TooMany
+        );
+        assert!(t.connect(ip("192.0.2.2"), now).is_ok(), "another IP");
+        drop(a);
+        assert!(
+            t.connect(ip("192.0.2.1"), now).is_ok(),
+            "a place was released"
+        );
+        let off = table(AbuseLimits {
+            max_connections_per_ip: 0,
+            ..AbuseLimits::default()
+        });
+        let held: Vec<_> = (0..100)
+            .map(|_| off.connect(ip("192.0.2.1"), now).unwrap())
+            .collect();
+        assert_eq!(held.len(), 100, "0 disables the cap");
+    }
+
+    #[test]
+    fn an_ip_spraying_flood_cannot_grow_the_table() {
+        let cap = 1024;
+        let t = table(AbuseLimits {
+            max_tracked_ips: cap,
+            ..AbuseLimits::default()
+        });
+        let now = Instant::now();
+        // Connections that stay open are never evicted.
+        let held: Vec<_> = (0..100u32)
+            .map(|i| {
+                t.connect(IpAddr::V4((0x0a00_0000 + i).into()), now)
+                    .unwrap()
+            })
+            .collect();
+        for i in 0..100_000u32 {
+            let ip = IpAddr::V6((0x2001_0db8_u128 << 96 | u128::from(i) << 64).into());
+            drop(t.connect(ip, now).unwrap());
+            assert!(t.len() <= cap, "{} entries after {i}", t.len());
+        }
+        // The open ones are still counted.
+        let max_open = AbuseLimits::default().max_connections_per_ip;
+        let ten = IpAddr::V4(0x0a00_0000.into());
+        let more: Vec<_> = (1..max_open)
+            .map(|_| t.connect(ten, now).unwrap())
+            .collect();
+        assert_eq!(t.connect(ten, now).unwrap_err(), Refused::TooMany);
+        drop((held, more));
     }
 
     #[test]
