@@ -523,6 +523,10 @@ mod tests {
         );
         assert_eq!(field("max_total_bytes = 0"), "max_total_bytes");
         assert_eq!(
+            field("hosts_per_ip_per_day = 10001"),
+            "hosts_per_ip_per_day"
+        );
+        assert_eq!(
             field("disk_check_interval_ms = 1"),
             "disk_check_interval_ms"
         );

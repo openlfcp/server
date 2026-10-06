@@ -22,6 +22,14 @@
 //! connection is never dropped, so the table is bounded by the cap plus
 //! the server's connection cap.
 //!
+//! **Storage floor** ([`Floor`]), in every hosting mode: new hosting and
+//! writes are refused with `QUOTA_EXCEEDED` when the store would pass
+//! [`AbuseLimits::max_total_bytes`], or when the free disk space of the
+//! state directory is under [`AbuseLimits::min_free_bytes`]. Reads keep
+//! working. The free space is read at most once per
+//! [`AbuseLimits::disk_check_interval_ms`] (one `statvfs`), not per write;
+//! a failed reading is logged and does not refuse.
+//!
 //! Every limit here is server infrastructure, never LFCP Resource
 //! authority. Refusals use the WIRE-01 §62 codes `RATE_LIMITED` and
 //! `QUOTA_EXCEEDED` on the WebSocket, and HTTP 429 on HTTP.
@@ -29,6 +37,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -283,9 +292,121 @@ pub mod refusal {
     pub const PRINCIPAL_BYTES: &str = "quota exceeded: stored bytes per hosting Principal";
     /// `QUOTA_EXCEEDED`: the write would pass the Resource's stored bytes.
     pub const RESOURCE_BYTES: &str = "quota exceeded: stored bytes per Resource";
+    /// `QUOTA_EXCEEDED`: the store would pass `max_total_bytes`.
+    pub const SERVER_FULL: &str = "quota exceeded: server storage full";
+    /// `QUOTA_EXCEEDED`: the free disk space is under `min_free_bytes`.
+    pub const DISK_LOW: &str = "quota exceeded: server disk space low";
     /// `RATE_LIMITED`: the client IP hosted its new Resources of the last
     /// 24 hours.
     pub const HOSTS_PER_IP: &str = "rate limited: new Resources per client address per day";
+}
+
+/// The free disk space of a directory's file system.
+pub trait DiskSpace: Send + Sync + 'static {
+    /// Bytes available to the server's user under `dir`.
+    fn available(&self, dir: &Path) -> std::io::Result<u64>;
+}
+
+/// The operating system's reading (`statvfs`, `GetDiskFreeSpaceExW`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OsDiskSpace;
+
+impl DiskSpace for OsDiskSpace {
+    fn available(&self, dir: &Path) -> std::io::Result<u64> {
+        fs4::available_space(dir)
+    }
+}
+
+/// The storage floor (see the module documentation).
+pub struct Floor {
+    max_total: Option<u64>,
+    min_free: u64,
+    dir: PathBuf,
+    disk: Arc<dyn DiskSpace>,
+    interval: Duration,
+    reading: Mutex<Option<(Instant, Option<u64>)>>,
+}
+
+impl fmt::Debug for Floor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Floor")
+            .field("max_total", &self.max_total)
+            .field("min_free", &self.min_free)
+            .field("dir", &self.dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Floor {
+    /// The floor of `limits` for the state directory `dir`, reading the
+    /// disk with `disk`.
+    pub fn new(limits: &AbuseLimits, dir: &Path, disk: Arc<dyn DiskSpace>) -> Floor {
+        Floor {
+            max_total: limits.max_total_bytes,
+            min_free: limits.min_free_bytes,
+            dir: dir.to_owned(),
+            disk,
+            interval: Duration::from_millis(limits.disk_check_interval_ms),
+            reading: Mutex::default(),
+        }
+    }
+
+    /// No floor at all (tests and tools).
+    pub fn none() -> Floor {
+        Floor::new(
+            &AbuseLimits {
+                min_free_bytes: 0,
+                max_total_bytes: None,
+                ..AbuseLimits::default()
+            },
+            Path::new("."),
+            Arc::new(OsDiskSpace),
+        )
+    }
+
+    /// Whether [`Floor::check`] needs the store's total bytes.
+    pub fn needs_total(&self) -> bool {
+        self.max_total.is_some()
+    }
+
+    /// The free space at `now`: the cached reading if it is recent.
+    fn free(&self, now: Instant) -> Option<u64> {
+        let mut reading = self.reading.lock().expect("never poisoned");
+        if let Some((at, free)) = *reading {
+            if now.saturating_duration_since(at) < self.interval {
+                return free;
+            }
+        }
+        let free = match self.disk.available(&self.dir) {
+            Ok(free) => Some(free),
+            Err(error) => {
+                tracing::warn!(%error, "cannot read the free disk space; not enforcing min_free_bytes");
+                None
+            }
+        };
+        *reading = Some((now, free));
+        free
+    }
+
+    /// Whether `incoming` more bytes may be stored at `now`, the store
+    /// holding `total` (needed when [`Floor::needs_total`]); otherwise the
+    /// diagnostic.
+    pub fn check(
+        &self,
+        total: Option<u64>,
+        incoming: u64,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        if let (Some(max), Some(total)) = (self.max_total, total) {
+            if total.saturating_add(incoming) > max {
+                return Err(refusal::SERVER_FULL);
+            }
+        }
+        if self.min_free > 0 && self.free(now).is_some_and(|free| free < self.min_free) {
+            return Err(refusal::DISK_LOW);
+        }
+        Ok(())
+    }
 }
 
 /// A token bucket's rate: `per_second` tokens refill it, up to `burst`.
@@ -961,6 +1082,81 @@ mod tests {
         let more: Vec<_> = (1..3).map(|_| t.connect(ten, now).unwrap()).collect();
         assert_eq!(t.connect(ten, now).unwrap_err(), Refused::TooMany);
         drop((held, more));
+    }
+
+    struct FakeDisk {
+        free: std::sync::atomic::AtomicU64,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl DiskSpace for FakeDisk {
+        fn available(&self, _: &Path) -> std::io::Result<u64> {
+            use std::sync::atomic::Ordering;
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            match self.free.load(Ordering::SeqCst) {
+                u64::MAX => Err(std::io::Error::other("unsupported")),
+                free => Ok(free),
+            }
+        }
+    }
+
+    #[test]
+    fn the_floor_caps_the_total_and_keeps_free_disk() {
+        use std::sync::atomic::Ordering;
+        let disk = Arc::new(FakeDisk {
+            free: 10_000.into(),
+            reads: 0.into(),
+        });
+        let floor = Floor::new(
+            &AbuseLimits {
+                max_total_bytes: Some(1000),
+                min_free_bytes: 5000,
+                disk_check_interval_ms: 1000,
+                ..AbuseLimits::default()
+            },
+            Path::new("."),
+            disk.clone(),
+        );
+        let now = Instant::now();
+        assert!(floor.needs_total());
+        assert_eq!(floor.check(Some(900), 100, now), Ok(()));
+        assert_eq!(floor.check(Some(900), 101, now), Err(refusal::SERVER_FULL));
+        // Low disk: refused only once the cached reading is refreshed.
+        disk.free.store(4999, Ordering::SeqCst);
+        for _ in 0..1000 {
+            assert_eq!(floor.check(Some(0), 1, now), Ok(()));
+        }
+        assert_eq!(
+            disk.reads.load(Ordering::SeqCst),
+            1,
+            "one reading per interval"
+        );
+        let later = now + Duration::from_secs(1);
+        assert_eq!(floor.check(Some(0), 1, later), Err(refusal::DISK_LOW));
+        assert_eq!(disk.reads.load(Ordering::SeqCst), 2);
+        // A failed reading does not refuse.
+        disk.free.store(u64::MAX, Ordering::SeqCst);
+        assert_eq!(
+            floor.check(Some(0), 1, later + Duration::from_secs(1)),
+            Ok(())
+        );
+        // Disabled: never read.
+        let none = Floor::new(
+            &AbuseLimits {
+                min_free_bytes: 0,
+                ..AbuseLimits::default()
+            },
+            Path::new("."),
+            disk.clone(),
+        );
+        assert!(!none.needs_total());
+        assert_eq!(none.check(None, u64::MAX, now), Ok(()));
+        assert_eq!(disk.reads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn the_os_reads_the_free_space() {
+        assert!(OsDiskSpace.available(Path::new(".")).unwrap() > 0);
     }
 
     #[test]

@@ -79,8 +79,12 @@ pub struct Options {
     /// Overrides of the configuration defaults.
     pub handshake_timeout_ms: Option<u64>,
     pub max_connections: Option<usize>,
-    /// The abuse limits (POST-003); default `AbuseLimits::default()`.
+    /// The abuse limits (POST-003); default `AbuseLimits::default()`
+    /// without the free disk check (`min_free_bytes = 0`), so tests do not
+    /// depend on the machine's free space.
     pub abuse: Option<lfcp_server::limits::AbuseLimits>,
+    /// The free disk space reader of the storage floor; default the OS.
+    pub disk: Option<Arc<dyn lfcp_server::limits::DiskSpace>>,
 }
 
 impl Default for Options {
@@ -96,6 +100,7 @@ impl Default for Options {
             handshake_timeout_ms: None,
             max_connections: None,
             abuse: None,
+            disk: None,
         }
     }
 }
@@ -143,7 +148,10 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
         max_connections: options
             .max_connections
             .unwrap_or(Config::default().max_connections),
-        abuse: options.abuse.unwrap_or_default(),
+        abuse: options.abuse.unwrap_or(lfcp_server::limits::AbuseLimits {
+            min_free_bytes: 0,
+            ..Default::default()
+        }),
         ..Config::default()
     };
     let identity: Arc<dyn ServerIdentity> = match options.identity {
@@ -174,6 +182,13 @@ pub async fn start(state: &std::path::Path, options: Options) -> Running {
     }
     if let Some(ingest) = options.ingest {
         sessions = sessions.with_ingest(ingest);
+    }
+    if let Some(disk) = options.disk {
+        sessions = sessions.with_floor(Arc::new(lfcp_server::limits::Floor::new(
+            &config.abuse,
+            &config.state_dir,
+            disk,
+        )));
     }
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(server.run(sessions, async {

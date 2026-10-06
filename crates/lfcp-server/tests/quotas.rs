@@ -1,6 +1,7 @@
 //! The quota hosting mode, the default of a fresh server (POST-003;
 //! security review H5): Resources and stored bytes per hosting Principal,
-//! stored bytes per Resource, each crossed for its documented refusal,
+//! stored bytes per Resource, new Resources per client IP, and the
+//! storage floor of every mode, each crossed for its documented refusal,
 //! and the administrator's view and overrides.
 
 mod support;
@@ -33,9 +34,14 @@ const CHAIN: [&str; 11] = [
     "C10_revoke_grandchild",
 ];
 
+/// `abuse`, without the free disk check (the machine's free space is not
+/// the test's).
 fn with(abuse: AbuseLimits) -> Options {
     Options {
-        abuse: Some(abuse),
+        abuse: Some(AbuseLimits {
+            min_free_bytes: 0,
+            ..abuse
+        }),
         ..Options::default()
     }
 }
@@ -400,4 +406,110 @@ async fn proxied(server: &Running, client: &str, keys: &PrincipalKeys) -> Client
         .unwrap();
     c.handshake(keys).await;
     c
+}
+
+struct FakeDisk(std::sync::atomic::AtomicU64);
+
+impl lfcp_server::limits::DiskSpace for FakeDisk {
+    fn available(&self, _: &std::path::Path) -> std::io::Result<u64> {
+        Ok(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn low_disk_space_refuses_hosting_and_writes_but_not_reads() {
+    use std::sync::atomic::Ordering;
+    let v = Vectors::load();
+    let disk = std::sync::Arc::new(FakeDisk((3u64 << 30).into()));
+    let dir = state_dir("quota-disk");
+    let server = start(
+        &dir,
+        Options {
+            abuse: Some(AbuseLimits {
+                min_free_bytes: 2 << 30,
+                disk_check_interval_ms: 100,
+                ..AbuseLimits::default()
+            }),
+            disk: Some(disk.clone()),
+            ..Options::default()
+        },
+    )
+    .await;
+    let mut owner = client(&server, &v.principal("owner")).await;
+    assert!(matches!(
+        host(&mut owner, v.cose(CHAIN[0])).await,
+        Body::ResourceHosted { .. }
+    ));
+    for i in 1..CHAIN.len() {
+        server
+            .store
+            .commit_control_record(v.cose(CHAIN[i]), v.record_id(CHAIN[i - 1]))
+            .await
+            .unwrap();
+    }
+    disk.0.store((2 << 30) - 1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let other = genesis(&v.principal("owner"), ResourceId::from_bytes([7; 32]));
+    assert_eq!(
+        host(&mut owner, other).await,
+        quota_exceeded(refusal::DISK_LOW)
+    );
+    assert_eq!(put_d1(&server, &v).await, quota_exceeded(refusal::DISK_LOW));
+    // Reads keep working.
+    let mut bob = client(&server, &v.principal("bob")).await;
+    bob.request(Body::ResourceOpen {
+        resource_id: v.resource(),
+        control_heads: vec![],
+        have: vec![],
+        grant_ids: None,
+        flags: Some(0),
+    })
+    .await;
+    assert!(matches!(bob.recv().await.body, Body::ResourceOpened { .. }));
+    // Space again: writes resume after the next reading.
+    disk.0.store(3 << 30, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(matches!(put_d1(&server, &v).await, Body::Ack(_)));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_total_cap_applies_in_every_mode() {
+    let v = Vectors::load();
+    let d1 = v.cose("D1_bob_epoch0_seq1").len() as u64;
+    let (server, dir) = chain_server(
+        &v,
+        "quota-total",
+        AbuseLimits {
+            max_total_bytes: Some(chain_bytes(&v) + d1 - 1),
+            min_free_bytes: 0,
+            ..AbuseLimits::default()
+        },
+    )
+    .await;
+    let admin = admin_token(&server, &PrincipalKeys::from_secrets(&[9; 32], [9; 32])).await;
+    let (status, _) = http(
+        server.addr,
+        "PUT",
+        "/admin/hosting",
+        Some(&admin),
+        Some(json!({ "mode": "open" })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        put_d1(&server, &v).await,
+        quota_exceeded(refusal::SERVER_FULL)
+    );
+    let mut owner = client(&server, &v.principal("owner")).await;
+    let other = genesis(&v.principal("owner"), ResourceId::from_bytes([7; 32]));
+    assert_eq!(
+        host(&mut owner, other).await,
+        quota_exceeded(refusal::SERVER_FULL)
+    );
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
 }

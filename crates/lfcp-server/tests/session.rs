@@ -62,6 +62,7 @@ fn vector_options(v: &Vectors) -> (Options, Arc<Script>) {
         handshake_timeout_ms: None,
         max_connections: None,
         abuse: None,
+        disk: None,
     };
     (options, script)
 }

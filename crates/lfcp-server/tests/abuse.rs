@@ -14,9 +14,14 @@ fn keys() -> PrincipalKeys {
     PrincipalKeys::from_secrets(&[1; 32], [2; 32])
 }
 
+/// `abuse`, without the free disk check (the machine's free space is not
+/// the test's).
 fn with(abuse: AbuseLimits) -> Options {
     Options {
-        abuse: Some(abuse),
+        abuse: Some(AbuseLimits {
+            min_free_bytes: 0,
+            ..abuse
+        }),
         ..Options::default()
     }
 }
