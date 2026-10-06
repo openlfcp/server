@@ -36,7 +36,11 @@
 //! | `POST /setup/pair` `{"code", "principal", "challenge", "proof"}` | `{"admin"}`; 403 wrong code, 410 no code or expired, 401 bad proof |
 //! | `POST /admin/session` `{"principal", "challenge", "proof"}` | `{"token", "expires_in_s"}`; 403 not an administrator |
 //! | `GET /admin/status` | server ID, limits, public URLs, durability, administrators, hosted Resource count |
-//! | `GET /admin/hosting`, `PUT /admin/hosting` | the hosting policy: `{"mode": "open"}` or `{"mode": "allow_list", "principals", "credentials"}` |
+//! | `GET /admin/hosting`, `PUT /admin/hosting` | the hosting policy: `{"mode": "quota"}` (the default), `{"mode": "open"}` or `{"mode": "allow_list", "principals", "credentials"}` |
+//! | `GET /admin/quotas` | the mode, the default quota and every per-Principal override |
+//! | `GET /admin/quotas/<principal>` | a Principal's override, effective quota and usage (Resources, bytes) |
+//! | `PUT /admin/quotas/<principal>` `{"resources", "bytes", "resource_bytes"}` | set its override (each optional; `null` or absent keeps the default) |
+//! | `DELETE /admin/quotas/<principal>` | remove its override |
 //! | `GET /admin/resources` | per Resource: ID, Control Head sequence, object counts, bytes; never contents |
 //!
 //! Binary values are lowercase hex: `principal` is the encoded Principal
@@ -71,9 +75,10 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::identity::ServerId;
+use crate::limits::Quota;
 use crate::rng::Random;
 use crate::session::HostingPolicy;
-use crate::store::{Pairing, Store, StoreError, DURABILITY};
+use crate::store::{Pairing, QuotaOverride, Store, StoreError, DURABILITY};
 
 pub use crate::store::SETUP_ATTEMPTS;
 
@@ -134,7 +139,11 @@ fn unix_now() -> i64 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostingRule {
-    /// Any authenticated Principal may host (the self-hosted default).
+    /// Any authenticated Principal may host, within the storage quota of
+    /// its Principal (POST-003): the default of a server that never set a
+    /// policy.
+    Quota,
+    /// Any authenticated Principal may host, without quotas.
     Open,
     /// Only these Principals (IDs, hex), or a session presenting one of
     /// these hosting credentials (stored as SHA-256 hashes, hex).
@@ -148,20 +157,50 @@ pub enum HostingRule {
     },
 }
 
-/// The live hosting policy: a [`HostingPolicy`] the admin API changes.
-pub struct ManagedHosting(RwLock<HostingRule>);
+/// The live hosting policy: a [`HostingPolicy`] the admin API changes,
+/// with the configured default quota and the per-Principal overrides.
+pub struct ManagedHosting {
+    rule: RwLock<HostingRule>,
+    defaults: Quota,
+    overrides: RwLock<HashMap<PrincipalId, QuotaOverride>>,
+}
 
 impl ManagedHosting {
+    /// A policy with `rule`, the default quota `defaults` and no override.
+    pub fn new(rule: HostingRule, defaults: Quota) -> ManagedHosting {
+        ManagedHosting {
+            rule: RwLock::new(rule),
+            defaults,
+            overrides: RwLock::default(),
+        }
+    }
+
     /// The current rule.
     pub fn rule(&self) -> HostingRule {
-        self.0.read().expect("never poisoned").clone()
+        self.rule.read().expect("never poisoned").clone()
+    }
+
+    /// The quota of `host` in quota mode: the default with its override.
+    pub fn quota_of(&self, host: &PrincipalId) -> Quota {
+        match self.overrides.read().expect("never poisoned").get(host) {
+            Some(o) => self.defaults.with(o),
+            None => self.defaults,
+        }
     }
 }
 
 impl HostingPolicy for ManagedHosting {
+    fn has_quotas(&self) -> bool {
+        *self.rule.read().expect("never poisoned") == HostingRule::Quota
+    }
+
+    fn quota(&self, host: &PrincipalId) -> Option<Quota> {
+        self.has_quotas().then(|| self.quota_of(host))
+    }
+
     fn allows(&self, host: &PrincipalId, credential: Option<&HostingCredential>) -> bool {
-        match &*self.0.read().expect("never poisoned") {
-            HostingRule::Open => true,
+        match &*self.rule.read().expect("never poisoned") {
+            HostingRule::Quota | HostingRule::Open => true,
             HostingRule::AllowList {
                 principals,
                 credential_hashes,
@@ -326,8 +365,11 @@ impl Admin {
             Some(json) => {
                 serde_json::from_str(&json).map_err(|e| AdminError::Setting(e.to_string()))?
             }
-            None => HostingRule::Open,
+            None => HostingRule::Quota,
         };
+        let hosting = ManagedHosting::new(rule, Quota::defaults(&config.abuse));
+        *hosting.overrides.write().expect("never poisoned") =
+            store.quota_overrides().await?.into_iter().collect();
         let setup_file = config.state_dir.join(SETUP_CODE_FILE);
         let mut challenge_key = [0u8; 32];
         random
@@ -354,7 +396,7 @@ impl Admin {
             setup_file,
             server_id,
             random,
-            hosting: Arc::new(ManagedHosting(RwLock::new(rule))),
+            hosting: Arc::new(hosting),
             status: StatusInfo {
                 ws_path: config.ws_path.clone(),
                 max_message_bytes: config.max_message_bytes,
@@ -409,10 +451,13 @@ impl Admin {
     ) -> Result<Response<Full<Bytes>>, Failure> {
         let admin_only = matches!(
             path,
-            "/admin/status" | "/admin/hosting" | "/admin/resources"
-        );
+            "/admin/status" | "/admin/hosting" | "/admin/resources" | "/admin/quotas"
+        ) || path.starts_with("/admin/quotas/");
         if admin_only {
             self.authenticate(bearer)?;
+        }
+        if let Some(principal) = path.strip_prefix("/admin/quotas/") {
+            return self.principal_quota(method, principal, body).await;
         }
         match (method, path) {
             (&Method::GET, "/setup") => {
@@ -436,10 +481,11 @@ impl Admin {
             (&Method::GET, "/admin/hosting") => Ok(ok(rule_json(&self.hosting.rule()))),
             (&Method::PUT, "/admin/hosting") => self.set_hosting(body).await,
             (&Method::GET, "/admin/resources") => self.resources().await,
+            (&Method::GET, "/admin/quotas") => Ok(ok(self.quotas_json())),
             (
                 _,
                 "/setup" | "/admin/challenge" | "/setup/pair" | "/admin/session" | "/admin/status"
-                | "/admin/hosting" | "/admin/resources",
+                | "/admin/hosting" | "/admin/resources" | "/admin/quotas",
             ) => Err(Failure(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method not allowed",
@@ -592,6 +638,7 @@ impl Admin {
         let request: HostingRequest = parse(body)?;
         let bad = |message| Failure(StatusCode::BAD_REQUEST, message);
         let rule = match request {
+            HostingRequest::Quota => HostingRule::Quota,
             HostingRequest::Open => HostingRule::Open,
             HostingRequest::AllowList {
                 principals,
@@ -624,9 +671,112 @@ impl Admin {
             .set_setting(HOSTING_SETTING, json)
             .await
             .map_err(internal)?;
-        *self.hosting.0.write().expect("never poisoned") = rule.clone();
+        *self.hosting.rule.write().expect("never poisoned") = rule.clone();
         tracing::info!("hosting policy changed");
         Ok(ok(rule_json(&rule)))
+    }
+
+    /// `GET /admin/quotas`.
+    fn quotas_json(&self) -> serde_json::Value {
+        let overrides: Vec<serde_json::Value> = self
+            .hosting
+            .overrides
+            .read()
+            .expect("never poisoned")
+            .iter()
+            .map(|(principal, o)| {
+                let mut entry = override_json(o);
+                entry["principal"] = json!(principal.to_hex());
+                entry
+            })
+            .collect();
+        json!({
+            "mode": rule_json(&self.hosting.rule())["mode"],
+            "defaults": quota_json(&self.hosting.defaults),
+            "overrides": overrides,
+        })
+    }
+
+    /// `GET`, `PUT` and `DELETE /admin/quotas/<principal>`.
+    async fn principal_quota(
+        &self,
+        method: &Method,
+        principal: &str,
+        body: &[u8],
+    ) -> Result<Response<Full<Bytes>>, Failure> {
+        let principal = PrincipalId::from_hex(principal).map_err(|_| {
+            Failure(
+                StatusCode::BAD_REQUEST,
+                "the path ends with a 32-byte hex Principal ID",
+            )
+        })?;
+        match *method {
+            Method::GET => {}
+            Method::PUT => {
+                let request: QuotaRequest = parse(body)?;
+                let quota = QuotaOverride {
+                    resources: request.resources,
+                    bytes: request.bytes,
+                    resource_bytes: request.resource_bytes,
+                };
+                if [quota.resources, quota.bytes, quota.resource_bytes]
+                    .iter()
+                    .flatten()
+                    .any(|n| *n > i64::MAX as u64)
+                {
+                    return Err(Failure(
+                        StatusCode::BAD_REQUEST,
+                        "a quota is at most 2^63-1",
+                    ));
+                }
+                self.store
+                    .set_quota_override(principal, quota)
+                    .await
+                    .map_err(internal)?;
+                self.hosting
+                    .overrides
+                    .write()
+                    .expect("never poisoned")
+                    .insert(principal, quota);
+                tracing::info!(principal = %principal.to_hex(), "quota override set");
+            }
+            Method::DELETE => {
+                self.store
+                    .delete_quota_override(principal)
+                    .await
+                    .map_err(internal)?;
+                self.hosting
+                    .overrides
+                    .write()
+                    .expect("never poisoned")
+                    .remove(&principal);
+                tracing::info!(principal = %principal.to_hex(), "quota override removed");
+            }
+            _ => {
+                return Err(Failure(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method not allowed",
+                ))
+            }
+        }
+        let (resources, bytes) = self
+            .store
+            .principal_usage(principal)
+            .await
+            .map_err(internal)?;
+        let o = self
+            .hosting
+            .overrides
+            .read()
+            .expect("never poisoned")
+            .get(&principal)
+            .copied();
+        Ok(ok(json!({
+            "principal": principal.to_hex(),
+            "override": o.as_ref().map(override_json),
+            "quota": quota_json(&self.hosting.quota_of(&principal)),
+            "usage": { "resources": resources, "bytes": bytes },
+        })))
     }
 
     async fn resources(&self) -> Result<Response<Full<Bytes>>, Failure> {
@@ -649,10 +799,27 @@ impl Admin {
     }
 }
 
+fn quota_json(quota: &Quota) -> serde_json::Value {
+    json!({
+        "resources": quota.resources,
+        "bytes": quota.bytes,
+        "resource_bytes": quota.resource_bytes,
+    })
+}
+
+fn override_json(o: &QuotaOverride) -> serde_json::Value {
+    json!({
+        "resources": o.resources,
+        "bytes": o.bytes,
+        "resource_bytes": o.resource_bytes,
+    })
+}
+
 /// The hosting rule as the API shows it: credential hashes are counted,
 /// not listed.
 fn rule_json(rule: &HostingRule) -> serde_json::Value {
     match rule {
+        HostingRule::Quota => json!({ "mode": "quota" }),
         HostingRule::Open => json!({ "mode": "open" }),
         HostingRule::AllowList {
             principals,
@@ -682,8 +849,20 @@ struct PairRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuotaRequest {
+    #[serde(default)]
+    resources: Option<u64>,
+    #[serde(default)]
+    bytes: Option<u64>,
+    #[serde(default)]
+    resource_bytes: Option<u64>,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum HostingRequest {
+    Quota,
     Open,
     AllowList {
         #[serde(default)]
@@ -806,13 +985,44 @@ mod tests {
     fn allow_lists_admit_principals_or_credentials() {
         let p = PrincipalId::from_bytes([1; 32]);
         let q = PrincipalId::from_bytes([2; 32]);
-        let hosting = ManagedHosting(RwLock::new(HostingRule::AllowList {
-            principals: [p.to_hex()].into(),
-            credential_hashes: [sha256(b"secret").to_hex()].into(),
-        }));
+        let quota = Quota::defaults(&crate::limits::AbuseLimits::default());
+        let hosting = ManagedHosting::new(
+            HostingRule::AllowList {
+                principals: [p.to_hex()].into(),
+                credential_hashes: [sha256(b"secret").to_hex()].into(),
+            },
+            quota,
+        );
+        assert!(!hosting.has_quotas() && hosting.quota(&p).is_none());
         assert!(hosting.allows(&p, None));
         assert!(!hosting.allows(&q, None));
         assert!(hosting.allows(&q, Some(&HostingCredential::new(b"secret".to_vec()))));
         assert!(!hosting.allows(&q, Some(&HostingCredential::new(b"other".to_vec()))));
+    }
+
+    #[test]
+    fn quota_mode_admits_anyone_within_their_quota() {
+        let p = PrincipalId::from_bytes([1; 32]);
+        let q = PrincipalId::from_bytes([2; 32]);
+        let defaults = Quota::defaults(&crate::limits::AbuseLimits::default());
+        let hosting = ManagedHosting::new(HostingRule::Quota, defaults);
+        assert!(hosting.allows(&p, None) && hosting.has_quotas());
+        hosting.overrides.write().unwrap().insert(
+            p,
+            QuotaOverride {
+                resources: Some(100),
+                ..QuotaOverride::default()
+            },
+        );
+        assert_eq!(
+            hosting.quota(&p),
+            Some(Quota {
+                resources: 100,
+                ..defaults
+            })
+        );
+        assert_eq!(hosting.quota(&q), Some(defaults));
+        *hosting.rule.write().unwrap() = HostingRule::Open;
+        assert!(!hosting.has_quotas() && hosting.quota(&p).is_none());
     }
 }

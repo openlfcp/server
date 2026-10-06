@@ -239,6 +239,50 @@ fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
     }
 }
 
+/// The storage quota of one hosting Principal (quota hosting mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quota {
+    /// Resources it may host.
+    pub resources: u64,
+    /// Stored bytes across its Resources.
+    pub bytes: u64,
+    /// Stored bytes of each of its Resources.
+    pub resource_bytes: u64,
+}
+
+impl Quota {
+    /// The configured default quota.
+    pub fn defaults(limits: &AbuseLimits) -> Quota {
+        Quota {
+            resources: limits.quota_resources_per_principal,
+            bytes: limits.quota_bytes_per_principal,
+            resource_bytes: limits.quota_bytes_per_resource,
+        }
+    }
+
+    /// This quota with an administrator's override applied.
+    pub fn with(self, o: &crate::store::QuotaOverride) -> Quota {
+        Quota {
+            resources: o.resources.unwrap_or(self.resources),
+            bytes: o.bytes.unwrap_or(self.bytes),
+            resource_bytes: o.resource_bytes.unwrap_or(self.resource_bytes),
+        }
+    }
+}
+
+/// The NACK diagnostics of the hosting and storage limits (WIRE-01 §60
+/// field 1), with their §62 codes in the README.
+pub mod refusal {
+    /// `QUOTA_EXCEEDED`: the hosting Principal hosts its quota of
+    /// Resources.
+    pub const RESOURCES: &str = "quota exceeded: Resources per hosting Principal";
+    /// `QUOTA_EXCEEDED`: the write would pass the hosting Principal's
+    /// stored bytes.
+    pub const PRINCIPAL_BYTES: &str = "quota exceeded: stored bytes per hosting Principal";
+    /// `QUOTA_EXCEEDED`: the write would pass the Resource's stored bytes.
+    pub const RESOURCE_BYTES: &str = "quota exceeded: stored bytes per Resource";
+}
+
 /// A token bucket's rate: `per_second` tokens refill it, up to `burst`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rate {

@@ -9,13 +9,13 @@
 //! | AUTH | sdk-rs `verify_auth` over this session's transcript; any failure is `ERROR(AUTH_FAILED)`, close | §36, G-MSG4 |
 //! | READY | profile, server ID, configured max message bytes, the store's durability (2), configured heartbeat, no extensions | §37 |
 //! | before READY | Resource, Control, Data, Key and Snapshot messages: `NACK(AUTHORIZATION_FAILED)`, stay open; `PING`/`PONG`/`ERROR` allowed; any other out-of-order message (or an undecodable one) is `ERROR(MALFORMED_MESSAGE)`, close | §64, G-SM4 |
-//! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature, ws/wss URLs), hosting policy, persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16 |
+//! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature, ws/wss URLs), hosting policy (a quota of Resources and bytes per hosting Principal: `NACK(QUOTA_EXCEEDED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
 //! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read`, or be an invitation subject, at the accepted Control Head, else `NACK(AUTHORIZATION_FAILED)`; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator | §41, §42, §84, §73 |
 //! | RESOURCE_CLOSE | drops the session's subscription only; `ACK` | §43 |
-//! | CONTROL_PUT | [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
+//! | CONTROL_PUT | the storage quota as for puts; [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
 //! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows | §44 |
 //! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)` | §45, §46 |
-//! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60 |
+//! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details), then the storage quota of the hosting Principal and of the Resource (`NACK(QUOTA_EXCEEDED)` with a diagnostic), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60, §84 |
 //! | an equivocating Data Unit | only the equivocating units of the request are stored, as evidence; none is accepted or pushed; `NACK(ACTOR_EQUIVOCATION)` | §26.2, §51 |
 //! | DATA_HAVE | the client's Have must normalize; answered with the server's | §48 |
 //! | DATA_GET / KEY_PACKAGE_GET / SNAPSHOT_GET | more than 256 ranges or 256 distinct epochs is `NACK(MALFORMED_MESSAGE)` before any lookup, and overlapping ranges are merged; read authority; Key Packages only to their recipient; size-limited batches; no stored Snapshot is `NACK(MISSING_DEPENDENCY)` | §49, §52, §55 |
@@ -59,6 +59,7 @@ use crate::config::Config;
 use crate::coordinator::{Chain, Coordinator, Failure};
 use crate::identity::ServerId;
 use crate::ingest::{self, IngestPolicy, ObjectKind, Unlimited};
+use crate::limits::{refusal, Quota};
 use crate::rng::{OsRandom, Random};
 use crate::store::{Hosting, Put, Store, StoreError, StoredObject, DURABILITY};
 use crate::ws::{ConnectionContext, Flow, Outbound, Session, SessionFactory};
@@ -70,6 +71,18 @@ pub trait HostingPolicy: Send + Sync + 'static {
     /// Resource, given the hosting credential from `RESOURCE_HOST` or else
     /// from `AUTH`. The credential must not be logged.
     fn allows(&self, host: &PrincipalId, credential: Option<&HostingCredential>) -> bool;
+
+    /// Whether any hosting Principal has a [`Quota`] (quota mode); when
+    /// not, the session skips the usage lookups.
+    fn has_quotas(&self) -> bool {
+        false
+    }
+
+    /// The storage quota of the Resources `host` hosts; `None` is no
+    /// quota.
+    fn quota(&self, _host: &PrincipalId) -> Option<Quota> {
+        None
+    }
 }
 
 /// The self-hosted MVP policy: any authenticated Principal may host, with
@@ -229,6 +242,82 @@ impl LfcpSession {
         self.send(out, Some(request), Body::Nack(code_body(code)))
     }
 
+    /// A NACK refusing a request by a server limit, with its diagnostic.
+    fn refuse(&self, out: &Outbound, request: [u8; 16], (code, diagnostic): Limit) -> Flow {
+        tracing::info!(
+            conn = self.conn,
+            code = code.name(),
+            diagnostic,
+            "refused by a server limit"
+        );
+        let mut body = code_body(code);
+        body.diagnostic = Some(diagnostic.to_owned());
+        self.send(out, Some(request), Body::Nack(body))
+    }
+
+    /// Whether `host` may host one more Resource whose Genesis is `size`
+    /// bytes, under its quota.
+    async fn may_host(
+        &self,
+        host: PrincipalId,
+        size: usize,
+    ) -> Result<(), Result<Limit, StoreError>> {
+        let Some(quota) = self.shared.hosting.quota(&host) else {
+            return Ok(());
+        };
+        let store = self.shared.coordinator.store();
+        let (resources, bytes) = store.principal_usage(host).await.map_err(Err)?;
+        if resources >= quota.resources {
+            return Err(Ok((WireCode::QuotaExceeded, refusal::RESOURCES)));
+        }
+        if bytes.saturating_add(size as u64) > quota.bytes {
+            return Err(Ok((WireCode::QuotaExceeded, refusal::PRINCIPAL_BYTES)));
+        }
+        Ok(())
+    }
+
+    /// Whether `size` more bytes may be stored for `resource`, under its
+    /// hosting Principal's quota. A Resource that is not hosted passes:
+    /// the request fails elsewhere.
+    async fn may_store(
+        &self,
+        resource: ResourceId,
+        size: usize,
+    ) -> Result<(), Result<Limit, StoreError>> {
+        if !self.shared.hosting.has_quotas() {
+            return Ok(());
+        }
+        let store = self.shared.coordinator.store();
+        let Some(usage) = store.usage(resource).await.map_err(Err)? else {
+            return Ok(());
+        };
+        let Some(quota) = self.shared.hosting.quota(&usage.host) else {
+            return Ok(());
+        };
+        let size = size as u64;
+        if usage.resource_bytes.saturating_add(size) > quota.resource_bytes {
+            return Err(Ok((WireCode::QuotaExceeded, refusal::RESOURCE_BYTES)));
+        }
+        if usage.host_bytes.saturating_add(size) > quota.bytes {
+            return Err(Ok((WireCode::QuotaExceeded, refusal::PRINCIPAL_BYTES)));
+        }
+        Ok(())
+    }
+
+    /// The answer to a failed [`LfcpSession::may_host`] or
+    /// [`LfcpSession::may_store`].
+    fn refuse_or_fail(
+        &self,
+        out: &Outbound,
+        request: [u8; 16],
+        failure: Result<Limit, StoreError>,
+    ) -> Flow {
+        match failure {
+            Ok(limit) => self.refuse(out, request, limit),
+            Err(error) => self.internal(out, request, &error),
+        }
+    }
+
     fn nack_error(&self, out: &Outbound, request: [u8; 16], error: &Error) -> Flow {
         match ErrorBody::for_error(error) {
             Some(body) => {
@@ -335,6 +424,18 @@ impl LfcpSession {
         let credential = credential.as_ref().or(auth.hosting_credential.as_ref());
         if !self.shared.hosting.allows(&host, credential) {
             return self.nack(out, request, WireCode::HostingDenied);
+        }
+        // Server limits (POST-003), for a Resource not hosted yet: hosting
+        // the same Genesis again changes nothing.
+        let store = self.shared.coordinator.store();
+        match store.resource(resource_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(failure) = self.may_host(host, genesis.len()).await {
+                    return self.refuse_or_fail(out, request, failure);
+                }
+            }
+            Err(error) => return self.internal(out, request, &error),
         }
         // Step 5: persisted (committed, WAL synchronous=FULL) before the
         // reply.
@@ -487,6 +588,9 @@ impl LfcpSession {
         record: Vec<u8>,
         out: &Outbound,
     ) -> Flow {
+        if let Err(failure) = self.may_store(resource_id, record.len()).await {
+            return self.refuse_or_fail(out, request, failure);
+        }
         let committed = self
             .shared
             .coordinator
@@ -605,6 +709,9 @@ impl LfcpSession {
             }
         }
         let size = objects.iter().map(Vec::len).sum();
+        if let Err(failure) = self.may_store(resource_id, size).await {
+            return Err(self.refuse_or_fail(out, request, failure));
+        }
         if let Err(refusal) = self
             .shared
             .ingest
@@ -1094,6 +1201,9 @@ impl Session for LfcpSession {
         }
     }
 }
+
+/// A server limit's refusal: its code and NACK diagnostic.
+type Limit = (WireCode, &'static str);
 
 fn code_body(code: WireCode) -> ErrorBody {
     ErrorBody {

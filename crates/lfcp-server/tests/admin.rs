@@ -346,7 +346,8 @@ async fn the_hosting_policy_applies_to_resource_host_and_persists() {
     let admin = token(&server, &carol).await;
 
     let (status, body) = http(server.addr, "GET", "/admin/hosting", Some(&admin), None).await;
-    assert_eq!((status, body), (200, json!({ "mode": "open" })));
+    // A server that never set a policy is in quota mode (POST-003).
+    assert_eq!((status, body), (200, json!({ "mode": "quota" })));
 
     // Only OWNER, or whoever presents the credential "deploy-key".
     let owner = v.principal("owner");
