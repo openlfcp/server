@@ -124,6 +124,12 @@ WebSocket version 426.
   before the payload is read or decoded: `ERROR(MESSAGE_TOO_LARGE)` and
   close 1009. The connection closes because the rest of the frame is
   unread.
+- Every close the server starts lingers, so the peer still reads the last
+  ERROR and close frame. Without it, closing a socket with unread bytes
+  sends RST (on Linux), and the peer discards what it had not read yet.
+  The server shuts down its write half, then reads and discards the peer's
+  bytes until EOF. It stops after at most 2 seconds and `max_message_bytes`
+  + 64 KiB, or at shutdown, then drops the socket.
 - Other undecodable messages get `ERROR` with their code (malformed CBOR,
   an unknown type → `PROTOCOL_UNSUPPORTED`) and the connection stays open,
   unless sdk-rs says the error closes it.
