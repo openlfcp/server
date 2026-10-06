@@ -185,6 +185,134 @@ async fn a_peer_that_stops_reading_is_closed_and_its_memory_freed() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Read every DATA_BATCH answering `request` until `units` units arrived;
+/// returns the batches' objects.
+async fn read_batches(client: &mut Client, request: [u8; 16], units: usize) -> Vec<Vec<Vec<u8>>> {
+    let mut batches = Vec::new();
+    let mut seen = 0;
+    while seen < units {
+        let bytes = client.next_frame().await.expect("the reply continues");
+        assert!(bytes.len() <= MESSAGE, "a batch of {} bytes", bytes.len());
+        let message = lfcp::wire::message::Message::decode(&bytes, &Default::default()).unwrap();
+        assert_eq!(message.correlation_id, Some(request));
+        let Body::DataBatch { units, .. } = message.body else {
+            panic!("expected DATA_BATCH, got {:?}", message.body);
+        };
+        seen += units.len();
+        batches.push(units);
+    }
+    assert_eq!(seen, units);
+    batches
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_resource_is_served_within_the_byte_caps() {
+    let v = Vectors::load();
+    // 32 MiB of units: 128 × the message size, 32 × the connection cap,
+    // 8 × the server-wide cap.
+    let units = 2048u64;
+    let (server, dir) = large_resource(&v, "memory-large", units, 16 * 1024).await;
+    let bob = v.principal("bob");
+    let actor = *bob.descriptor().id();
+
+    // Six readers at once: more than the server-wide budget would allow
+    // at their own caps.
+    let mut readers = Vec::new();
+    for _ in 0..6 {
+        let addr = server.addr;
+        let get = Body::DataGet {
+            resource_id: v.resource(),
+            // Three ranges, so pages cross from one to the next.
+            ranges: vec![
+                DataRange {
+                    principal: actor,
+                    start: 1,
+                    end: 700,
+                },
+                DataRange {
+                    principal: actor,
+                    start: 701,
+                    end: 701,
+                },
+                DataRange {
+                    principal: actor,
+                    start: 702,
+                    end: u64::MAX,
+                },
+            ],
+        };
+        let bob = v.principal("bob");
+        readers.push(tokio::spawn(async move {
+            let mut client = Client::connect(addr).await;
+            client.handshake(&bob).await;
+            let request = client.request(get).await;
+            read_batches(&mut client, request, units as usize).await
+        }));
+    }
+    let budget = MESSAGE - 1024;
+    let cost = |batch: &[Vec<u8>]| batch.iter().map(|u| u.len() + 9).sum::<usize>();
+    for reader in readers {
+        let batches = reader.await.unwrap();
+        let all: Vec<&Vec<u8>> = batches.iter().flatten().collect();
+        let sequences: Vec<u64> = all
+            .iter()
+            .map(|u| {
+                lfcp::wire::data_unit::ReceivedDataUnit::parse(u)
+                    .unwrap()
+                    .header()
+                    .sequence
+            })
+            .collect();
+        assert_eq!(
+            sequences,
+            (1..=units).collect::<Vec<_>>(),
+            "every unit once, in order"
+        );
+        // The batches are the greedy cut of the whole reply, as before
+        // paging: each within the budget, and none could take the next
+        // batch's first unit.
+        for pair in batches.windows(2) {
+            assert!(cost(&pair[0]) <= budget);
+            assert!(cost(&pair[0]) + pair[1][0].len() + 9 > budget);
+        }
+    }
+    assert!(
+        server.outbound.connection_peak() <= CONNECTION_CAP,
+        "a connection held {} bytes",
+        server.outbound.connection_peak()
+    );
+    assert!(
+        server.outbound.peak() <= TOTAL_CAP,
+        "all connections held {} bytes",
+        server.outbound.peak()
+    );
+    assert!(
+        server.outbound.peak() > CONNECTION_CAP,
+        "the readers overlapped"
+    );
+    assert!(eventually(Duration::from_secs(5), || server.outbound.used() == 0).await);
+
+    // An empty listing still gets one, empty, batch.
+    let mut client = Client::connect(server.addr).await;
+    client.handshake(&bob).await;
+    let request = client
+        .request(Body::DataGet {
+            resource_id: v.resource(),
+            ranges: vec![DataRange {
+                principal: actor,
+                start: units + 1,
+                end: units + 9,
+            }],
+        })
+        .await;
+    let reply = client.recv().await;
+    assert_eq!(reply.correlation_id, Some(request));
+    assert!(matches!(reply.body, Body::DataBatch { units, .. } if units.is_empty()));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_admin_body_is_closed_after_the_timeout() {
     let dir = state_dir("memory-admin-body");

@@ -408,6 +408,18 @@ After every Control commit, subscribers that lost read authority are
 dropped from live pushes; their session stays open and its next request
 for the Resource gets `AUTHORIZATION_FAILED`.
 
+GET replies are streamed, not built in memory (security review H6,
+POST-004). `CONTROL_GET`, `DATA_GET` and `KEY_PACKAGE_GET` read the store
+one page at a time (keyset paging in `store::Listing`). Each page is first
+sized from the stored object lengths, then room for it is reserved in the
+outbound budgets, then it is read and encoded straight into one batch
+message (`max_message_bytes` − 1 KiB of objects). The budgets fill up
+while the peer reads, so a GET of any size holds at most
+`max_outbound_bytes`. The pages are the batches the whole reply would be
+cut into, so the replies are unchanged on the wire. An empty result is one
+empty batch. `SNAPSHOT_GET` sends one stored Snapshot, at most
+`max_message_bytes`.
+
 Before anything is looked up, a `DATA_GET` with more than 256 ranges
 (WIRE-01 §49) or a `KEY_PACKAGE_GET` with more than 256 distinct epochs
 gets `NACK(MALFORMED_MESSAGE)`. Repeated epochs are looked up once, and

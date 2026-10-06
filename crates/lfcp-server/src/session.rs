@@ -61,7 +61,7 @@ use crate::identity::ServerId;
 use crate::ingest::{self, IngestPolicy, ObjectKind, Unlimited};
 use crate::limits::{refusal, Floor, OsDiskSpace, Quota, WriteClass};
 use crate::rng::{OsRandom, Random};
-use crate::store::{Hosting, Put, Store, StoreError, StoredObject, DURABILITY};
+use crate::store::{page_cost, Cursor, Hosting, Listing, Put, Store, StoreError, DURABILITY};
 use crate::ws::{ConnectionContext, Flow, Outbound, Session, SessionFactory};
 
 /// Server hosting policy (§36, §39): who may ask this server to host a
@@ -234,16 +234,20 @@ impl LfcpSession {
         &self.subscriptions
     }
 
-    /// A message with a fresh ID; `None` without randomness.
-    fn message(&self, correlation: Option<[u8; 16]>, body: Body) -> Option<Message> {
-        let id = match self.shared.random.nonce16() {
-            Ok(id) => id,
+    /// A fresh message ID; `None` without randomness.
+    fn message_id(&self) -> Option<[u8; 16]> {
+        match self.shared.random.nonce16() {
+            Ok(id) => Some(id),
             Err(error) => {
                 tracing::error!(conn = self.conn, %error, "no randomness; closing");
-                return None;
+                None
             }
-        };
-        let mut message = Message::new(id, body);
+        }
+    }
+
+    /// A message with a fresh ID; `None` without randomness.
+    fn message(&self, correlation: Option<[u8; 16]>, body: Body) -> Option<Message> {
+        let mut message = Message::new(self.message_id()?, body);
         message.correlation_id = correlation;
         Some(message)
     }
@@ -762,22 +766,16 @@ impl LfcpSession {
         if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
             return flow;
         }
-        let records = match self
-            .shared
-            .coordinator
-            .store()
-            .control_records(resource_id, start, end)
-            .await
-        {
-            Ok(records) => records,
-            Err(error) => return self.internal(out, request, &error).await,
+        let listing = Listing::Control {
+            resource: resource_id,
+            from: start,
+            to: end,
         };
-        let records = records.into_iter().map(|r| r.bytes).collect();
-        self.reply_in_batches(out, request, records, |records| Body::ControlBatch {
+        let batch = Body::ControlBatch {
             resource_id,
-            records,
-        })
-        .await
+            records: Vec::new(),
+        };
+        self.reply_paged(out, request, listing, batch).await
     }
 
     /// Validate every object first (nothing is stored if one fails), then
@@ -1052,23 +1050,18 @@ impl LfcpSession {
         if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
             return flow;
         }
-        let store = self.shared.coordinator.store();
-        let mut units = Vec::new();
-        for range in ranges {
-            match store
-                .data_units_in(resource_id, range.principal, range.start, range.end)
-                .await
-            {
-                Ok(found) => units.extend(found),
-                Err(error) => return self.internal(out, request, &error).await,
-            }
-        }
-        let units = unique(units);
-        self.reply_in_batches(out, request, units, |units| Body::DataBatch {
+        let listing = Listing::Data {
+            resource: resource_id,
+            ranges: ranges
+                .into_iter()
+                .map(|r| (r.principal, r.start, r.end))
+                .collect(),
+        };
+        let batch = Body::DataBatch {
             resource_id,
-            units,
-        })
-        .await
+            units: Vec::new(),
+        };
+        self.reply_paged(out, request, listing, batch).await
     }
 
     /// KEY_PACKAGE_GET (§52): every stored package for the requested
@@ -1095,20 +1088,16 @@ impl LfcpSession {
         if recipient != principal {
             return self.nack(out, request, WireCode::AuthorizationFailed).await;
         }
-        let store = self.shared.coordinator.store();
-        let mut packages = Vec::new();
-        for epoch in epochs {
-            match store.key_packages_for(resource_id, epoch, recipient).await {
-                Ok(found) => packages.extend(found),
-                Err(error) => return self.internal(out, request, &error).await,
-            }
-        }
-        let packages = unique(packages);
-        self.reply_in_batches(out, request, packages, |packages| Body::KeyPackageBatch {
+        let listing = Listing::KeyPackages {
+            resource: resource_id,
+            recipient,
+            epochs,
+        };
+        let batch = Body::KeyPackageBatch {
             resource_id,
-            packages,
-        })
-        .await
+            packages: Vec::new(),
+        };
+        self.reply_paged(out, request, listing, batch).await
     }
 
     /// SNAPSHOT_GET (§55): the named Snapshot of this Resource, or the
@@ -1153,23 +1142,72 @@ impl LfcpSession {
         }
     }
 
-    /// Send `objects` as correlated batches within the message size limit.
-    async fn reply_in_batches(
+    /// Send `listing` as correlated batches of `batch`'s type within the
+    /// message size limit, a page at a time (security review H6): each
+    /// page is sized from the store, room for it is reserved in the
+    /// outbound budgets (waiting while the peer reads), then it is read,
+    /// encoded and queued. The pages are the batches the whole reply would
+    /// be cut into, so the reply is the same; there is always at least one
+    /// batch, possibly empty.
+    async fn reply_paged(
         &self,
         out: &Outbound,
         request: [u8; 16],
-        objects: Vec<Vec<u8>>,
-        body: impl Fn(Vec<Vec<u8>>) -> Body,
+        listing: Listing,
+        batch: Body,
     ) -> Flow {
         let budget = usize::try_from(self.shared.ready.max_message_bytes)
             .unwrap_or(usize::MAX)
             .saturating_sub(BATCH_OVERHEAD);
-        for batch in batches(objects, budget) {
-            if self.send(out, Some(request), body(batch)).await == Flow::Close {
+        let (message_type, resource_id) = match &batch {
+            Body::ControlBatch { resource_id, .. }
+            | Body::DataBatch { resource_id, .. }
+            | Body::KeyPackageBatch { resource_id, .. } => (batch.message_type(), *resource_id),
+            _ => unreachable!("a batch body"),
+        };
+        let store = self.shared.coordinator.store();
+        let mut cursor = Cursor::default();
+        let mut first = true;
+        loop {
+            let plan = match store
+                .plan_page(listing.clone(), cursor.clone(), budget)
+                .await
+            {
+                Ok(plan) => plan,
+                Err(error) => return self.internal(out, request, &error).await,
+            };
+            if plan.count == 0 && !first {
+                return Flow::Continue;
+            }
+            // The page's objects, then their encoding, before the objects
+            // are dropped.
+            let Ok(reservation) = out.reserve(2 * plan.cost + BATCH_OVERHEAD).await else {
+                return Flow::Close;
+            };
+            let page = match store
+                .read_page(listing.clone(), cursor, plan.count, plan.cost)
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => return self.internal(out, request, &error).await,
+            };
+            let Some(id) = self.message_id() else {
+                return Flow::Close;
+            };
+            let bytes = encode_batch(message_type, id, request, &resource_id, &page.objects);
+            let (read, cost) = (page.objects.len(), page.cost);
+            cursor = page.next;
+            if out.send_reserved(bytes, reservation).await.is_err() {
+                tracing::info!(conn = self.conn, "connection closing; reply dropped");
                 return Flow::Close;
             }
+            first = false;
+            // Objects stored since the plan can shorten a page; then the
+            // listing goes on from where the page ended.
+            if !plan.more && read == plan.count && cost == plan.cost {
+                return Flow::Continue;
+            }
         }
-        Flow::Continue
     }
 
     fn principal(&self) -> PrincipalId {
@@ -1397,33 +1435,59 @@ fn merge_ranges(ranges: Vec<DataRange>) -> Vec<DataRange> {
 /// Room for the envelope and the CONTROL_BATCH body around the records.
 const BATCH_OVERHEAD: usize = 1024;
 
-/// Split `items` into batches whose total size (with a few bytes of CBOR
-/// framing each) stays within `budget`; an item is never split, and there
-/// is always at least one batch, possibly empty.
-fn batches(items: impl IntoIterator<Item = Vec<u8>>, budget: usize) -> Vec<Vec<Vec<u8>>> {
-    let mut batches = vec![Vec::new()];
-    let mut size = 0;
-    for item in items {
-        let cost = item.len() + 9;
-        let current = batches.last_mut().expect("never empty");
-        if !current.is_empty() && size + cost > budget {
-            batches.push(Vec::new());
-            size = 0;
+/// The encoded batch message (type `message_type`, ID `id`, correlated to
+/// `request`) carrying `objects`, written directly as the deterministic
+/// CBOR of [`Message::encode`] (WIRE-01 §32, §46, §50, §53): without the
+/// intermediate value tree, a page costs its objects and one encoding.
+fn encode_batch(
+    message_type: u64,
+    id: [u8; 16],
+    request: [u8; 16],
+    resource_id: &ResourceId,
+    objects: &[Vec<u8>],
+) -> Vec<u8> {
+    fn head(out: &mut Vec<u8>, major: u8, n: u64) {
+        let major = major << 5;
+        match n {
+            0..=23 => out.push(major | n as u8),
+            24..=0xff => out.extend([major | 24, n as u8]),
+            0x100..=0xffff => {
+                out.push(major | 25);
+                out.extend((n as u16).to_be_bytes());
+            }
+            0x1_0000..=0xffff_ffff => {
+                out.push(major | 26);
+                out.extend((n as u32).to_be_bytes());
+            }
+            _ => {
+                out.push(major | 27);
+                out.extend(n.to_be_bytes());
+            }
         }
-        size += cost;
-        batches.last_mut().expect("never empty").push(item);
     }
-    batches
-}
-
-/// The objects' bytes, each object once, in order.
-fn unique(objects: Vec<StoredObject>) -> Vec<Vec<u8>> {
-    let mut seen = HashSet::new();
-    objects
-        .into_iter()
-        .filter(|o| seen.insert(o.id))
-        .map(|o| o.bytes)
-        .collect()
+    fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+        head(out, 2, value.len() as u64);
+        out.extend_from_slice(value);
+    }
+    let size: usize = objects.iter().map(|o| page_cost(o.len())).sum();
+    let mut out = Vec::with_capacity(size + 128);
+    head(&mut out, 5, 4); // envelope {0, 1, 2, 4}
+    head(&mut out, 0, 0);
+    head(&mut out, 0, message_type);
+    head(&mut out, 0, 1);
+    bytes(&mut out, &id);
+    head(&mut out, 0, 2);
+    bytes(&mut out, &request);
+    head(&mut out, 0, 4);
+    head(&mut out, 5, 2); // body {0: resource, 1: objects}
+    head(&mut out, 0, 0);
+    bytes(&mut out, resource_id.as_bytes());
+    head(&mut out, 0, 1);
+    head(&mut out, 4, objects.len() as u64);
+    for object in objects {
+        bytes(&mut out, object);
+    }
+    out
 }
 
 /// The canonical wire Have of stored (actor, sequence) pairs.
@@ -1482,6 +1546,42 @@ mod tests {
         let flow = session.handle(Message::new([0; 16], body), out).await;
         assert_eq!(flow, Flow::Continue);
         inbox.recv().await.unwrap().into_message().unwrap()
+    }
+
+    #[test]
+    fn encoded_batches_are_the_messages_encoding() {
+        let resource = ResourceId::from_bytes([5; 32]);
+        for count in [0usize, 1, 23, 24, 300] {
+            for size in [0usize, 23, 24, 255, 256, 70_000] {
+                if count * size > 4 << 20 {
+                    continue;
+                }
+                let objects: Vec<Vec<u8>> = (0..count).map(|i| vec![i as u8; size]).collect();
+                for body in [
+                    Body::ControlBatch {
+                        resource_id: resource,
+                        records: objects.clone(),
+                    },
+                    Body::DataBatch {
+                        resource_id: resource,
+                        units: objects.clone(),
+                    },
+                    Body::KeyPackageBatch {
+                        resource_id: resource,
+                        packages: objects.clone(),
+                    },
+                ] {
+                    let message_type = body.message_type();
+                    let mut message = Message::new([1; 16], body);
+                    message.correlation_id = Some([2; 16]);
+                    assert_eq!(
+                        encode_batch(message_type, [1; 16], [2; 16], &resource, &objects),
+                        message.encode(),
+                        "type {message_type}, {count} × {size}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -1046,6 +1046,281 @@ impl Store {
     }
 }
 
+/// The objects a GET reply lists, in reply order (WIRE-01 §45, §49, §52):
+/// read a page at a time ([`Store::plan_page`], [`Store::read_page`]), so a
+/// reply never holds a whole Resource in memory (security review H6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listing {
+    /// Control Records with sequence in `from..=to`, by sequence then
+    /// record ID.
+    Control {
+        /// The Resource.
+        resource: ResourceId,
+        /// The first sequence.
+        from: u64,
+        /// The last sequence.
+        to: u64,
+    },
+    /// Data Units of each `(actor, start, end)` range in turn, by sequence
+    /// then unit ID. Ranges must not overlap, or a unit is listed twice.
+    Data {
+        /// The Resource.
+        resource: ResourceId,
+        /// The ranges, in reply order.
+        ranges: Vec<(PrincipalId, u64, u64)>,
+    },
+    /// Key Packages for `recipient` at each epoch in turn, by package ID.
+    /// Epochs must be distinct.
+    KeyPackages {
+        /// The Resource.
+        resource: ResourceId,
+        /// The recipient.
+        recipient: PrincipalId,
+        /// The epochs, in reply order.
+        epochs: Vec<u64>,
+    },
+}
+
+/// A row's position in its segment: (sequence or epoch, object ID).
+type Key = (i64, Vec<u8>);
+
+/// Where a [`Listing`] continues: after `key` in segment `segment` (a
+/// Data range or a Key Package epoch; Control has one).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cursor {
+    segment: usize,
+    key: Option<Key>,
+}
+
+/// The next page of a [`Listing`], sized but not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagePlan {
+    /// The objects that fit.
+    pub count: usize,
+    /// Their total [`page_cost`].
+    pub cost: usize,
+    /// Whether objects follow them.
+    pub more: bool,
+}
+
+/// A page of a [`Listing`]'s objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// The exact bytes of each object, in order.
+    pub objects: Vec<Vec<u8>>,
+    /// Their total [`page_cost`].
+    pub cost: usize,
+    /// Where the listing continues.
+    pub next: Cursor,
+}
+
+/// An object's cost in a page: its size plus a CBOR byte-string header
+/// (at most 9 bytes).
+pub fn page_cost(len: usize) -> usize {
+    len + 9
+}
+
+impl Listing {
+    fn segments(&self) -> usize {
+        match self {
+            Listing::Control { .. } => 1,
+            Listing::Data { ranges, .. } => ranges.len(),
+            Listing::KeyPackages { epochs, .. } => epochs.len(),
+        }
+    }
+
+    /// Visit segment `segment`'s rows after `after` in order, with their
+    /// key and size and, if `bytes`, their bytes, while `visit` returns
+    /// true.
+    fn scan(
+        &self,
+        conn: &Connection,
+        segment: usize,
+        after: &Key,
+        bytes: bool,
+        visit: &mut dyn FnMut(Key, usize, Option<Vec<u8>>) -> bool,
+    ) -> Result<(), StoreError> {
+        let column = if bytes { ", bytes" } else { "" };
+        let (sql, binds): (String, Vec<rusqlite::types::Value>) = match self {
+            Listing::Control { resource, from, to } => (
+                format!(
+                    "SELECT seq, record_id, length(bytes){column} FROM control_records
+                     WHERE resource_id = ?1 AND seq BETWEEN ?2 AND ?3 AND (seq, record_id) > (?4, ?5)
+                     ORDER BY seq, record_id"
+                ),
+                vec![
+                    resource.as_bytes().to_vec().into(),
+                    i64_of(*from)?.into(),
+                    i64_of((*to).min(i64::MAX as u64))?.into(),
+                ],
+            ),
+            Listing::Data { resource, ranges } => {
+                let (_, start, end) = ranges[segment];
+                (
+                    format!(
+                        "SELECT seq, unit_id, length(bytes){column} FROM data_units
+                         WHERE resource_id = ?1 AND actor = ?6 AND seq BETWEEN ?2 AND ?3 AND (seq, unit_id) > (?4, ?5)
+                         ORDER BY seq, unit_id"
+                    ),
+                    vec![
+                        resource.as_bytes().to_vec().into(),
+                        i64_of(start)?.into(),
+                        i64_of(end.min(i64::MAX as u64))?.into(),
+                    ],
+                )
+            }
+            Listing::KeyPackages {
+                resource, epochs, ..
+            } => {
+                let epoch = i64_of(epochs[segment])?;
+                (
+                    format!(
+                        "SELECT epoch, package_id, length(bytes){column} FROM key_packages
+                         WHERE resource_id = ?1 AND recipient = ?6 AND epoch BETWEEN ?2 AND ?3 AND (epoch, package_id) > (?4, ?5)
+                         ORDER BY package_id"
+                    ),
+                    vec![
+                        resource.as_bytes().to_vec().into(),
+                        epoch.into(),
+                        epoch.into(),
+                    ],
+                )
+            }
+        };
+        let mut binds = binds;
+        binds.push(after.0.into());
+        binds.push(after.1.clone().into());
+        match self {
+            Listing::Data { ranges, .. } => {
+                binds.push(ranges[segment].0.as_bytes().to_vec().into())
+            }
+            Listing::KeyPackages { recipient, .. } => {
+                binds.push(recipient.as_bytes().to_vec().into())
+            }
+            Listing::Control { .. } => {}
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(binds))?;
+        while let Some(row) = rows.next()? {
+            let key = (row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?);
+            let len = row.get::<_, i64>(2)? as usize;
+            let object = if bytes { Some(row.get(3)?) } else { None };
+            if !visit(key, len, object) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk the listing from `cursor`: each object's key, size and, if
+    /// `bytes`, bytes, while `visit` returns true. Returns the cursor after
+    /// the last object visited with true.
+    fn walk(
+        &self,
+        conn: &Connection,
+        cursor: &Cursor,
+        bytes: bool,
+        visit: &mut dyn FnMut(usize, Option<Vec<u8>>) -> bool,
+    ) -> Result<Cursor, StoreError> {
+        let start = (i64::MIN, Vec::new());
+        let mut position = cursor.clone();
+        let mut stopped = false;
+        while position.segment < self.segments() {
+            let after = position.key.clone().unwrap_or_else(|| start.clone());
+            let segment = position.segment;
+            self.scan(conn, segment, &after, bytes, &mut |key, len, object| {
+                if visit(len, object) {
+                    position.key = Some(key);
+                    true
+                } else {
+                    stopped = true;
+                    false
+                }
+            })?;
+            if stopped {
+                break;
+            }
+            position = Cursor {
+                segment: segment + 1,
+                key: None,
+            };
+        }
+        Ok(position)
+    }
+}
+
+/// Whether an object of `cost` joins a page holding `count` objects of
+/// `size`: the first always does, later ones while the page stays within
+/// `budget`.
+fn fits(count: usize, size: usize, cost: usize, budget: usize) -> bool {
+    count == 0 || size + cost <= budget
+}
+
+impl Store {
+    /// Size the next page of `listing` from `cursor`: the objects whose
+    /// [`page_cost`]s fit `budget` (at least one, if any is left). Reads
+    /// sizes only, never the objects.
+    pub async fn plan_page(
+        &self,
+        listing: Listing,
+        cursor: Cursor,
+        budget: usize,
+    ) -> Result<PagePlan, StoreError> {
+        self.call(move |conn| {
+            let mut plan = PagePlan {
+                count: 0,
+                cost: 0,
+                more: false,
+            };
+            listing.walk(conn, &cursor, false, &mut |len, _| {
+                let cost = page_cost(len);
+                if fits(plan.count, plan.cost, cost, budget) {
+                    plan.count += 1;
+                    plan.cost += cost;
+                    true
+                } else {
+                    plan.more = true;
+                    false
+                }
+            })?;
+            Ok(plan)
+        })
+        .await
+    }
+
+    /// Read at most `count` objects of `listing` from `cursor`, of at most
+    /// `budget` total [`page_cost`] (objects stored since the plan can
+    /// only make the page shorter).
+    pub async fn read_page(
+        &self,
+        listing: Listing,
+        cursor: Cursor,
+        count: usize,
+        budget: usize,
+    ) -> Result<Page, StoreError> {
+        self.call(move |conn| {
+            let mut objects = Vec::new();
+            let mut cost = 0;
+            let next = listing.walk(conn, &cursor, true, &mut |len, object| {
+                let object_cost = page_cost(len);
+                if objects.len() < count && cost + object_cost <= budget {
+                    cost += object_cost;
+                    objects.push(object.expect("bytes were read"));
+                    true
+                } else {
+                    false
+                }
+            })?;
+            Ok(Page {
+                objects,
+                cost,
+                next,
+            })
+        })
+        .await
+    }
+}
+
 fn require_resource(conn: &Connection, resource: &ResourceId) -> Result<(), StoreError> {
     let known: Option<i64> = conn
         .query_row(
