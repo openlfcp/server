@@ -344,3 +344,60 @@ async fn writes_past_the_principal_bytes_are_refused_until_open_mode() {
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_resources_per_client_ip_are_rate_limited() {
+    let dir = state_dir("quota-hosts-per-ip");
+    let server = start(
+        &dir,
+        with(AbuseLimits {
+            hosts_per_ip_per_day: 2,
+            trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
+            ..AbuseLimits::default()
+        }),
+    )
+    .await;
+    let r = |i: u8| ResourceId::from_bytes([i; 32]);
+    // Fresh keypairs from one client address: the third is refused.
+    for i in 1..=2u8 {
+        let keys = PrincipalKeys::from_secrets(&[i; 32], [i; 32]);
+        let mut c = proxied(&server, "203.0.113.1", &keys).await;
+        assert!(matches!(
+            host(&mut c, genesis(&keys, r(i))).await,
+            Body::ResourceHosted { .. }
+        ));
+        // Hosting it again is not new and does not count.
+        assert!(matches!(
+            host(&mut c, genesis(&keys, r(i))).await,
+            Body::ResourceHosted { .. }
+        ));
+    }
+    let keys = PrincipalKeys::from_secrets(&[3; 32], [3; 32]);
+    let mut c = proxied(&server, "203.0.113.1", &keys).await;
+    assert_eq!(
+        host(&mut c, genesis(&keys, r(3))).await,
+        Body::Nack(ErrorBody {
+            code: 17,
+            diagnostic: Some(refusal::HOSTS_PER_IP.into()),
+            details: None,
+        })
+    );
+    // Another client address may host.
+    let mut c = proxied(&server, "203.0.113.2", &keys).await;
+    assert!(matches!(
+        host(&mut c, genesis(&keys, r(3))).await,
+        Body::ResourceHosted { .. }
+    ));
+
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A ready session as `keys`, through a trusted proxy reporting `client`.
+async fn proxied(server: &Running, client: &str, keys: &PrincipalKeys) -> Client {
+    let mut c = Client::try_connect(server.addr, &[("x-forwarded-for", client)])
+        .await
+        .unwrap();
+    c.handshake(keys).await;
+    c
+}

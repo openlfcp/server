@@ -26,7 +26,7 @@
 //! authority. Refusals use the WIRE-01 §62 codes `RATE_LIMITED` and
 //! `QUOTA_EXCEEDED` on the WebSocket, and HTTP 429 on HTTP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -119,12 +119,14 @@ impl AbuseLimits {
                 "admin_requests_per_ip_per_minute",
                 u64::from(self.admin_requests_per_ip_per_minute),
             ),
-            ("hosts_per_ip_per_day", u64::from(self.hosts_per_ip_per_day)),
         ];
         for (field, value) in rates {
             if value > 1_000_000 {
                 return Err((field, "must be between 0 and 1000000"));
             }
+        }
+        if self.hosts_per_ip_per_day > 10_000 {
+            return Err(("hosts_per_ip_per_day", "must be between 0 and 10000"));
         }
         if self.ws_messages_per_second > 0 && self.ws_message_burst == 0 {
             return Err((
@@ -281,6 +283,9 @@ pub mod refusal {
     pub const PRINCIPAL_BYTES: &str = "quota exceeded: stored bytes per hosting Principal";
     /// `QUOTA_EXCEEDED`: the write would pass the Resource's stored bytes.
     pub const RESOURCE_BYTES: &str = "quota exceeded: stored bytes per Resource";
+    /// `RATE_LIMITED`: the client IP hosted its new Resources of the last
+    /// 24 hours.
+    pub const HOSTS_PER_IP: &str = "rate limited: new Resources per client address per day";
 }
 
 /// A token bucket's rate: `per_second` tokens refill it, up to `burst`.
@@ -446,6 +451,8 @@ struct Entry {
     seen: Instant,
     connects: Option<Bucket>,
     admin: Option<Bucket>,
+    /// When this IP hosted new Resources, within the last [`DAY`].
+    hosted: VecDeque<Instant>,
 }
 
 impl Entry {
@@ -455,16 +462,24 @@ impl Entry {
             seen: now,
             connects: None,
             admin: None,
+            hosted: VecDeque::new(),
         }
     }
 
     /// Nothing to remember: dropping it changes no decision.
     fn is_idle(&self, now: Instant) -> bool {
         self.open == 0
+            && self
+                .hosted
+                .iter()
+                .all(|at| now.saturating_duration_since(*at) >= DAY)
             && self.connects.is_none_or(|b| b.is_full(now))
             && self.admin.is_none_or(|b| b.is_full(now))
     }
 }
+
+/// The window of [`AbuseLimits::hosts_per_ip_per_day`].
+pub const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Take a token from the bucket in `slot` (created full at `rate`).
 fn take(slot: &mut Option<Bucket>, rate: Option<Rate>, now: Instant) -> Result<(), Duration> {
@@ -480,6 +495,7 @@ pub struct IpTable {
     max_open: usize,
     connects: Option<Rate>,
     admin: Option<Rate>,
+    hosts_per_day: usize,
     max_tracked: usize,
     entries: Mutex<HashMap<IpKey, Entry>>,
 }
@@ -491,6 +507,7 @@ impl IpTable {
             max_open: limits.max_connections_per_ip,
             connects: Rate::per_minute(limits.connections_per_ip_per_minute),
             admin: Rate::per_minute(limits.admin_requests_per_ip_per_minute),
+            hosts_per_day: limits.hosts_per_ip_per_day as usize,
             max_tracked: limits.max_tracked_ips,
             entries: Mutex::default(),
         })
@@ -545,6 +562,43 @@ impl IpTable {
     pub fn admin_request(&self, ip: IpAddr, now: Instant) -> Result<(), Duration> {
         let rate = self.admin;
         self.with(ip, now, |entry| take(&mut entry.admin, rate, now))
+    }
+
+    /// Count a new Resource hosted from `ip`: `false`, counting nothing,
+    /// when [`AbuseLimits::hosts_per_ip_per_day`] were hosted in the last
+    /// 24 hours.
+    pub fn try_host(&self, ip: IpAddr, now: Instant) -> bool {
+        let limit = self.hosts_per_day;
+        if limit == 0 {
+            return true;
+        }
+        self.with(ip, now, |entry| {
+            while entry
+                .hosted
+                .front()
+                .is_some_and(|at| now.saturating_duration_since(*at) >= DAY)
+            {
+                entry.hosted.pop_front();
+            }
+            if entry.hosted.len() >= limit {
+                return false;
+            }
+            entry.hosted.push_back(now);
+            true
+        })
+    }
+
+    /// Undo the latest [`IpTable::try_host`] of `ip` (the hosting failed or
+    /// was not new).
+    pub fn cancel_host(&self, ip: IpAddr) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .expect("never poisoned")
+            .get_mut(&IpKey::of(ip))
+        {
+            entry.hosted.pop_back();
+        }
     }
 }
 
@@ -617,6 +671,16 @@ impl Client {
     /// The per-IP table the client is counted in.
     pub fn table(&self) -> &Arc<IpTable> {
         &self.table
+    }
+
+    /// [`IpTable::try_host`] for this client, now.
+    pub fn try_host(&self) -> bool {
+        self.table.try_host(self.ip, Instant::now())
+    }
+
+    /// [`IpTable::cancel_host`] for this client.
+    pub fn cancel_host(&self) {
+        self.table.cancel_host(self.ip);
     }
 }
 
@@ -806,6 +870,37 @@ mod tests {
         assert!(t.admin_request(ip("192.0.2.2"), now).is_ok(), "another IP");
         // Connections and admin requests are counted apart.
         assert!(t.connect(ip("192.0.2.1"), now).is_ok());
+    }
+
+    #[test]
+    fn new_resources_per_ip_are_counted_over_a_day() {
+        let t = table(AbuseLimits {
+            hosts_per_ip_per_day: 2,
+            ..AbuseLimits::default()
+        });
+        let now = Instant::now();
+        let a = ip("192.0.2.1");
+        assert!(t.try_host(a, now));
+        assert!(t.try_host(a, now + Duration::from_secs(3600)));
+        assert!(!t.try_host(a, now + Duration::from_secs(7200)));
+        assert!(t.try_host(ip("192.0.2.2"), now), "another IP");
+        // A cancelled hosting does not count.
+        t.cancel_host(a);
+        assert!(t.try_host(a, now + Duration::from_secs(7200)));
+        // The first one leaves the window after 24 hours.
+        assert!(!t.try_host(a, now + DAY - Duration::from_secs(1)));
+        assert!(t.try_host(a, now + DAY));
+        // A recent hosting keeps the entry from being idle.
+        let entries = t.entries.lock().unwrap();
+        assert!(!entries[&IpKey::of(a)].is_idle(now + DAY));
+        assert!(entries[&IpKey::of(a)].is_idle(now + 3 * DAY));
+        drop(entries);
+        let off = table(AbuseLimits {
+            hosts_per_ip_per_day: 0,
+            ..AbuseLimits::default()
+        });
+        assert!((0..100).all(|_| off.try_host(a, now)));
+        assert!(off.is_empty(), "nothing tracked when off");
     }
 
     #[test]

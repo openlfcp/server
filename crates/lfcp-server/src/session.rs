@@ -9,7 +9,7 @@
 //! | AUTH | sdk-rs `verify_auth` over this session's transcript; any failure is `ERROR(AUTH_FAILED)`, close | §36, G-MSG4 |
 //! | READY | profile, server ID, configured max message bytes, the store's durability (2), configured heartbeat, no extensions | §37 |
 //! | before READY | Resource, Control, Data, Key and Snapshot messages: `NACK(AUTHORIZATION_FAILED)`, stay open; `PING`/`PONG`/`ERROR` allowed; any other out-of-order message (or an undecodable one) is `ERROR(MALFORMED_MESSAGE)`, close | §64, G-SM4 |
-//! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature, ws/wss URLs), hosting policy (a quota of Resources and bytes per hosting Principal: `NACK(QUOTA_EXCEEDED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
+//! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature, ws/wss URLs), hosting policy (a quota of Resources and bytes per hosting Principal: `NACK(QUOTA_EXCEEDED)` with a diagnostic; new Resources per client IP per day: `NACK(RATE_LIMITED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
 //! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read`, or be an invitation subject, at the accepted Control Head, else `NACK(AUTHORIZATION_FAILED)`; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator | §41, §42, §84, §73 |
 //! | RESOURCE_CLOSE | drops the session's subscription only; `ACK` | §43 |
 //! | CONTROL_PUT | the storage quota as for puts; [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
@@ -164,6 +164,7 @@ impl SessionFactory for Lfcp {
             pending: None,
             authenticated: None,
             subscriptions: HashMap::new(),
+            client: connection.client.clone(),
         }
     }
 }
@@ -200,6 +201,7 @@ pub struct LfcpSession {
     pending: Option<(HelloBody, ChallengeBody)>,
     authenticated: Option<Authenticated>,
     subscriptions: HashMap<ResourceId, Subscription>,
+    client: crate::limits::Client,
 }
 
 impl LfcpSession {
@@ -428,11 +430,21 @@ impl LfcpSession {
         // Server limits (POST-003), for a Resource not hosted yet: hosting
         // the same Genesis again changes nothing.
         let store = self.shared.coordinator.store();
+        let mut counted = false;
         match store.resource(resource_id).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 if let Err(failure) = self.may_host(host, genesis.len()).await {
                     return self.refuse_or_fail(out, request, failure);
+                }
+                // Keypairs are free: in quota mode, new Resources per client
+                // IP per day damp a Sybil flood.
+                if self.shared.hosting.quota(&host).is_some() {
+                    if !self.client.try_host() {
+                        let limit = (WireCode::RateLimited, refusal::HOSTS_PER_IP);
+                        return self.refuse(out, request, limit);
+                    }
+                    counted = true;
                 }
             }
             Err(error) => return self.internal(out, request, &error),
@@ -443,13 +455,16 @@ impl LfcpSession {
             host,
             durability: DURABILITY,
         };
-        match self
+        let hosted = self
             .shared
             .coordinator
             .store()
             .host_resource(genesis, hosting)
-            .await
-        {
+            .await;
+        if counted && !matches!(hosted, Ok(Put::Inserted)) {
+            self.client.cancel_host();
+        }
+        match hosted {
             Ok(_) => {
                 tracing::info!(conn = self.conn, resource = %resource_id.to_hex(), "hosted");
                 self.send(
