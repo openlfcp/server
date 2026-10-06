@@ -204,20 +204,15 @@ async fn bad_codes_proofs_and_expired_codes_are_refused() {
             .0,
         401
     );
-    // A challenge is single use, and one the server never issued fails.
+    // A wrong code with a valid proof; a challenge the server never
+    // issued fails.
     let c = challenge(server.addr).await;
     let body = with_code(proof(&bob, "pair", &id, &c), "AAAA-AAAA");
-    assert_eq!(
-        http(server.addr, "POST", "/setup/pair", None, Some(body.clone()))
-            .await
-            .0,
-        403
-    );
     assert_eq!(
         http(server.addr, "POST", "/setup/pair", None, Some(body))
             .await
             .0,
-        401
+        403
     );
     let body = with_code(proof(&bob, "pair", &id, &"00".repeat(32)), &code);
     assert_eq!(
@@ -273,6 +268,22 @@ async fn admin_endpoints_need_an_admin_session() {
     }
     // A non-admin Principal gets no session.
     assert_eq!(session(&server, &v.principal("bob")).await.0, 403);
+
+    // A session proof is single use (POST-003: challenges are stateless,
+    // the proof that opened a session is remembered).
+    let c = challenge(server.addr).await;
+    let body = proof(&carol, "session", server.server_id.as_bytes(), &c);
+    let (status, _) = http(
+        server.addr,
+        "POST",
+        "/admin/session",
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = http(server.addr, "POST", "/admin/session", None, Some(body)).await;
+    assert_eq!(status, 401, "a replayed session proof");
 
     let admin = token(&server, &carol).await;
     let (status, body) = http(server.addr, "GET", "/admin/status", Some(&admin), None).await;
@@ -448,6 +459,41 @@ async fn being_an_administrator_grants_no_resource_authority() {
         })
         .await;
     assert_eq!(nack(&client.recv().await.body), AUTHORIZATION_FAILED);
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_challenge_flood_does_not_lock_out_the_administrator() {
+    let v = Vectors::load();
+    let dir = state_dir("admin-flood");
+    // No per-IP admin rate here: the flood and the administrator share
+    // 127.0.0.1 (POST-003).
+    let server = start(
+        &dir,
+        Options {
+            abuse: Some(lfcp_server::limits::AbuseLimits {
+                admin_requests_per_ip_per_minute: 0,
+                ..Default::default()
+            }),
+            ..Options::default()
+        },
+    )
+    .await;
+    let code = server.setup_code.clone().unwrap();
+    let carol = v.principal("carol");
+    assert_eq!(pair(&server, &carol, &code).await.0, 200);
+    // A challenge issued before the flood stays valid through it.
+    let early = challenge(server.addr).await;
+    // Far more than the 1024 outstanding challenges 0.1.0 allowed.
+    for _ in 0..2000 {
+        challenge(server.addr).await;
+    }
+    let body = proof(&carol, "session", server.server_id.as_bytes(), &early);
+    let (status, body) = http(server.addr, "POST", "/admin/session", None, Some(body)).await;
+    assert_eq!(status, 200, "{body}");
+    token(&server, &carol).await;
+
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }

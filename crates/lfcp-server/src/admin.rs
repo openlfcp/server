@@ -18,10 +18,21 @@
 //! challenge opens a short session whose bearer token the server keeps only
 //! as a hash, in memory.
 //!
+//! Challenges are stateless (POST-003; security review M3): a challenge is
+//! its expiry, a random nonce and a MAC under a key drawn at start, so
+//! issuing one stores nothing and no flood of `POST /admin/challenge` can
+//! exhaust them for the administrator. A challenge is valid until it
+//! expires or the server restarts. A session proof is single use: only a
+//! proof that opened a session is remembered (until its challenge
+//! expires), so the memory is bounded by the administrators' own logins.
+//! A refused proof leaves nothing behind; the pairing is single use
+//! through its code. Floods are further bounded by the per-IP admin rate
+//! limit ([`crate::server`]).
+//!
 //! | Request | Answer |
 //! | --- | --- |
 //! | `GET /setup` | `{"paired", "server_id"}` |
-//! | `POST /admin/challenge` | `{"challenge", "expires_in_s"}`: single use |
+//! | `POST /admin/challenge` | `{"challenge", "expires_in_s"}`: stateless; a session proof over it is single use |
 //! | `POST /setup/pair` `{"code", "principal", "challenge", "proof"}` | `{"admin"}`; 403 wrong code, 410 no code or expired, 401 bad proof |
 //! | `POST /admin/session` `{"principal", "challenge", "proof"}` | `{"token", "expires_in_s"}`; 403 not an administrator |
 //! | `GET /admin/status` | server ID, limits, public URLs, durability, administrators, hosted Resource count |
@@ -75,9 +86,6 @@ pub const SETUP_CODE_FILE: &str = "setup-code";
 pub const SETUP_TTL: Duration = Duration::from_secs(60 * 60);
 /// How long a challenge may be answered.
 pub const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
-/// The most challenges outstanding at once; past it `POST /admin/challenge`
-/// gets 429 until some are used or expire (security review M3).
-pub const MAX_CHALLENGES: usize = 1024;
 /// How long an admin session lasts.
 pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 /// The largest request body the API reads.
@@ -181,29 +189,80 @@ struct Session {
     expires: Instant,
 }
 
-/// The outstanding challenges: single use, each valid for
-/// [`CHALLENGE_TTL`], at most [`MAX_CHALLENGES`].
-#[derive(Default)]
-struct Challenges(HashMap<[u8; 32], Instant>);
+/// Stateless challenges (see the module documentation): 8 bytes of
+/// expiry (whole seconds since `epoch`, big-endian), an 8-byte nonce, and
+/// the first 16 bytes of HMAC-SHA256 under `key` over those 16 bytes.
+struct Challenges {
+    key: [u8; 32],
+    epoch: Instant,
+    /// Challenges whose proof opened a session, until they expire.
+    used: Mutex<HashMap<[u8; 32], Instant>>,
+}
 
 impl Challenges {
-    /// Record `challenge` as issued at `now`, after dropping expired ones;
-    /// `false` when [`MAX_CHALLENGES`] are still outstanding.
-    fn issue(&mut self, challenge: [u8; 32], now: Instant) -> bool {
-        self.0.retain(|_, expires| *expires > now);
-        if self.0.len() >= MAX_CHALLENGES {
-            return false;
+    fn new(key: [u8; 32], epoch: Instant) -> Challenges {
+        Challenges {
+            key,
+            epoch,
+            used: Mutex::default(),
         }
-        self.0.insert(challenge, now + CHALLENGE_TTL);
-        true
     }
 
-    /// Consume `challenge`: whether it was issued and is unexpired.
-    fn take(&mut self, challenge: &[u8; 32], now: Instant) -> bool {
-        self.0
-            .remove(challenge)
-            .is_some_and(|expires| expires > now)
+    fn seconds(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_secs()
     }
+
+    fn mac(&self, head: &[u8]) -> [u8; 16] {
+        let mac = hmac_sha256(&self.key, head);
+        mac[..16].try_into().expect("16 bytes")
+    }
+
+    /// A challenge issued at `now` with `nonce`; nothing is stored.
+    fn issue(&self, nonce: [u8; 8], now: Instant) -> [u8; 32] {
+        let expires = self.seconds(now) + CHALLENGE_TTL.as_secs();
+        let mut challenge = [0u8; 32];
+        challenge[..8].copy_from_slice(&expires.to_be_bytes());
+        challenge[8..16].copy_from_slice(&nonce);
+        let mac = self.mac(&challenge[..16]);
+        challenge[16..].copy_from_slice(&mac);
+        challenge
+    }
+
+    /// When `challenge`, issued by this server and unexpired at `now`,
+    /// expires.
+    fn valid(&self, challenge: &[u8; 32], now: Instant) -> Option<Instant> {
+        let expected = self.mac(&challenge[..16]);
+        let differs = expected
+            .iter()
+            .zip(&challenge[16..])
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        let expires = u64::from_be_bytes(challenge[..8].try_into().expect("8 bytes"));
+        (differs == 0 && self.seconds(now) < expires)
+            .then(|| self.epoch + Duration::from_secs(expires))
+    }
+
+    /// Mark `challenge` used by an accepted proof: `false` if it already
+    /// was (a replay). Expired marks are dropped first.
+    fn spend(&self, challenge: &[u8; 32], now: Instant) -> bool {
+        let Some(expires) = self.valid(challenge, now) else {
+            return false;
+        };
+        let mut used = self.used.lock().expect("never poisoned");
+        used.retain(|_, until| *until > now);
+        used.insert(*challenge, expires).is_none()
+    }
+}
+
+/// HMAC-SHA256 (RFC 2104) of `message` under a 32-byte `key`.
+fn hmac_sha256(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
+    let mut inner = [0x36u8; 64];
+    let mut outer = [0x5cu8; 64];
+    for (i, byte) in key.iter().enumerate() {
+        inner[i] ^= byte;
+        outer[i] ^= byte;
+    }
+    let inner = lfcp::crypto::sha256_parts(&[&inner, message]);
+    *lfcp::crypto::sha256_parts(&[&outer, inner.as_bytes()]).as_bytes()
 }
 
 /// The setup/admin HTTP surface.
@@ -214,7 +273,7 @@ pub struct Admin {
     random: Arc<dyn Random>,
     hosting: Arc<ManagedHosting>,
     status: StatusInfo,
-    challenges: Mutex<Challenges>,
+    challenges: Challenges,
     sessions: Mutex<HashMap<[u8; 32], Session>>,
 }
 
@@ -270,6 +329,10 @@ impl Admin {
             None => HostingRule::Open,
         };
         let setup_file = config.state_dir.join(SETUP_CODE_FILE);
+        let mut challenge_key = [0u8; 32];
+        random
+            .fill(&mut challenge_key)
+            .map_err(AdminError::Random)?;
         let code = if store.admins().await?.is_empty() {
             let mut bytes = [0u8; 8];
             random.fill(&mut bytes).map_err(AdminError::Random)?;
@@ -298,7 +361,7 @@ impl Admin {
                 heartbeat_ms: config.heartbeat_ms,
                 public_urls: config.public_urls.clone(),
             },
-            challenges: Mutex::default(),
+            challenges: Challenges::new(challenge_key, Instant::now()),
             sessions: Mutex::new(HashMap::new()),
         };
         Ok((Arc::new(admin), code))
@@ -359,21 +422,9 @@ impl Admin {
                 ))
             }
             (&Method::POST, "/admin/challenge") => {
-                let mut challenge = [0u8; 32];
-                self.random
-                    .fill(&mut challenge)
-                    .map_err(|_| internal_msg())?;
-                let issued = self
-                    .challenges
-                    .lock()
-                    .expect("never poisoned")
-                    .issue(challenge, Instant::now());
-                if !issued {
-                    return Err(Failure(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "too many outstanding challenges; retry later",
-                    ));
-                }
+                let mut nonce = [0u8; 8];
+                self.random.fill(&mut nonce).map_err(|_| internal_msg())?;
+                let challenge = self.challenges.issue(nonce, Instant::now());
                 Ok(ok(json!({
                     "challenge": to_hex(&challenge),
                     "expires_in_s": CHALLENGE_TTL.as_secs(),
@@ -397,13 +448,14 @@ impl Admin {
         }
     }
 
-    /// A proof of `purpose` by the Principal in `request`, for a challenge
-    /// this server issued (and now consumes).
+    /// A proof of `purpose` by the Principal in `request`, for an
+    /// unexpired challenge this server issued. Returns the Principal and
+    /// the challenge.
     fn verify(
         &self,
         purpose: &str,
         request: &ProofRequest,
-    ) -> Result<PrincipalDescriptor, Failure> {
+    ) -> Result<(PrincipalDescriptor, [u8; 32]), Failure> {
         let bad = |message| Failure(StatusCode::BAD_REQUEST, message);
         let descriptor = from_hex(&request.principal)
             .ok()
@@ -414,14 +466,8 @@ impl Admin {
             .and_then(|b| b.try_into().ok())
             .ok_or_else(|| bad("challenge is not 32 hex bytes"))?;
         let proof = from_hex(&request.proof).map_err(|_| bad("proof is not hex"))?;
-        // The challenge is consumed whatever the outcome.
-        let issued = self
-            .challenges
-            .lock()
-            .expect("never poisoned")
-            .take(&challenge, Instant::now());
         let refused = Failure(StatusCode::UNAUTHORIZED, "proof refused");
-        if !issued {
+        if self.challenges.valid(&challenge, Instant::now()).is_none() {
             return Err(refused);
         }
         let transcript = cbor::encode(&Value::Array(vec![
@@ -436,12 +482,13 @@ impl Admin {
             return Err(refused);
         }
         cose::verify(&object, &descriptor).map_err(|_| refused)?;
-        Ok(descriptor)
+        Ok((descriptor, challenge))
     }
 
     async fn pair(&self, body: &[u8]) -> Result<Response<Full<Bytes>>, Failure> {
         let request: PairRequest = parse(body)?;
-        let descriptor = self.verify("pair", &request.proof)?;
+        // Single use through the code: a pairing destroys it.
+        let (descriptor, _) = self.verify("pair", &request.proof)?;
         let outcome = self
             .store
             .pair_admin(
@@ -475,10 +522,14 @@ impl Admin {
 
     async fn session(&self, body: &[u8]) -> Result<Response<Full<Bytes>>, Failure> {
         let request: ProofRequest = parse(body)?;
-        let descriptor = self.verify("session", &request)?;
+        let (descriptor, challenge) = self.verify("session", &request)?;
         let admins = self.store.admins().await.map_err(internal)?;
         if !admins.contains(descriptor.id()) {
             return Err(Failure(StatusCode::FORBIDDEN, "not a server administrator"));
+        }
+        // A proof opens one session: a replay is refused.
+        if !self.challenges.spend(&challenge, Instant::now()) {
+            return Err(Failure(StatusCode::UNAUTHORIZED, "proof refused"));
         }
         let mut token = [0u8; 32];
         self.random.fill(&mut token).map_err(|_| internal_msg())?;
@@ -713,27 +764,42 @@ mod tests {
     }
 
     #[test]
-    fn challenges_are_single_use_bounded_and_expire() {
-        let mut challenges = Challenges::default();
+    fn hmac_matches_rfc_4231() {
+        // RFC 4231 test case 2 has a 4-byte key; its zero-padded 32-byte
+        // form is the same HMAC key (RFC 2104 pads short keys with zeros).
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(b"Jefe");
+        assert_eq!(
+            to_hex(&hmac_sha256(&key, b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn challenges_are_stateless_unforgeable_and_expire() {
         let now = Instant::now();
-        let id = |i: usize| {
-            let mut c = [0u8; 32];
-            c[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            c
-        };
-        for i in 0..MAX_CHALLENGES {
-            assert!(challenges.issue(id(i), now));
+        let challenges = Challenges::new([7; 32], now);
+        // Issuing stores nothing, however many.
+        for i in 0..100_000u64 {
+            challenges.issue(i.to_le_bytes(), now);
         }
-        assert!(!challenges.issue(id(MAX_CHALLENGES), now), "the cap");
-        // Using one frees its place; it cannot be used twice.
-        assert!(challenges.take(&id(0), now));
-        assert!(!challenges.take(&id(0), now));
-        assert!(challenges.issue(id(MAX_CHALLENGES), now));
-        // Expired challenges are refused and no longer count.
-        let later = now + CHALLENGE_TTL;
-        assert!(!challenges.take(&id(1), later));
-        assert!(challenges.issue(id(0), later));
-        assert_eq!(challenges.0.len(), 1);
+        assert!(challenges.used.lock().unwrap().is_empty());
+        let c = challenges.issue([1; 8], now);
+        assert!(challenges.valid(&c, now).is_some());
+        // Another key, a changed byte, or expiry: refused.
+        assert!(Challenges::new([8; 32], now).valid(&c, now).is_none());
+        for i in [0, 9, 20, 31] {
+            let mut forged = c;
+            forged[i] ^= 1;
+            assert!(challenges.valid(&forged, now).is_none(), "byte {i}");
+        }
+        assert!(challenges.valid(&c, now + CHALLENGE_TTL).is_none());
+        // Spending is single use, and the mark expires with the challenge.
+        assert!(challenges.spend(&c, now));
+        assert!(!challenges.spend(&c, now));
+        let d = challenges.issue([2; 8], now + CHALLENGE_TTL);
+        assert!(challenges.spend(&d, now + CHALLENGE_TTL));
+        assert_eq!(challenges.used.lock().unwrap().len(), 1, "c was dropped");
     }
 
     #[test]
