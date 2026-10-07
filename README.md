@@ -749,6 +749,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+The tests in `tests/process_restart.rs` start the `lfcp-server` binary. A
+test that panics or returns stops its server and removes the server's
+temporary files. A test process that is itself killed (SIGKILL, a CI
+timeout, Ctrl-C) takes its servers with it too: a watchdog `sh` started
+with each server sees its stdin pipe close, then kills the server and
+removes the files. The server has no test-only flag for this.
+
 ## Follow-ups
 
 - Optional built-in TLS (a `rustls` feature) for a single-binary

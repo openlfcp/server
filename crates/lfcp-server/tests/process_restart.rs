@@ -6,6 +6,15 @@
 //! `synchronous = FULL`, so up to what SQLite and fsync guarantee), keep
 //! its server ID, refuse stale and replayed state changes, and serve a
 //! catch-up that converges without duplicates.
+//!
+//! No server outlives its test. Each spawned process is a [`Process`]
+//! guard: dropped (a test that returns or panics), it kills and waits for
+//! the server. A test process that is itself killed (SIGKILL, a gate
+//! timeout, Ctrl-C) runs no destructor. A watchdog covers that case: a
+//! small `sh` reaper whose stdin is a pipe that only the test process
+//! holds. When that process dies, the kernel closes the pipe, `read` gets
+//! EOF, and the reaper kills the server and removes its state, config and
+//! log. This is test code only: the server has no test flag.
 
 #![cfg(unix)]
 
@@ -13,6 +22,7 @@ mod support;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,10 +32,75 @@ use support::durability::{populate, second_package, verify_after_restart, SNAPSH
 use support::lfcp::state_dir;
 use support::vectors::{Vectors, CHAIN};
 
-/// A running `lfcp-server` process.
+/// A running `lfcp-server` process: killed and waited for when dropped,
+/// and by its reaper if the test process dies first (see the module docs).
 struct Process {
     child: Child,
+    reaper: Child,
     addr: SocketAddr,
+}
+
+/// A state directory: it, its config, log and pid file are removed when
+/// dropped (also on panic).
+struct StateDir(PathBuf);
+
+impl Deref for StateDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for StateDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        for extension in ["toml", "log", "pid"] {
+            let _ = std::fs::remove_file(self.0.with_extension(extension));
+        }
+    }
+}
+
+/// What the reaper removes after killing the server: the state directory,
+/// its config and log, and the test's own directory when the state is
+/// inside one.
+fn leftovers(state: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        state.to_owned(),
+        state.with_extension("toml"),
+        state.with_extension("log"),
+        state.with_extension("pid"),
+    ];
+    if let Some(parent) = state.parent() {
+        if parent
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("lfcp-session-"))
+        {
+            paths.push(parent.to_owned());
+        }
+    }
+    paths
+}
+
+/// The watchdog for `pid`: waits for EOF on its stdin, which only this
+/// process holds, then kills `pid` and removes `paths`.
+fn reaper(pid: u32, paths: &[PathBuf]) -> Child {
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"read _line; kill -9 "$1" 2>/dev/null; shift; rm -rf -- "$@""#)
+        .arg("lfcp-server-reaper")
+        .arg(pid.to_string())
+        .args(paths)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
 }
 
 fn free_port() -> u16 {
@@ -63,12 +138,23 @@ fn spawn_with_output(state: &Path, output: impl Fn() -> Stdio, log_level: &str) 
         ),
     )
     .unwrap();
+    // stdin null: the server must not hold the reaper's pipe, or the pipe
+    // would never reach EOF.
     let child = Command::new(env!("CARGO_BIN_EXE_lfcp-server"))
         .args(["--config", config.to_str().unwrap()])
+        .stdin(Stdio::null())
         .stdout(output())
         .stderr(output())
         .spawn()
         .unwrap();
+    let reaper = reaper(child.id(), &leftovers(state));
+    // The guard exists before the wait, so a server that never turns
+    // healthy is killed too.
+    let process = Process {
+        child,
+        reaper,
+        addr,
+    };
     let started = Instant::now();
     while !healthy(addr) {
         assert!(
@@ -77,7 +163,21 @@ fn spawn_with_output(state: &Path, output: impl Fn() -> Stdio, log_level: &str) 
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    Process { child, addr }
+    process
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // The reaper first: closing its pipe would otherwise make it kill
+        // a process this guard has already waited for, and remove a state
+        // directory the next server of the test reuses.
+        let _ = self.reaper.kill();
+        let _ = self.reaper.wait();
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl Process {
@@ -159,15 +259,10 @@ async fn inspect_store(v: &Vectors, state: &Path) {
     }
 }
 
-fn fresh(name: &str) -> PathBuf {
-    let dir = state_dir(name);
+fn fresh(name: &str) -> StateDir {
+    let dir = StateDir(state_dir(name));
     let _ = std::fs::remove_file(dir.with_extension("toml"));
     dir
-}
-
-fn cleanup(dir: &Path) {
-    std::fs::remove_dir_all(dir).unwrap();
-    let _ = std::fs::remove_file(dir.with_extension("toml"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -184,7 +279,6 @@ async fn a_killed_server_keeps_every_acknowledged_object() {
     verify_after_restart(&v, second.addr, server_id, &second_kp).await;
     second.kill();
     inspect_store(&v, &dir).await;
-    cleanup(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -200,7 +294,6 @@ async fn a_gracefully_stopped_server_keeps_its_state() {
     verify_after_restart(&v, second.addr, server_id, &second_kp).await;
     second.terminate();
     inspect_store(&v, &dir).await;
-    cleanup(&dir);
 }
 
 #[test]
@@ -218,7 +311,6 @@ fn the_health_check_mode_reports_the_server_state() {
     assert!(check(), "healthy while running");
     process.kill();
     assert!(!check(), "unhealthy once killed");
-    cleanup(&dir);
 }
 
 /// LFCP-046, security review M6: the setup code goes only to a 0600 file
@@ -340,8 +432,6 @@ async fn the_setup_code_is_written_to_a_private_file_and_never_logged() {
     assert_eq!(text.matches("pairing code written to").count(), 1);
     assert!(!text.contains(&token), "the session token is never logged");
     assert!(text.contains("server administrator paired"));
-    std::fs::remove_file(&log).unwrap();
-    cleanup(&dir);
 }
 
 /// Security review L5: the state directories the server creates are 0700,
@@ -387,5 +477,68 @@ fn state_files_are_owner_only() {
     }
     assert_eq!(mode(&state), 0o755, "an existing directory keeps its mode");
     process.terminate();
-    cleanup(&root);
+}
+
+/// The parent role of [`a_killed_test_process_takes_its_server_with_it`]:
+/// a test process that starts a server, writes the server's pid and waits
+/// to be killed. A no-op unless that test runs it.
+#[test]
+fn orphan_parent_role() {
+    let Some(state) = std::env::var_os("LFCP_ORPHAN_STATE") else {
+        return;
+    };
+    let state = PathBuf::from(state);
+    let process = spawn(&state);
+    std::fs::write(state.with_extension("pid"), process.child.id().to_string()).unwrap();
+    std::thread::sleep(Duration::from_secs(120));
+}
+
+/// A test process killed with SIGKILL runs no destructor, yet its server
+/// exits: the reaper sees its pipe close, kills the server and removes the
+/// state, config and pid file.
+#[test]
+fn a_killed_test_process_takes_its_server_with_it() {
+    let dir = fresh("orphan");
+    let pid_file = dir.with_extension("pid");
+    let mut parent = Command::new(std::env::current_exe().unwrap())
+        .args(["orphan_parent_role", "--exact", "--test-threads=1"])
+        .env("LFCP_ORPHAN_STATE", &*dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            if !pid.is_empty() {
+                break pid;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the parent did not start its server"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive());
+    parent.kill().unwrap(); // SIGKILL: no destructor runs in the parent
+    parent.wait().unwrap();
+    let killed = Instant::now();
+    while alive() || dir.exists() {
+        assert!(
+            killed.elapsed() < Duration::from_secs(5),
+            "server {pid} outlived its test process"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!dir.with_extension("toml").exists());
 }
