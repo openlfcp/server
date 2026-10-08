@@ -17,15 +17,17 @@
 //!
 //! Not checked here, by design: AEAD (§26.3 step 6, client-local, N3), the
 //! HPKE recipient binding (N5) and the Data Profile (step 7). Actor hash
-//! chain gaps (§26.2) are the sync engine's; equivocation is detected when
-//! storing.
+//! chain gaps (§26.2) are the sync engine's; equivocation is detected, and
+//! a `previous` the server does not hold refused (§51.1,
+//! `UNKNOWN_PREVIOUS`), against the store under the Resource lock
+//! ([`crate::session`]).
 //!
 //! Server-local limits ([`IngestPolicy`]: quotas, rate limits) are not LFCP
 //! capabilities and fail with their own codes.
 
 use lfcp::base::{DataUnitId, Error, Hash32, PrincipalId, ResourceId, WireCode};
 use lfcp::wire::control::authority::{data_unit_policy, key_package_policy, snapshot_policy};
-use lfcp::wire::data_unit::ReceivedDataUnit;
+use lfcp::wire::data_unit::{DataUnitHeader, ReceivedDataUnit};
 use lfcp::wire::key_package::ReceivedKeyPackage;
 use lfcp::wire::snapshot::ReceivedSnapshot;
 
@@ -40,6 +42,9 @@ pub struct ValidUnit {
     pub actor: PrincipalId,
     /// The actor sequence.
     pub sequence: u64,
+    /// The unit's authenticated header, for the `previous` link check
+    /// (§51.1).
+    pub header: DataUnitHeader,
 }
 
 /// Validate a Data Unit of `resource` (§26.3 steps 1–5, §51).
@@ -59,6 +64,7 @@ pub fn data_unit(chain: &Chain, resource: ResourceId, bytes: &[u8]) -> Result<Va
         id,
         actor: header.actor,
         sequence: header.sequence,
+        header,
     })
 }
 

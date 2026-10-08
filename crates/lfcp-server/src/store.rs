@@ -529,6 +529,56 @@ impl Store {
         .await
     }
 
+    /// The actor and sequence of the stored Data Unit `id` of `resource`,
+    /// equivocation evidence included (WIRE-01 §51.1).
+    pub async fn data_unit_position(
+        &self,
+        resource: ResourceId,
+        id: Hash32,
+    ) -> Result<Option<(PrincipalId, u64)>, StoreError> {
+        self.call(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT actor, seq FROM data_units WHERE resource_id = ?1 AND unit_id = ?2",
+                    params![resource.as_bytes().as_slice(), id.as_bytes().as_slice()],
+                    |row| {
+                        Ok((
+                            PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                            row.get::<_, i64>(1)? as u64,
+                        ))
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Whether a Data Unit of `actor` is stored at a sequence `s` with
+    /// `low < s < high` (WIRE-01 §51.1).
+    pub async fn data_unit_between(
+        &self,
+        resource: ResourceId,
+        actor: PrincipalId,
+        low: u64,
+        high: u64,
+    ) -> Result<bool, StoreError> {
+        let (low, high) = (i64_of(low)?, i64_of(high.min(i64::MAX as u64))?);
+        self.call(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM data_units
+                 WHERE resource_id = ?1 AND actor = ?2 AND seq > ?3 AND seq < ?4)",
+                params![
+                    resource.as_bytes().as_slice(),
+                    actor.as_bytes().as_slice(),
+                    low,
+                    high
+                ],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .await
+    }
+
     /// A stored Data Unit's exact bytes.
     pub async fn data_unit(&self, id: Hash32) -> Result<Option<Vec<u8>>, StoreError> {
         self.call(move |conn| {

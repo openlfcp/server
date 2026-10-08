@@ -1236,3 +1236,283 @@ async fn ingested_objects_stay_opaque() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+const UNKNOWN_PREVIOUS: u64 = 23;
+
+/// A Snapshot by BOB whose frontier is `frontier_cbor` (a canonical
+/// frontier, as the data_put_previous vectors give it).
+fn snapshot_with_frontier(v: &Vectors, frontier_cbor: &[u8]) -> Vec<u8> {
+    let bob = v.principal("bob");
+    let value = lfcp::cbor::decode_strict(frontier_cbor).unwrap();
+    let header = SnapshotHeader {
+        resource_id: v.resource(),
+        data_epoch: 1,
+        publisher: *bob.descriptor().id(),
+        sequence: 1,
+        control_head: head_hash(v.record_id("C10_revoke_grandchild")),
+        frontier: Frontier::from_value(&value).unwrap(),
+    };
+    Snapshot::seal(header, b"snapshot", &Dek::from_bytes([6; 32]), &bob)
+        .unwrap()
+        .signed_object()
+        .bytes()
+        .to_vec()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_put_whose_previous_the_server_lost_is_refused() {
+    // WIRE-01 §51.1 (mvp-0.1-baseline.9, ADR 0008 (b)): each
+    // data_put_previous vector against a server holding its stored units
+    // and Snapshot, through a session of another Principal than the actor.
+    let v = Vectors::load();
+    let cases: Vec<serde_json::Value> = v.json()["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "data_put_previous")
+        .cloned()
+        .collect();
+    assert_eq!(cases.len(), 8);
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        let (server, _dir) = chain_server(&v, &format!("prev-{id}"), 10, Options::default()).await;
+        let inputs = case["inputs"].as_object().unwrap();
+        let hex_of = |value: &serde_json::Value| {
+            lfcp::base::from_hex(value["hex"].as_str().unwrap()).unwrap()
+        };
+        let stored: Vec<Vec<u8>> = inputs
+            .iter()
+            .filter(|(k, _)| k.starts_with("stored_") && k.ends_with("_cose"))
+            .map(|(_, value)| hex_of(value))
+            .collect();
+        if !stored.is_empty() {
+            server.store.put_data_units(stored).await.unwrap();
+        }
+        if let Some(frontier) = inputs.get("stored_snapshot_frontier") {
+            let snapshot = snapshot_with_frontier(&v, &hex_of(frontier));
+            server.store.put_snapshot(snapshot).await.unwrap();
+        }
+        let message =
+            Message::decode(&hex_of(&inputs["message_cbor"]), &Default::default()).unwrap();
+        let Body::DataPut { units, .. } = message.body else {
+            panic!("{id}: not a DATA_PUT")
+        };
+        let mut session = client(&server, &v.principal("bob")).await;
+        let request = session.request(data_put(&v, units.clone())).await;
+        let reply = session.recv().await;
+        assert_eq!(reply.correlation_id, Some(request), "{id}");
+        let expected = &case["expected"];
+        if expected["valid"] == true {
+            assert!(matches!(reply.body, Body::Ack(_)), "{id}: {:?}", reply.body);
+            for unit in &units {
+                let unit_id = ReceivedDataUnit::parse(unit).unwrap().id();
+                let stored = server
+                    .store
+                    .data_unit(Hash32::from_bytes(*unit_id.as_bytes()))
+                    .await
+                    .unwrap();
+                assert_eq!(stored.as_ref(), Some(unit), "{id}: stored");
+            }
+        } else {
+            let Body::Nack(body) = &reply.body else {
+                panic!("{id}: expected a NACK, got {:?}", reply.body)
+            };
+            assert_eq!(body.code, UNKNOWN_PREVIOUS, "{id}: code");
+            let details = body.details.as_ref().and_then(|d| d.as_bytes()).unwrap();
+            assert_eq!(
+                details,
+                hex_of(&expected["error"]["details"]),
+                "{id}: details"
+            );
+            for unit in &units {
+                let unit_id = ReceivedDataUnit::parse(unit).unwrap().id();
+                if inputs.values().any(|value| {
+                    value
+                        .get("hex")
+                        .is_some_and(|h| h == &lfcp::base::to_hex(unit))
+                }) {
+                    continue; // stored before the put
+                }
+                let stored = server
+                    .store
+                    .data_unit(Hash32::from_bytes(*unit_id.as_bytes()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    stored, None,
+                    "{id}: nothing of a refused DATA_PUT is stored"
+                );
+            }
+        }
+    }
+}
+
+/// `count` units of BOB from sequence 1, chained, in epoch 0 at C5.
+fn bob_chain(v: &Vectors, count: u64) -> Vec<DataUnit> {
+    let bob = v.principal("bob");
+    let mut previous = None;
+    (1..=count)
+        .map(|sequence| {
+            let unit = DataUnit::seal(
+                DataUnitHeader {
+                    resource_id: v.resource(),
+                    data_epoch: 0,
+                    actor: *bob.descriptor().id(),
+                    sequence,
+                    previous,
+                    control_head: head_hash(v.record_id("C5_route_update")),
+                },
+                format!("unit {sequence}").as_bytes(),
+                &Dek::from_bytes([9; 32]),
+                &bob,
+            )
+            .unwrap();
+            previous = Some(unit.id());
+            unit
+        })
+        .collect()
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_server_refuses_the_next_unit_until_the_lost_one_is_relayed() {
+    // ADR 0008, the drill: units 1–3 are backed up, 4 is acknowledged and
+    // then lost to a restore. The writer's unit 5 names 4: refused with
+    // UNKNOWN_PREVIOUS (WIRE-01 §51.1) instead of wedging readers. Another
+    // Principal relays 4 (§68.1, §84); then 5 is accepted.
+    let v = Vectors::load();
+    let units = bob_chain(&v, 5);
+    let bytes = |i: usize| units[i].signed_object().bytes().to_vec();
+    let stored = |server: &Running, i: usize| {
+        let store = server.store.clone();
+        let id = Hash32::from_bytes(*units[i].id().as_bytes());
+        async move { store.data_unit(id).await.unwrap().is_some() }
+    };
+    let (server, dir) = chain_server(&v, "drill", 5, Options::default()).await;
+    let mut bob = client(&server, &v.principal("bob")).await;
+    for i in 0..3 {
+        assert_eq!(
+            reply_code_or_ack(&mut bob, data_put(&v, vec![bytes(i)])).await,
+            None
+        );
+    }
+    server.stop().await;
+    let backup = state_dir("drill-backup");
+    copy_dir(&dir, &backup);
+
+    let server = start(&dir, Options::default()).await;
+    let mut bob = client(&server, &v.principal("bob")).await;
+    assert_eq!(
+        reply_code_or_ack(&mut bob, data_put(&v, vec![bytes(3)])).await,
+        None
+    );
+    server.stop().await;
+
+    // The restore: the store as it was before unit 4.
+    std::fs::remove_dir_all(&dir).unwrap();
+    copy_dir(&backup, &dir);
+    let server = start(&dir, Options::default()).await;
+    assert!(!stored(&server, 3).await, "unit 4 is lost");
+
+    let mut bob = client(&server, &v.principal("bob")).await;
+    let id = bob.request(data_put(&v, vec![bytes(4)])).await;
+    let reply = bob.recv().await;
+    assert_eq!(reply.correlation_id, Some(id));
+    let Body::Nack(body) = &reply.body else {
+        panic!("expected a NACK, got {:?}", reply.body)
+    };
+    assert_eq!(body.code, UNKNOWN_PREVIOUS);
+    assert_eq!(
+        body.details.as_ref().and_then(|d| d.as_bytes()),
+        Some(units[3].id().as_bytes().as_slice()),
+        "the details name the lost unit"
+    );
+    assert!(!stored(&server, 4).await, "unit 5 is not stored");
+
+    // CAROL relays BOB's unit 4: the server authorizes the object, not the
+    // session that uploads it.
+    let mut carol = client(&server, &v.principal("carol")).await;
+    assert_eq!(
+        reply_code_or_ack(&mut carol, data_put(&v, vec![bytes(3)])).await,
+        None
+    );
+    assert_eq!(
+        reply_code_or_ack(&mut bob, data_put(&v, vec![bytes(4)])).await,
+        None
+    );
+    for i in 0..5 {
+        assert!(stored(&server, i).await, "unit {}", i + 1);
+    }
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&backup);
+}
+
+/// `None` for an ACK, else the NACK's code.
+async fn reply_code_or_ack(client: &mut Client, body: Body) -> Option<u64> {
+    let id = client.request(body).await;
+    let reply = client.recv().await;
+    assert_eq!(reply.correlation_id, Some(id));
+    match reply.body {
+        Body::Ack(_) => None,
+        _ => Some(code(&reply)),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn any_session_may_relay_a_validly_signed_object() {
+    // WIRE-01 §84 (mvp-0.1-baseline.9, ADR 0008): the server authorizes the
+    // uploaded object, not the session. OWNER's session uploads CAROL's
+    // Control Record C10, BOB's Key Package for CAROL and BOB's Snapshot.
+    let v = Vectors::load();
+    // C5 moves the Control Coordinator to sync-b.
+    let options = Options {
+        public_urls: vec![SYNC_A.into(), SYNC_B.into()],
+        ..Options::default()
+    };
+    let (server, _dir) = chain_server(&v, "relay", 9, options).await;
+    let mut owner = client(&server, &v.principal("owner")).await;
+    owner
+        .request(Body::ControlPut {
+            resource_id: v.resource(),
+            expected_head: v.record_id("C9_grant_invite_grandchild"),
+            record: v.cose("C10_revoke_grandchild"),
+        })
+        .await;
+    assert_eq!(
+        owner.recv().await.body,
+        ack(23, vec![head_hash(v.record_id("C10_revoke_grandchild"))]),
+        "CAROL's record"
+    );
+    owner
+        .request(Body::KeyPackagePut {
+            resource_id: v.resource(),
+            packages: vec![v.cose("KPC_carol_epoch1")],
+        })
+        .await;
+    assert_eq!(
+        owner.recv().await.body,
+        ack(42, vec![id_of(&v, "KPC_carol_epoch1", "package_id")]),
+        "BOB's Key Package"
+    );
+    let snapshot = v.cose("SNAPSHOT-01");
+    owner
+        .request(Body::SnapshotPut {
+            resource_id: v.resource(),
+            snapshot: snapshot.clone(),
+        })
+        .await;
+    assert_eq!(
+        owner.recv().await.body,
+        ack(52, vec![ReceivedSnapshot::parse(&snapshot).unwrap().id()]),
+        "BOB's Snapshot"
+    );
+}

@@ -15,7 +15,7 @@
 //! | CONTROL_PUT | the storage floor and quota as for puts, with the control reserve (revocation always gets through, [`crate::limits::WriteClass`]); [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
 //! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows | §44 |
 //! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)` | §45, §46 |
-//! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details), then the storage floor ([`crate::limits::Floor`]) and the storage quota of the hosting Principal and of the Resource (`NACK(QUOTA_EXCEEDED)` with a diagnostic), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60, §84 |
+//! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | from any authenticated session: the object is authorized, not the uploader (relay, §84); every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details); for DATA_PUT, equivocation (stored as evidence, `NACK(ACTOR_EQUIVOCATION)`), then each `previous` held, earlier in the put or covered by a stored Snapshot, else `NACK(UNKNOWN_PREVIOUS)` naming it (§51.1); then the storage floor ([`crate::limits::Floor`]) and the storage quota of the hosting Principal and of the Resource (`NACK(QUOTA_EXCEEDED)` with a diagnostic), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60, §84 |
 //! | an equivocating Data Unit | only the equivocating units of the request are stored, as evidence; none is accepted or pushed; `NACK(ACTOR_EQUIVOCATION)` | §26.2, §51 |
 //! | DATA_HAVE | the client's Have must normalize; answered with the server's | §48 |
 //! | DATA_GET / KEY_PACKAGE_GET / SNAPSHOT_GET | more than 256 ranges or 256 distinct epochs is `NACK(MALFORMED_MESSAGE)` before any lookup, and overlapping ranges are merged; read authority; Key Packages only to their recipient; size-limited batches; no stored Snapshot is `NACK(MISSING_DEPENDENCY)` | §49, §52, §55 |
@@ -40,11 +40,12 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use lfcp::base::{ControlRecordId, Error, Hash32, PrincipalId, ResourceId, WireCode};
+use lfcp::base::{ControlRecordId, DataUnitId, Error, Hash32, PrincipalId, ResourceId, WireCode};
 use lfcp::cbor::Value;
 use lfcp::principal::PrincipalDescriptor;
 use lfcp::wire::control::authority::validate_authorized;
 use lfcp::wire::control::chain::ChainOutcome;
+use lfcp::wire::data_unit::{check_put_previous, StoredUnits};
 use lfcp::wire::have::HaveVector;
 use lfcp::wire::message::DataRange;
 use lfcp::wire::message::{
@@ -907,6 +908,17 @@ impl LfcpSession {
             drop(locked);
             return self.nack(out, request, WireCode::ActorEquivocation).await;
         }
+        // §51.1: every `previous` is stored, earlier in this put, or
+        // covered by a stored Snapshot; otherwise nothing is stored.
+        match previous_links(store, resource_id, &valid).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                drop(locked);
+                tracing::info!(conn = self.conn, %error, "DATA_PUT with an unknown previous");
+                return self.nack_error(out, request, &error).await;
+            }
+            Err(error) => return self.internal(out, request, &error).await,
+        }
         let puts = match store.put_data_units(units.clone()).await {
             Ok(puts) => puts,
             Err(error) => return self.internal(out, request, &error).await,
@@ -1501,6 +1513,83 @@ fn have_of(sequences: &[(PrincipalId, u64)]) -> Vec<WireActorHave> {
         let _ = have.insert(actor, *sequence);
     }
     have.to_wire()
+}
+
+/// What the store holds for the `previous` links of a `DATA_PUT`
+/// (WIRE-01 §51.1), read ahead so that sdk-rs's check runs without I/O.
+#[derive(Default)]
+struct PreviousFacts {
+    positions: HashMap<DataUnitId, (PrincipalId, u64)>,
+    snapshots: HaveVector,
+    between: HashSet<(PrincipalId, u64, u64)>,
+}
+
+impl StoredUnits for PreviousFacts {
+    fn stored_sequence(&self, actor: &PrincipalId, id: &DataUnitId) -> Option<u64> {
+        self.positions
+            .get(id)
+            .filter(|(a, _)| a == actor)
+            .map(|&(_, seq)| seq)
+    }
+
+    fn snapshot_covered_below(&self, actor: &PrincipalId, below: u64) -> Option<u64> {
+        self.snapshots.highest_below(actor, below)
+    }
+
+    fn stores_between(&self, actor: &PrincipalId, low: u64, high: u64) -> bool {
+        self.between.contains(&(*actor, low, high))
+    }
+}
+
+/// §51.1 for the validated units of one `DATA_PUT`, in message order: the
+/// outer error is the store's, the inner one the refusal
+/// (`UNKNOWN_PREVIOUS`). The Snapshot frontiers are read only when a
+/// `previous` is neither stored nor earlier in the put.
+async fn previous_links(
+    store: &Store,
+    resource: ResourceId,
+    units: &[ingest::ValidUnit],
+) -> Result<Result<(), Error>, StoreError> {
+    let mut facts = PreviousFacts::default();
+    let mut earlier: HashSet<DataUnitId> = HashSet::new();
+    let mut snapshots_read = false;
+    for unit in units {
+        if let Some(previous) = unit.header.previous {
+            if !earlier.contains(&previous) && !facts.positions.contains_key(&previous) {
+                let id = Hash32::from_bytes(*previous.as_bytes());
+                if let Some(position) = store.data_unit_position(resource, id).await? {
+                    facts.positions.insert(previous, position);
+                }
+            }
+            if facts.stored_sequence(&unit.actor, &previous).is_none()
+                && !earlier.contains(&previous)
+            {
+                if !snapshots_read {
+                    for stored in store.snapshots(resource).await? {
+                        if let Ok(snapshot) = ReceivedSnapshot::parse(&stored.bytes) {
+                            facts
+                                .snapshots
+                                .merge(&HaveVector::from_frontier(&snapshot.header().frontier));
+                        }
+                    }
+                    snapshots_read = true;
+                }
+                if let Some(m) = facts.snapshot_covered_below(&unit.actor, unit.sequence) {
+                    if store
+                        .data_unit_between(resource, unit.actor, m, unit.sequence)
+                        .await?
+                    {
+                        facts.between.insert((unit.actor, m, unit.sequence));
+                    }
+                }
+            }
+        }
+        earlier.insert(unit.id);
+    }
+    Ok(check_put_previous(
+        units.iter().map(|u| (u.id, &u.header)),
+        &facts,
+    ))
 }
 
 #[cfg(test)]

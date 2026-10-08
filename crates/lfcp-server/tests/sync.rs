@@ -175,14 +175,16 @@ async fn populated(
     let bob = units(v, &v.principal("bob"), 600, "C5_route_update");
     let owner = units(v, &v.principal("owner"), 40, "C1_grant_bob");
     let mut writer = reader(&server, &v.principal("bob")).await;
-    let stored: Vec<Vec<u8>> = bob
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !(520..529).contains(i))
-        .map(|(_, u)| u.clone())
-        .collect();
-    put_all(v, &mut writer, &stored).await;
+    put_all(v, &mut writer, &bob[..520]).await;
     put_all(v, &mut writer, &owner).await;
+    // Unit 530 names 529, which the server lacks: a DATA_PUT of it is
+    // refused (WIRE-01 §51.1), so the units after the hole are seeded into
+    // the store, as a server that lost 521–529 would hold them.
+    server
+        .store
+        .put_data_units(bob[529..].to_vec())
+        .await
+        .unwrap();
     (server, dir, bob, owner)
 }
 

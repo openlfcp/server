@@ -12,6 +12,12 @@ impl Vectors {
     pub fn load() -> Vectors {
         Vectors(Spec::open().read_json("test-vectors/lfcp-wire-01/LFCP-TEST-VECTORS-01.json"))
     }
+    /// The whole suite.
+    #[allow(dead_code)]
+    pub fn json(&self) -> &Json {
+        &self.0
+    }
+
     pub fn case(&self, id: &str) -> &Json {
         self.0["cases"]
             .as_array()
