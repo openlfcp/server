@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "lfcp-admin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom",
  "lfcp",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "lfcp-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fs4",
  "futures-util",
