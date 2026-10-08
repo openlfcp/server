@@ -7,3 +7,12 @@ version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/openlfcp/server"
+
+# Automerge is a dev-dependency only (tests/sections.rs builds section
+# units with sdk-rs). Unoptimized it takes minutes for a 200-Task section,
+# so test builds optimize it; the server binary does not contain it.
+[profile.dev.package.automerge]
+opt-level = 3
+
+[profile.dev.package.hexane]
+opt-level = 3
