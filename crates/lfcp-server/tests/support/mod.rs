@@ -6,5 +6,6 @@
 pub mod admin;
 pub mod durability;
 pub mod lfcp;
+pub mod sections;
 pub mod spec;
 pub mod vectors;

@@ -10,247 +10,29 @@
 mod support;
 
 use automerge::ActorId;
-use lfcp::base::{Hash32, ObjectId, PrincipalId, ResourceId};
+use lfcp::base::{ObjectId, ResourceId};
 use lfcp::principal::PrincipalKeys;
 use lfcp::shared_objects::document::{NewTask, SharedObjects};
 use lfcp::shared_objects::framing;
 use lfcp::shared_sections::{self, NewNode, Received, SectionsDoc, SectionsReplica};
-use lfcp::wire::control::body::{ControlBody, Endpoint, GenesisBody};
-use lfcp::wire::control::{ControlRecord, ControlRecordHeader, ReceivedControlRecord};
-use lfcp::wire::data_unit::{DataUnit, DataUnitHeader, ReceivedDataUnit};
 use lfcp::wire::frontier::{ActorHave, Frontier};
-use lfcp::wire::keys::Dek;
-use lfcp::wire::message::{AckBody, Body, DataRange};
+use lfcp::wire::message::{AckBody, Body};
 use lfcp::wire::snapshot::{ReceivedSnapshot, Snapshot, SnapshotHeader};
 use lfcp_server::config::MIN_MESSAGE_BYTES;
 use support::lfcp::{code, start, state_dir, Client, Options, Running};
+use support::sections::{
+    alice, dek, genesis, get_all, head, host, open, put_all, seal_all, section_import, unit_id,
+    uuid, SECTION, SECTIONS,
+};
 
-const SECTIONS: &str = "org.openlfcp.shared-sections.v1";
 const OBJECTS: &str = "org.openlfcp.shared-objects.v1";
 const MESSAGE_TOO_LARGE: u64 = 19;
-const DATA_PUT: u64 = 33;
 const SNAPSHOT_PUT: u64 = 52;
-
-const SECTION: &str = "019a2f85-7b31-7c42-8000-000000000001";
-
-/// A canonical UUIDv7 for test object `n` of kind `k`.
-fn uuid(k: u16, n: u32) -> String {
-    format!("019a2f85-7b31-7c42-{:04x}-{n:012x}", 0x8000 | k)
-}
-
-fn alice() -> PrincipalKeys {
-    PrincipalKeys::from_secrets(&[1; 32], [2; 32])
-}
-
-fn dek() -> Dek {
-    Dek::from_bytes([9; 32])
-}
-
-/// The Genesis of `resource`, owned by `owner`, with `profile`.
-fn genesis(owner: &PrincipalKeys, resource: ResourceId, profile: &str) -> Vec<u8> {
-    let url = "wss://sync.example.test/v1/ws".to_owned();
-    ControlRecord::sign(
-        ControlRecordHeader {
-            resource_id: resource,
-            sequence: 0,
-            previous: None,
-            issuer: *owner.descriptor().id(),
-        },
-        ControlBody::Genesis(GenesisBody {
-            data_profile: profile.into(),
-            owner: owner.descriptor().clone(),
-            dek_commitment: Hash32::from_bytes([3; 32]),
-            endpoints: vec![Endpoint {
-                url: url.clone(),
-                priority: 0,
-                flags: None,
-            }],
-            coordinator: url,
-        }),
-        owner,
-    )
-    .unwrap()
-    .signed_object()
-    .bytes()
-    .to_vec()
-}
-
-/// The Control Head a Genesis makes.
-fn head(genesis: &[u8]) -> Hash32 {
-    Hash32::from_bytes(
-        *ReceivedControlRecord::parse(genesis)
-            .unwrap()
-            .id()
-            .as_bytes(),
-    )
-}
-
-/// Each plaintext as `owner`'s next Data Unit at epoch 0, chained by
-/// `previous` (WIRE-01 §51.1).
-fn seal_all(
-    owner: &PrincipalKeys,
-    resource: ResourceId,
-    control_head: Hash32,
-    plaintexts: &[Vec<u8>],
-) -> Vec<Vec<u8>> {
-    let mut previous = None;
-    plaintexts
-        .iter()
-        .enumerate()
-        .map(|(i, plaintext)| {
-            let unit = DataUnit::seal(
-                DataUnitHeader {
-                    resource_id: resource,
-                    data_epoch: 0,
-                    actor: *owner.descriptor().id(),
-                    sequence: i as u64 + 1,
-                    previous,
-                    control_head,
-                },
-                plaintext,
-                &dek(),
-                owner,
-            )
-            .unwrap();
-            previous = Some(unit.id());
-            unit.signed_object().bytes().to_vec()
-        })
-        .collect()
-}
-
-/// The plaintext of a served unit, as a client reads it: signature first.
-fn open(bytes: &[u8], author: &PrincipalKeys) -> Vec<u8> {
-    ReceivedDataUnit::parse(bytes)
-        .unwrap()
-        .verify(author.descriptor())
-        .unwrap()
-        .open(&dek())
-        .unwrap()
-}
-
-fn unit_id(bytes: &[u8]) -> Hash32 {
-    Hash32::from_bytes(*ReceivedDataUnit::parse(bytes).unwrap().id().as_bytes())
-}
 
 async fn client(server: &Running, keys: &PrincipalKeys) -> Client {
     let mut client = Client::connect(server.addr).await;
     client.handshake(keys).await;
     client
-}
-
-async fn host(client: &mut Client, genesis: Vec<u8>) {
-    client
-        .request(Body::ResourceHost {
-            genesis,
-            hosting_credential: None,
-        })
-        .await;
-    let reply = client.recv().await;
-    assert!(
-        matches!(reply.body, Body::ResourceHosted { durability: 2, .. }),
-        "{:?}",
-        reply.body
-    );
-}
-
-/// Puts `units` in DATA_PUTs of at most `per_put` units and checks that
-/// every unit is acknowledged as durable.
-async fn put_all(client: &mut Client, resource: ResourceId, units: &[Vec<u8>], per_put: usize) {
-    for chunk in units.chunks(per_put) {
-        client
-            .request(Body::DataPut {
-                resource_id: resource,
-                units: chunk.to_vec(),
-            })
-            .await;
-        let reply = client.recv().await;
-        let Body::Ack(AckBody {
-            request_type,
-            object_ids: Some(mut ids),
-            durable,
-        }) = reply.body
-        else {
-            panic!("expected ACK, got {:?}", reply.body)
-        };
-        assert_eq!(request_type, DATA_PUT);
-        assert_eq!(durable, Some(true));
-        let mut want: Vec<Hash32> = chunk.iter().map(|u| unit_id(u)).collect();
-        ids.sort_by_key(|h| *h.as_bytes());
-        want.sort_by_key(|h| *h.as_bytes());
-        assert_eq!(ids, want);
-    }
-}
-
-/// Every unit of `actor` from 1 to `count`, as the server serves them, in
-/// the pages it sends (WIRE-01 §49).
-async fn get_all(
-    client: &mut Client,
-    resource: ResourceId,
-    actor: PrincipalId,
-    count: u64,
-) -> Vec<Vec<u8>> {
-    client
-        .request(Body::DataGet {
-            resource_id: resource,
-            ranges: vec![DataRange {
-                principal: actor,
-                start: 1,
-                end: count,
-            }],
-        })
-        .await;
-    let mut out = Vec::new();
-    while (out.len() as u64) < count {
-        let Body::DataBatch { units, .. } = client.recv().await.body else {
-            panic!("expected DATA_BATCH")
-        };
-        assert!(!units.is_empty());
-        out.extend(units);
-    }
-    out
-}
-
-/// A section of 200 Tasks, each with a paragraph of about 200 characters,
-/// written with sdk-rs: one change per intent (SHARED-SECTIONS-PROFILE-01
-/// §11), the section ready from its first change.
-fn section_import(resource: ResourceId, owner: &PrincipalId) -> (SectionsDoc, Vec<Vec<u8>>) {
-    let actor = shared_sections::actor_id(&resource, owner);
-    let (mut doc, first) = SectionsDoc::create(actor, SECTION, "Joint launch", owner).unwrap();
-    let mut changes = vec![first];
-    let mut after: Option<String> = None;
-    for i in 1..=200u32 {
-        let task = uuid(1, i);
-        let title = format!("Задача {i}: prepare the launch");
-        changes.push(
-            doc.create_node(
-                &task,
-                NewNode::Task { title: &title },
-                SECTION,
-                after.as_deref(),
-                &uuid(2, i),
-                owner,
-            )
-            .unwrap(),
-        );
-        let text = format!("Notes {i} 😀 ").repeat(16);
-        changes.push(
-            doc.create_node(
-                &uuid(3, i),
-                NewNode::Paragraph { text: &text },
-                &task,
-                None,
-                &uuid(4, i),
-                owner,
-            )
-            .unwrap(),
-        );
-        after = Some(task);
-    }
-    let plaintexts = changes
-        .iter()
-        .map(|c| framing::encode_change(c.raw_bytes()))
-        .collect();
-    (doc, plaintexts)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -262,7 +44,7 @@ async fn a_section_resource_is_hosted_stored_and_served_like_any_other() {
     let sections = ResourceId::from_bytes([0x5e; 32]);
     let sections_genesis = genesis(&owner, sections, SECTIONS);
     let started = std::time::Instant::now();
-    let (mut author, plaintexts) = section_import(sections, &owner_id);
+    let (mut author, plaintexts) = section_import(sections, &owner_id, 200);
     let units = seal_all(&owner, sections, head(&sections_genesis), &plaintexts);
     println!("sections: built in {:?}", started.elapsed());
 
