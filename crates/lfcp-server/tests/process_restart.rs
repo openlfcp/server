@@ -27,9 +27,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use automerge::ActorId;
+use lfcp::base::ResourceId;
+use lfcp::shared_sections::{Received, SectionsReplica};
+use lfcp::wire::message::Body;
 use lfcp_server::store::{Store, DATABASE_FILE};
-use support::durability::{populate, second_package, verify_after_restart, SNAPSHOTS, UNITS};
+use support::durability::{
+    populate, second_package, session, verify_after_restart, SNAPSHOTS, UNITS,
+};
 use support::lfcp::state_dir;
+use support::sections::{
+    alice, genesis, get_all, head, host, open, put_all, seal_all, section_import, SECTIONS,
+};
 use support::vectors::{Vectors, CHAIN};
 
 /// A running `lfcp-server` process: killed and waited for when dropped,
@@ -294,6 +303,62 @@ async fn a_gracefully_stopped_server_keeps_its_state() {
     verify_after_restart(&v, second.addr, server_id, &second_kp).await;
     second.terminate();
     inspect_store(&v, &dir).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_section_import_survives_a_kill_and_a_lost_ack() {
+    // LFCP-02-032 (WIRE-01 §37, §59, §70): a section's units, written by
+    // sdk-rs, through a killed server process. The acknowledged units
+    // survive byte for byte; a put whose ACK the client never read is sent
+    // again with the same bytes, whether or not the killed process had
+    // committed it, and every unit ends up stored once.
+    let owner = alice();
+    let owner_id = *owner.descriptor().id();
+    let resource = ResourceId::from_bytes([0x5e; 32]);
+    let genesis = genesis(&owner, resource, SECTIONS);
+    let (author, plaintexts) = section_import(resource, &owner_id, 40);
+    let units = seal_all(&owner, resource, head(&genesis), &plaintexts);
+    let (acked, unacked) = units.split_at(41);
+
+    let dir = fresh("sections-kill");
+    let first = spawn(&dir);
+    let (mut client, server_id) = session(first.addr, &owner).await;
+    host(&mut client, genesis).await;
+    put_all(&mut client, resource, acked, acked.len()).await;
+    // The second put is sent, and the process killed before its reply is
+    // read: the client cannot know whether it was committed.
+    client
+        .request(Body::DataPut {
+            resource_id: resource,
+            units: unacked.to_vec(),
+        })
+        .await;
+    first.kill();
+
+    let second = spawn(&dir);
+    let (mut client, id) = session(second.addr, &owner).await;
+    assert_eq!(id, server_id, "the server ID survives");
+    assert_eq!(
+        get_all(&mut client, resource, owner_id, acked.len() as u64).await,
+        acked,
+        "every acknowledged unit, exact bytes"
+    );
+    // A lost ACK is recovered by sending the same bytes: acknowledged
+    // units again, and the put of unknown outcome.
+    put_all(&mut client, resource, acked, acked.len()).await;
+    put_all(&mut client, resource, unacked, unacked.len()).await;
+    let all = get_all(&mut client, resource, owner_id, units.len() as u64).await;
+    assert_eq!(all, units, "each unit once, in order");
+
+    let mut replica = SectionsReplica::new(resource, ActorId::from([7u8; 32]));
+    for unit in &all {
+        assert_eq!(
+            replica.receive(&owner_id, &open(unit, &owner)),
+            Received::Applied
+        );
+    }
+    assert_eq!(replica.view().effective(), author.effective());
+    second.kill();
 }
 
 #[test]
