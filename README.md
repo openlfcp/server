@@ -94,6 +94,10 @@ acknowledged after its transaction commits.
   server exits with "the store is at schema version N, newer than this
   server supports". Rolling the server back across a schema change
   therefore needs a backup made by the older version.
+- A damaged database (for example an ID column whose value is not 32
+  bytes, which the schema checks only when a row is written) fails the
+  read that meets it with "the store is corrupt (...); restore
+  server.sqlite3 from a backup"; the store keeps answering other reads.
 
 The server ID stays in its own file rather than in the database: it keeps
 its create-new and fsync semantics, it is readable by an operator, and

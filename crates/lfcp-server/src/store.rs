@@ -62,6 +62,10 @@ pub enum StoreError {
     OutOfRange,
     /// The connection thread has stopped.
     Closed,
+    /// The database holds a value its schema forbids (a damaged file): the
+    /// read fails with this error, the store stays open, and the operator
+    /// restores the database from a backup.
+    Corrupt(String),
     /// The database was written by a newer server: its schema version is
     /// above every migration this code knows. Nothing was written to it.
     NewerSchema {
@@ -84,6 +88,10 @@ impl fmt::Display for StoreError {
             }
             StoreError::OutOfRange => f.write_str("integer out of range"),
             StoreError::Closed => f.write_str("store closed"),
+            StoreError::Corrupt(what) => write!(
+                f,
+                "the store is corrupt ({what}); restore server.sqlite3 from a backup"
+            ),
             StoreError::NewerSchema { found, supported } => write!(
                 f,
                 "the store is at schema version {found}, newer than this server supports \
@@ -98,6 +106,11 @@ impl std::error::Error for StoreError {}
 
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> StoreError {
+        if let rusqlite::Error::FromSqlConversionFailure(_, _, inner) = &e {
+            if let Some(id) = inner.downcast_ref::<CorruptId>() {
+                return StoreError::Corrupt(id.to_string());
+            }
+        }
         StoreError::Sqlite(e.to_string())
     }
 }
@@ -203,9 +216,34 @@ fn i64_of(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::OutOfRange)
 }
 
-fn id32(blob: Vec<u8>) -> Hash32 {
-    Hash32::from_bytes(blob.try_into().expect("the schema checks 32-byte IDs"))
+/// A 32-byte ID column. The schema's `CHECK (length(...) = 32)` runs only
+/// when a row is written, so a damaged file can hold another length: that
+/// is [`StoreError::Corrupt`], never a panic of the store thread (fuzzing
+/// finding S1).
+fn id32(blob: Vec<u8>) -> rusqlite::Result<Hash32> {
+    let len = blob.len();
+    blob.try_into().map(Hash32::from_bytes).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            Box::new(CorruptId { len }),
+        )
+    })
 }
+
+/// An ID column read from the database whose length is not 32 bytes.
+#[derive(Debug)]
+struct CorruptId {
+    len: usize,
+}
+
+impl fmt::Display for CorruptId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "an ID of {} bytes, not 32", self.len)
+    }
+}
+
+impl std::error::Error for CorruptId {}
 
 impl Store {
     /// Open (or create) `<state_dir>/server.sqlite3`, configure it and run
@@ -304,7 +342,7 @@ impl Store {
                 )
                 .optional()?;
             if let Some(existing) = existing {
-                let existing = ControlRecordId::from_bytes(*id32(existing).as_bytes());
+                let existing = ControlRecordId::from_bytes(*id32(existing)?.as_bytes());
                 return if existing == id {
                     Ok(Put::Duplicate)
                 } else {
@@ -425,17 +463,22 @@ impl Store {
                     },
                 )
                 .optional()?;
-            Ok(row.map(|(genesis, head_id, seq, host, durability)| ResourceInfo {
-                genesis: ControlRecordId::from_bytes(*id32(genesis).as_bytes()),
-                head: Head {
-                    id: ControlRecordId::from_bytes(*id32(head_id).as_bytes()),
-                    seq: seq as u64,
+            row.map(
+                |(genesis, head_id, seq, host, durability)| -> Result<ResourceInfo, StoreError> {
+                    Ok(ResourceInfo {
+                        genesis: ControlRecordId::from_bytes(*id32(genesis)?.as_bytes()),
+                        head: Head {
+                            id: ControlRecordId::from_bytes(*id32(head_id)?.as_bytes()),
+                            seq: seq as u64,
+                        },
+                        hosting: Hosting {
+                            host: PrincipalId::from_bytes(*id32(host)?.as_bytes()),
+                            durability,
+                        },
+                    })
                 },
-                hosting: Hosting {
-                    host: PrincipalId::from_bytes(*id32(host).as_bytes()),
-                    durability,
-                },
-            }))
+            )
+            .transpose()
         })
         .await
     }
@@ -461,12 +504,14 @@ impl Store {
             )?;
             let rows = stmt.query_map(params![resource.as_bytes().as_slice(), from, to], |row| {
                 Ok(StoredControlRecord {
-                    id: ControlRecordId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                    id: ControlRecordId::from_bytes(*id32(row.get(0)?)?.as_bytes()),
                     seq: row.get::<_, i64>(1)? as u64,
                     previous: row
                         .get::<_, Option<Vec<u8>>>(2)?
-                        .map(|b| ControlRecordId::from_bytes(*id32(b).as_bytes())),
-                    issuer: PrincipalId::from_bytes(*id32(row.get(3)?).as_bytes()),
+                        .map(id32)
+                        .transpose()?
+                        .map(|h| ControlRecordId::from_bytes(*h.as_bytes())),
+                    issuer: PrincipalId::from_bytes(*id32(row.get(3)?)?.as_bytes()),
                     control_type: row.get::<_, i64>(4)? as u64,
                     bytes: row.get(5)?,
                 })
@@ -536,7 +581,7 @@ impl Store {
                 "SELECT unit_id FROM data_units WHERE resource_id = ?1 AND actor = ?2 AND seq = ?3 ORDER BY unit_id",
             )?;
             let rows = stmt.query_map(params![resource.as_bytes().as_slice(), actor.as_bytes().as_slice(), seq], |row| {
-                Ok(id32(row.get(0)?))
+                id32(row.get(0)?)
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
@@ -557,7 +602,7 @@ impl Store {
                     params![resource.as_bytes().as_slice(), id.as_bytes().as_slice()],
                     |row| {
                         Ok((
-                            PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                            PrincipalId::from_bytes(*id32(row.get(0)?)?.as_bytes()),
                             row.get::<_, i64>(1)? as u64,
                         ))
                     },
@@ -627,7 +672,7 @@ impl Store {
                 params![resource.as_bytes().as_slice(), actor.as_bytes().as_slice(), start, end],
                 |row| {
                     Ok(StoredObject {
-                        id: id32(row.get(0)?),
+                        id: id32(row.get(0)?)?,
                         bytes: row.get(1)?,
                     })
                 },
@@ -649,7 +694,7 @@ impl Store {
             )?;
             let rows = stmt.query_map([resource.as_bytes().as_slice()], |row| {
                 Ok((
-                    PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                    PrincipalId::from_bytes(*id32(row.get(0)?)?.as_bytes()),
                     row.get::<_, i64>(1)? as u64,
                 ))
             })?;
@@ -701,7 +746,7 @@ impl Store {
             )?;
             let rows = stmt.query_map(params![resource.as_bytes().as_slice(), epoch, recipient.as_bytes().as_slice()], |row| {
                 Ok(StoredObject {
-                    id: id32(row.get(0)?),
+                    id: id32(row.get(0)?)?,
                     bytes: row.get(1)?,
                 })
             })?;
@@ -762,7 +807,7 @@ impl Store {
             )?;
             let rows = stmt.query_map([resource.as_bytes().as_slice()], |row| {
                 Ok(StoredObject {
-                    id: id32(row.get(0)?),
+                    id: id32(row.get(0)?)?,
                     bytes: row.get(1)?,
                 })
             })?;
@@ -978,7 +1023,7 @@ impl Store {
         self.call(|conn| {
             let mut stmt = conn.prepare("SELECT principal FROM admins ORDER BY principal")?;
             let rows = stmt.query_map([], |row| {
-                Ok(PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()))
+                Ok(PrincipalId::from_bytes(*id32(row.get(0)?)?.as_bytes()))
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
@@ -1027,7 +1072,7 @@ impl Store {
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(ResourceSize {
-                    resource_id: ResourceId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                    resource_id: ResourceId::from_bytes(*id32(row.get(0)?)?.as_bytes()),
                     control_head_seq: row.get::<_, i64>(1)? as u64,
                     control_records: row.get::<_, i64>(2)? as u64,
                     data_units: row.get::<_, i64>(3)? as u64,
@@ -1059,7 +1104,7 @@ impl Store {
                     [resource.as_bytes().as_slice()],
                     |row| {
                         Ok(Usage {
-                            host: PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                            host: PrincipalId::from_bytes(*id32(row.get(0)?)?.as_bytes()),
                             resource_bytes: row.get::<_, i64>(1)? as u64,
                             host_resources: row.get::<_, i64>(2)? as u64,
                             host_bytes: row.get::<_, i64>(3)? as u64,
@@ -1106,7 +1151,7 @@ impl Store {
             let rows = stmt.query_map([], |row| {
                 let n = |i: usize| row.get::<_, Option<i64>>(i).map(|v| v.map(|v| v as u64));
                 Ok((
-                    PrincipalId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                    PrincipalId::from_bytes(*id32(row.get(0)?)?.as_bytes()),
                     QuotaOverride {
                         resources: n(1)?,
                         bytes: n(2)?,
@@ -1447,7 +1492,7 @@ fn head(conn: &Connection, resource: &ResourceId) -> Result<Option<Head>, StoreE
             [resource.as_bytes().as_slice()],
             |row| {
                 Ok(Head {
-                    id: ControlRecordId::from_bytes(*id32(row.get(0)?).as_bytes()),
+                    id: ControlRecordId::from_bytes(*id32(row.get(0)?)?.as_bytes()),
                     seq: row.get::<_, i64>(1)? as u64,
                 })
             },
