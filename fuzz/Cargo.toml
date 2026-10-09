@@ -1,0 +1,55 @@
+[package]
+name = "lfcp-server-fuzz"
+description = "cargo-fuzz targets for the LFCP reference server, without network I/O."
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lfcp-server = { path = "../crates/lfcp-server" }
+# The same sdk-rs checkout and versions as the server.
+lfcp = { path = "../../sdk-rs/crates/lfcp", default-features = false }
+tokio = { version = "1.53", default-features = false, features = ["rt", "rt-multi-thread", "io-util", "sync", "time", "macros"] }
+hyper = { version = "1.11", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+
+# Not a member of the server's workspace: normal builds and CI never
+# compile it. Run with `cargo +nightly fuzz` from the repository root.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_open"
+path = "fuzz_targets/store_open.rs"
+test = false
+doc = false
+bench = false
