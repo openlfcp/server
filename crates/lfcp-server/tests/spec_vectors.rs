@@ -11,7 +11,7 @@ use support::spec::Spec;
 #[test]
 fn challenge_and_ready_carry_one_server_id() {
     let spec = Spec::open();
-    assert_eq!(spec.lock().tag, "mvp-0.2-baseline.2");
+    assert_eq!(spec.lock().tag, "mvp-0.2-baseline.3");
     let suite = spec.read_json("test-vectors/lfcp-wire-01/LFCP-TEST-VECTORS-01.json");
     let message = |id: &str| {
         let case = suite["cases"]
