@@ -184,6 +184,28 @@ pub fn version(conn: &Connection) -> rusqlite::Result<u32> {
         .unwrap_or(0))
 }
 
+/// The applied version as stored, 0 for an empty database, without writing
+/// anything: usable on a read-only connection, before [`migrate`].
+pub fn stored_version(conn: &Connection) -> rusqlite::Result<u32> {
+    let has_table = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_table {
+        return Ok(0);
+    }
+    Ok(conn
+        .query_row("SELECT version FROM schema_version", [], |row| {
+            row.get::<_, u32>(0)
+        })
+        .optional()?
+        .unwrap_or(0))
+}
+
 /// Apply every missing migration, each in its own transaction.
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<u32> {
     let mut current = version(conn)?;

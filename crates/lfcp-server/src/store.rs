@@ -31,7 +31,7 @@ use lfcp::wire::control::ReceivedControlRecord;
 use lfcp::wire::data_unit::ReceivedDataUnit;
 use lfcp::wire::key_package::ReceivedKeyPackage;
 use lfcp::wire::snapshot::ReceivedSnapshot;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use tokio::sync::oneshot;
 
 /// The database file in the state directory.
@@ -62,6 +62,14 @@ pub enum StoreError {
     OutOfRange,
     /// The connection thread has stopped.
     Closed,
+    /// The database was written by a newer server: its schema version is
+    /// above every migration this code knows. Nothing was written to it.
+    NewerSchema {
+        /// The version in the database.
+        found: u32,
+        /// The latest version this code migrates to.
+        supported: u32,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -76,6 +84,12 @@ impl fmt::Display for StoreError {
             }
             StoreError::OutOfRange => f.write_str("integer out of range"),
             StoreError::Closed => f.write_str("store closed"),
+            StoreError::NewerSchema { found, supported } => write!(
+                f,
+                "the store is at schema version {found}, newer than this server supports \
+                 ({supported}); it was left unchanged: run a server version that supports it, \
+                 or restore a backup made by this version"
+            ),
         }
     }
 }
@@ -770,12 +784,56 @@ impl Drop for Store {
 }
 
 fn open_connection(path: &Path) -> Result<Connection, StoreError> {
+    // A store of a newer server is refused before anything is written to
+    // it: a rollback to an older server must not run on a schema it does
+    // not know.
+    {
+        let read = open_for_version(path)?;
+        let found = schema::stored_version(&read)?;
+        let supported = schema::latest_version();
+        if found > supported {
+            return Err(StoreError::NewerSchema { found, supported });
+        }
+    }
     let mut conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     schema::migrate(&mut conn)?;
     Ok(conn)
+}
+
+/// A read-only connection for [`schema::stored_version`] that leaves the
+/// store's files as they are. Without a `-wal` file the database is opened
+/// immutable, so SQLite creates no `-wal` or `-shm` beside it; with one
+/// (a server that stopped without a checkpoint), it may hold the latest
+/// version, so the files that exist are read normally.
+fn open_for_version(path: &Path) -> Result<Connection, StoreError> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    if Path::new(&wal).exists() {
+        return Ok(Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?);
+    }
+    let file = path
+        .to_str()
+        .ok_or_else(|| StoreError::Sqlite("the store path is not UTF-8".into()))?;
+    let mut uri = String::from("file:");
+    for c in file.chars() {
+        match c {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            c => uri.push(c),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Ok(Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?)
 }
 
 /// What the setup code check found ([`Store::pair_admin`]).

@@ -88,7 +88,12 @@ acknowledged after its transaction commits.
   `quota_overrides` holds the administrator's per-Principal quotas. No
   client IP is stored.
 - Migrations: `schema_version` and an append-only list
-  (`store/schema.rs`), applied in order when the database opens.
+  (`store/schema.rs`), applied in order when the database opens. A
+  database at a version above every migration the server knows, written
+  by a newer server, is refused before anything is written to it: the
+  server exits with "the store is at schema version N, newer than this
+  server supports". Rolling the server back across a schema change
+  therefore needs a backup made by the older version.
 
 The server ID stays in its own file rather than in the database: it keeps
 its create-new and fsync semantics, it is readable by an operator, and

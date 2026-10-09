@@ -609,6 +609,120 @@ async fn reopening_keeps_everything_and_migrations_run_once() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// LFCP-02-116: a store written by a newer server (schema version above
+/// every migration this code knows) is refused with a clear error, and
+/// none of its files changes; once the version is one this code knows
+/// again, it opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_of_a_newer_server_is_refused_unchanged() {
+    let v = Vectors::load();
+    let dir = temp_dir("newer-schema");
+    let path = {
+        let store = chain_store(&v, &dir).await;
+        store.path().to_path_buf()
+    };
+    let newer = schema::latest_version() + 1;
+    let set_version = |version: u32| {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("UPDATE schema_version SET version = ?1", [version])
+            .unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+    };
+    set_version(newer);
+    let files = || {
+        let mut all: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            // The store's files; the server binary also keeps its identity here.
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(DATABASE_FILE)
+            })
+            .map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(&p).unwrap())
+            })
+            .collect();
+        all.sort();
+        all
+    };
+    let before = files();
+
+    match Store::open(&dir) {
+        Err(StoreError::NewerSchema { found, supported }) => {
+            assert_eq!(found, newer);
+            assert_eq!(supported, schema::latest_version());
+        }
+        Err(other) => panic!("another error: {other}"),
+        Ok(_) => panic!("a store of a newer server was opened"),
+    }
+    let message = StoreError::NewerSchema {
+        found: newer,
+        supported: schema::latest_version(),
+    }
+    .to_string();
+    assert!(
+        message.contains(&format!("schema version {newer}")),
+        "{message}"
+    );
+    assert!(message.contains("left unchanged"), "{message}");
+    assert_eq!(files(), before, "the refused store's files changed");
+
+    // The server binary exits with the error and leaves the files too.
+    let config = dir.with_extension("toml");
+    std::fs::write(
+        &config,
+        format!(
+            "bind = \"127.0.0.1:0\"\nstate_dir = \"{}\"\npublic_urls = [\"wss://sync-a.example.test/v1/ws\"]\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lfcp-server"))
+        .args(["--config", config.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "the server started: {printed}");
+    assert!(
+        printed.contains("newer than this server supports"),
+        "{printed}"
+    );
+    assert_eq!(
+        files(),
+        before,
+        "the server binary changed the store's files"
+    );
+    std::fs::remove_file(&config).unwrap();
+
+    set_version(schema::latest_version());
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.head(v.resource()).await.unwrap().unwrap().seq, 10);
+    drop(store);
+
+    // The newer version only in the WAL (a server stopped without a
+    // checkpoint): refused as well.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.query_row("PRAGMA wal_autocheckpoint = 0", [], |_| Ok(()))
+        .unwrap();
+    conn.execute("UPDATE schema_version SET version = ?1", [newer])
+        .unwrap();
+    assert!(matches!(
+        Store::open(&dir),
+        Err(StoreError::NewerSchema { found, .. }) if found == newer
+    ));
+    drop(conn);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn migrating_an_empty_database_is_deterministic() {
     let schema_of = |name: &str| {
