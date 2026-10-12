@@ -280,6 +280,14 @@ async fn undecodable_messages_get_an_error_and_the_connection_stays_open() {
         2,
         "MALFORMED_MESSAGE"
     );
+    // The same as the vector unassigned_type_without_message_id.
+    let bytes = lfcp::base::from_hex("a200187504a1004850a9c6073731578c").unwrap();
+    client.send(Frame::Binary(bytes.into())).await.unwrap();
+    assert_eq!(
+        error_code(&next_message(&mut client).await),
+        2,
+        "unassigned_type_without_message_id"
+    );
     // Still usable.
     client
         .send(Frame::Binary(ping(4).encode().into()))

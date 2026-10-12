@@ -919,6 +919,18 @@ async fn data_reads_need_read_authority() {
             "{extra:?}"
         );
     }
+    // The published negatives (finding S2), as raw bytes.
+    for id in [
+        "resource_open_reversed_range",
+        "resource_open_range_sequence_zero",
+    ] {
+        bob.send_bytes(v.hex(id, "inputs", "message_cbor")).await;
+        assert_eq!(
+            code(&bob.recv().await),
+            v.expected_code(id).unwrap(),
+            "{id}"
+        );
+    }
     bob.request(open(vec![(4, 6), (2, 5)])).await;
     assert!(matches!(bob.recv().await.body, Body::ResourceOpened { .. }));
 
