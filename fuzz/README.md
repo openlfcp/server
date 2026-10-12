@@ -35,4 +35,11 @@ guided inside SQLite.
 
 | ID | Finding | Reproducer |
 | --- | --- | --- |
+| S2 | `RESOURCE_OPEN` whose live Have holds a reversed range (or one with sequence 0) is answered `RESOURCE_OPENED`; §48 (and LFCP-TEST-VECTORS-01 `data_have_reversed_range`) rejects it with `MALFORMED_MESSAGE`. `on_open` (`session.rs:559`) never reads the client's `have`; `DATA_HAVE` checks it (`session.rs:1017`, `HaveVector::from_wire`). Not a crash: found by the sdk-rs/sdk-ts Wire codec diff | `repro/S2-resource-open-reversed-have` (`session` input, `LFCP_FUZZ_TRACE=1` shows the answer) |
 | S1 | A database whose ID column holds a blob of another length (a corrupted file: the schema's `CHECK (length(...) = 32)` runs only on insert) makes `id32` panic (`store.rs:207`, `expect("the schema checks 32-byte IDs")`) on the store thread at the first read of the row; every later call of the store is `StoreError::Closed` until a restart, which reads the row again | `repro/S1-store-open` (`store_open` input): `Store::open` succeeds, `control_records` panics the store thread (`store.rs:468`, `469`) |
+
+## Runs
+
+| Server | sdk-rs | Targets, time | Executions | Crashes, timeouts, OOMs |
+| --- | --- | --- | --- | --- |
+| 814e913 (baseline.10) | 74c3a71 | `session` (`-fork=6`) and `wire_decode` (`-fork=2`), 60 min, seeds with every client message type and the lfcp-wire-01 messages of baseline.10 | 119,980 and 37,310,704 | none |

@@ -358,6 +358,35 @@ fn write_seeds(dir: &std::path::Path) {
             resource_id: r,
             snapshot_id: None,
         }),
+        // What only a server sends, and payloads that do not parse as
+        // the objects they name.
+        msg(Body::ControlBatch {
+            resource_id: r,
+            records: vec![grant.clone()],
+        }),
+        msg(Body::DataBatch {
+            resource_id: r,
+            units: units[..1].to_vec(),
+        }),
+        msg(Body::KeyPackagePut {
+            resource_id: r,
+            packages: units[..1].to_vec(),
+        }),
+        msg(Body::SnapshotPut {
+            resource_id: r,
+            snapshot: units[0].clone(),
+        }),
+        msg(Body::Presence {
+            resource_id: r,
+            principal: me,
+            ttl_ms: 30_000,
+            payload: vec![0xa0],
+        }),
+        msg(Body::PresenceLeave {
+            resource_id: r,
+            principal: me,
+        }),
+        msg(Body::Pong([7; 8])),
         msg(Body::Ping([7; 8])),
         msg(Body::ResourceClose { resource_id: r }),
     ];
