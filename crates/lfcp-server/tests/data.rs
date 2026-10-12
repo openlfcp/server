@@ -898,6 +898,30 @@ async fn data_reads_need_read_authority() {
         MALFORMED_MESSAGE
     );
 
+    // RESOURCE_OPEN carries a live Have too (§41, §48): a reversed range or
+    // sequence 0 is malformed, while an unnormalized one still opens.
+    let bob_id = *v.principal("bob").descriptor().id();
+    let open = |extra: Vec<(u64, u64)>| Body::ResourceOpen {
+        resource_id: v.resource(),
+        control_heads: vec![],
+        have: vec![WireActorHave {
+            principal: bob_id,
+            contiguous: 1,
+            extra: Some(extra),
+        }],
+        grant_ids: None,
+        flags: Some(0),
+    };
+    for extra in [vec![(5, 3)], vec![(0, 2)]] {
+        assert_eq!(
+            reply_code(&mut bob, open(extra.clone())).await,
+            MALFORMED_MESSAGE,
+            "{extra:?}"
+        );
+    }
+    bob.request(open(vec![(4, 6), (2, 5)])).await;
+    assert!(matches!(bob.recv().await.body, Body::ResourceOpened { .. }));
+
     // A stranger reads nothing.
     let stranger = PrincipalKeys::from_secrets(&[77; 32], [78; 32]);
     let mut outsider = client(&server, &stranger).await;

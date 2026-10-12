@@ -556,13 +556,19 @@ impl LfcpSession {
         }
     }
 
+    /// RESOURCE_OPEN (§41): the client's live Have must normalize (§48); a
+    /// reversed range or sequence 0 is malformed, as in DATA_HAVE.
     async fn on_open(
         &mut self,
         request: [u8; 16],
         resource_id: ResourceId,
+        have: &[WireActorHave],
         flags: Option<u64>,
         out: &Outbound,
     ) -> Flow {
+        if HaveVector::from_wire(have).is_err() {
+            return self.nack(out, request, WireCode::MalformedMessage).await;
+        }
         let Some(auth) = self.authenticated.as_ref() else {
             return self.nack(out, request, WireCode::AuthorizationFailed).await;
         };
@@ -1280,8 +1286,11 @@ impl Session for LfcpSession {
                 hosting_credential,
             } => self.on_host(id, genesis, hosting_credential, out).await,
             Body::ResourceOpen {
-                resource_id, flags, ..
-            } => self.on_open(id, resource_id, flags, out).await,
+                resource_id,
+                have,
+                flags,
+                ..
+            } => self.on_open(id, resource_id, &have, flags, out).await,
             Body::ResourceClose { resource_id } => self.on_close(id, resource_id, out).await,
             Body::ControlPut {
                 resource_id,
