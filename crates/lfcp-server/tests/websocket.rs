@@ -270,6 +270,16 @@ async fn undecodable_messages_get_an_error_and_the_connection_stays_open() {
         1,
         "PROTOCOL_UNSUPPORTED"
     );
+    // The envelope is checked before the type (§32, §33, finding W3): the
+    // unassigned type 117 without a Message ID is malformed.
+    let mut bytes = vec![0xa2, 0x00, 0x18, 0x75, 0x04, 0xa1, 0x00, 0x48];
+    bytes.extend([5; 8]);
+    client.send(Frame::Binary(bytes.into())).await.unwrap();
+    assert_eq!(
+        error_code(&next_message(&mut client).await),
+        2,
+        "MALFORMED_MESSAGE"
+    );
     // Still usable.
     client
         .send(Frame::Binary(ping(4).encode().into()))
