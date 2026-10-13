@@ -745,10 +745,12 @@ warns when the `lfcp` crate has uncommitted changes. Move the lock
 deliberately when the server needs newer sdk-rs code. A git or tag
 dependency replaces this at a release milestone.
 
-`spec.lock` pins `openlfcp/spec` (`mvp-0.2-baseline.11`: `mvp-0.1-baseline.10`
+`spec.lock` pins `openlfcp/spec` (`mvp-0.2-baseline.12`: `mvp-0.1-baseline.10`
 with the LFCP-WIRE-01 §32/§33 fix, the envelope checked before the message
-type, and the negative Wire vectors for findings S2 and W3, plus shared
-sections, which the server does not read); tests read vectors
+type, and the negative Wire vectors for findings S2 and W3; the §47 writer
+rule for pending Control Records, which binds clients, not the coordinator;
+and the Shared Objects and shared sections changes, which the server does
+not read); tests read vectors
 from `../spec` (or `$LFCP_SPEC_DIR`) with `git show` at the locked commit.
 
 ## Build from a clean checkout
