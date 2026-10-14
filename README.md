@@ -683,7 +683,11 @@ curl --cacert root.crt https://localhost/health
   against `/health`. The proxy starts once the server is healthy.
 - Configuration: `deploy/server.toml`, mounted read-only. Set
   `public_urls` to the `wss://` URL clients use, so the server coordinates
-  the Resources that name it, and consider `max_total_bytes`.
+  the Resources that name it. Its limits are set for a small public host,
+  tighter than the defaults in "Running": 1 MiB messages, 24 connections
+  (8 per client IP), 24 MiB of outbound buffers, 200 Resources per hosting
+  Principal and 50 new Resources per client IP per day. Its
+  `max_total_bytes` is 3 GiB: set it below the volume size.
 - Client IP: the compose network has a fixed subnet (`172.30.78.0/24`)
   and the proxy a fixed address (`172.30.78.10`), the only
   `trusted_proxies` entry of `server.toml`. The Caddyfile replaces any

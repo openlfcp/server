@@ -14,11 +14,48 @@ log_level = "info"
 # here (WIRE-01 §21). Set your host name for a real deployment.
 public_urls = ["wss://localhost/v1/ws"]
 
-# Abuse limits (POST-003; README "Running"). Only the proxy, at its fixed
-# address on the compose network (compose.yaml), may report the client
-# address, in X-Forwarded-For (deploy/Caddyfile overwrites it). Every
-# other per-IP, rate, quota and storage limit keeps its default.
+# Connections and memory: the defaults (README "Running") sized down for
+# a small public host.
+# 1 MiB per LFCP message.
+max_message_bytes = 1048576
+# Open TCP connections, WebSocket included.
+max_connections = 24
+# Outbound bytes one connection may hold (4 MiB) and all together (24 MiB).
+max_outbound_bytes = 4194304
+max_total_outbound_bytes = 25165824
+# A peer that stops reading, or a slow admin body, is closed after 10 s.
+write_timeout_ms = 10000
+admin_body_timeout_ms = 10000
+
+# Abuse limits (POST-003; README "Abuse limits"). Only the proxy, at its
+# fixed address on the compose network (compose.yaml), may report the
+# client address, in X-Forwarded-For (deploy/Caddyfile overwrites it).
 trusted_proxies = ["172.30.78.10"]
 client_ip_header = "x-forwarded-for"
-# The store's total cap, unset by default; set it below the volume size.
-# max_total_bytes = 3221225472
+# Per client IP: open WebSockets, and new ones per minute.
+max_connections_per_ip = 8
+connections_per_ip_per_minute = 20
+# LFCP messages per second on one WebSocket, and their burst.
+ws_messages_per_second = 50
+ws_message_burst = 200
+# /setup and /admin/* requests per client IP per minute.
+admin_requests_per_ip_per_minute = 60
+# Client IPs tracked at once.
+max_tracked_ips = 65536
+
+# Quota mode: per hosting Principal, Resources and stored bytes (256 MiB);
+# per Resource, stored bytes (128 MiB); what control writes may store past
+# them (16 MiB); new Resources per client IP per day.
+quota_resources_per_principal = 200
+quota_bytes_per_principal = 268435456
+quota_bytes_per_resource = 134217728
+quota_control_reserve_bytes = 16777216
+hosts_per_ip_per_day = 50
+
+# Storage, every mode. The store's total (3 GiB): set it below the volume
+# size.
+max_total_bytes = 3221225472
+# Bulk writes stop below 2 GiB free on the volume; free space is read at
+# most every 10 s.
+min_free_bytes = 2147483648
+disk_check_interval_ms = 10000

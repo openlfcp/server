@@ -1,8 +1,9 @@
 # lfcp-server configuration for deploy/check.sh only (LFCP-055).
 #
-# Mounted over /etc/lfcp/server.toml by compose.check.yaml: server.toml plus
-# the Control Coordinator URLs of the published test vectors, so the Rust
-# test client can host the vectors' Resource and put its Control Records
+# Mounted over /etc/lfcp/server.toml by compose.check.yaml: server.toml's
+# listener and proxy settings, without its deployment limits, plus the
+# Control Coordinator URLs of the published test vectors, so the Rust test
+# client can host the vectors' Resource and put its Control Records
 # (WIRE-01 §21). A real deployment uses server.toml.
 
 bind = "0.0.0.0:7820"
