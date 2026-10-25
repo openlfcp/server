@@ -15,7 +15,7 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: server
       # sdk-rs is a path dependency (../sdk-rs) at the commit in sdk-rs.lock;
@@ -24,14 +24,14 @@ jobs:
         run: |
           echo "sdk=$(jq -er .commit sdk-rs.lock)" >> "$GITHUB_OUTPUT"
           echo "spec=$(jq -er .tag spec.lock)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: openlfcp/sdk-rs
           ref: ${{ steps.locks.outputs.sdk }}
           path: sdk-rs
       # Full history with tags, so the tests can check that the tag still
       # resolves to the commit in spec.lock.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: openlfcp/spec
           ref: refs/tags/${{ steps.locks.outputs.spec }}
@@ -55,14 +55,14 @@ jobs:
         shell: bash
         working-directory: server
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: server
       - id: locks
         run: |
           echo "sdk=$(jq -er .commit sdk-rs.lock)" >> "$GITHUB_OUTPUT"
           echo "spec=$(jq -er .tag spec.lock)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: openlfcp/sdk-rs
           ref: ${{ steps.locks.outputs.sdk }}
@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: server
       - id: locks
@@ -84,12 +84,12 @@ jobs:
         run: |
           echo "sdk=$(jq -er .commit sdk-rs.lock)" >> "$GITHUB_OUTPUT"
           echo "spec=$(jq -er .tag spec.lock)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: openlfcp/sdk-rs
           ref: ${{ steps.locks.outputs.sdk }}
           path: sdk-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: openlfcp/spec
           ref: refs/tags/${{ steps.locks.outputs.spec }}
