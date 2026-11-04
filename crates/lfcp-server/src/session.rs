@@ -193,6 +193,8 @@ impl SessionFactory for Lfcp {
             pending: None,
             authenticated: None,
             subscriptions: HashMap::new(),
+            #[cfg(test)]
+            open_barrier: None,
             client: connection.client.clone(),
         }
     }
@@ -230,6 +232,8 @@ pub struct LfcpSession {
     pending: Option<(HelloBody, ChallengeBody)>,
     authenticated: Option<Authenticated>,
     subscriptions: HashMap<ResourceId, Subscription>,
+    #[cfg(test)]
+    open_barrier: Option<Arc<tests::OpenBarrier>>,
     client: crate::limits::Client,
 }
 
@@ -596,35 +600,68 @@ impl LfcpSession {
             return self.nack(out, request, WireCode::AuthorizationFailed).await;
         };
         let principal = *auth.principal.id();
-        let chain = match self
-            .control_readable(request, resource_id, &principal, out)
-            .await
-        {
-            Ok((chain, None)) => chain,
-            Ok((_, Some(prefix))) => {
-                return self.open_prefix(request, resource_id, prefix, out).await
+        // Serialize the authority decision and subscription with Control
+        // commits. A revoke must not revalidate the Hub between these steps.
+        let locked = match self.shared.coordinator.lock(resource_id).await {
+            Ok(locked) => locked,
+            Err(failure) => return self.nack_failure(out, request, failure).await,
+        };
+        let Some(chain) = locked.chain.as_ref() else {
+            drop(locked);
+            return self.nack(out, request, WireCode::ResourceNotHosted).await;
+        };
+        match chain.may_read(&principal) {
+            ReadAccess::Full => {}
+            ReadAccess::ControlPrefix(head) => {
+                let prefix = ControlHead {
+                    sequence: head.sequence,
+                    id: head.id,
+                };
+                drop(locked);
+                return self.open_prefix(request, resource_id, prefix, out).await;
             }
-            Err(flow) => return flow,
-        };
-        let store = self.shared.coordinator.store();
-        let heads = match self.shared.coordinator.heads(resource_id).await {
-            Ok(heads) => heads,
-            Err(error) => return self.internal(out, request, &error).await,
-        };
-        let have = match store.data_sequences(resource_id).await {
-            Ok(sequences) => have_of(&sequences),
-            Err(error) => return self.internal(out, request, &error).await,
-        };
-        let snapshot = match store.snapshots(resource_id).await {
-            Ok(snapshots) => snapshots
+            ReadAccess::Denied => {
+                drop(locked);
+                return self.nack(out, request, WireCode::AuthorizationFailed).await;
+            }
+        }
+        #[cfg(test)]
+        if let Some(barrier) = &self.open_barrier {
+            barrier.authorized.notify_one();
+            barrier.resume.notified().await;
+        }
+        // Collect the response at the same head. On failure, release the
+        // Resource before waiting for outbound capacity, just as on success.
+        let opened: Result<Body, StoreError> = async {
+            let store = self.shared.coordinator.store();
+            let heads = self.shared.coordinator.heads(resource_id).await?;
+            let have = have_of(&store.data_sequences(resource_id).await?);
+            let snapshot = store
+                .snapshots(resource_id)
+                .await?
                 .first()
                 .and_then(|s| ReceivedSnapshot::parse(&s.bytes).ok())
                 .map(|s| SnapshotSummary {
                     snapshot_id: s.id(),
                     data_epoch: s.header().data_epoch,
                     frontier: HaveVector::from_frontier(&s.header().frontier).to_wire(),
-                }),
-            Err(error) => return self.internal(out, request, &error).await,
+                });
+            Ok(Body::ResourceOpened {
+                resource_id,
+                control_heads: heads,
+                have,
+                snapshot,
+                route_version: Some(chain.state().route_version),
+                coordinator: Some(chain.coordinator.clone()),
+            })
+        }
+        .await;
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                drop(locked);
+                return self.internal(out, request, &error).await;
+            }
         };
         let flags = flags.unwrap_or(0);
         self.subscriptions
@@ -636,20 +673,9 @@ impl LfcpSession {
             principal,
             out.clone(),
         );
+        drop(locked);
         tracing::debug!(conn = self.conn, resource = %resource_id.to_hex(), "opened");
-        self.send(
-            out,
-            Some(request),
-            Body::ResourceOpened {
-                resource_id,
-                control_heads: heads,
-                have,
-                snapshot,
-                route_version: Some(chain.state().route_version),
-                coordinator: Some(chain.coordinator),
-            },
-        )
-        .await
+        self.send(out, Some(request), opened).await
     }
 
     /// RESOURCE_OPEN by a revoked reader (§41, identity-01):
@@ -1769,6 +1795,12 @@ mod tests {
     use lfcp::wire::session::auth;
     use tokio::sync::mpsc;
 
+    #[derive(Default)]
+    pub(super) struct OpenBarrier {
+        pub(super) authorized: tokio::sync::Notify,
+        pub(super) resume: tokio::sync::Notify,
+    }
+
     fn genesis(owner: &PrincipalKeys, resource: ResourceId) -> Vec<u8> {
         let url = "wss://sync.example.test/v1/ws".to_owned();
         let record = ControlRecord::sign(
@@ -1972,5 +2004,249 @@ mod tests {
 
         drop((session, factory, store));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// OPEN must install its subscription before a concurrent revoke can
+    /// revalidate it, including devices suspended through the cascade.
+    /// A full outbound queue must not keep the Resource lock held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_racing_with_revoke_does_not_restore_live_data_subscription() {
+        use lfcp::wire::control::body::{DeviceGrantBody, DeviceRevokeBody};
+        use lfcp::wire::control::device::{
+            CertificateChain, DeviceCertificate, DeviceCertificatePayload, DeviceKind,
+        };
+        use lfcp::wire::control::ReceivedControlRecord;
+        use lfcp::wire::data_unit::{DataUnit, DataUnitHeader};
+        use lfcp::wire::keys::Dek;
+        use std::time::Duration;
+
+        async fn authenticated(
+            factory: &Lfcp,
+            keys: &PrincipalKeys,
+            conn: u64,
+        ) -> (LfcpSession, Outbound, mpsc::Receiver<crate::ws::Out>) {
+            let context = ConnectionContext {
+                id: conn,
+                peer: "127.0.0.1:1".parse().unwrap(),
+                client: crate::limits::Client::detached("127.0.0.1".parse().unwrap()),
+                server_id: ServerId::from_bytes([9; 32]),
+                limits: crate::ws::Limits::new(1 << 20, 0),
+                outbound: crate::budget::ByteBudget::new(1 << 30),
+            };
+            let mut session = factory.open(&context);
+            let (out, mut inbox) = test_outbound(1);
+            let hello = HelloBody {
+                wire_profiles: vec![WIRE_PROFILE.into()],
+                principal: keys.descriptor().clone(),
+                client_nonce: [4; 16],
+                data_profiles: None,
+            };
+            let Body::Challenge(challenge) =
+                reply(&mut session, &out, &mut inbox, Body::Hello(hello.clone()))
+                    .await
+                    .body
+            else {
+                panic!("CHALLENGE")
+            };
+            let ready = reply(
+                &mut session,
+                &out,
+                &mut inbox,
+                Body::Auth(auth(keys, &hello, &challenge, None).unwrap()),
+            )
+            .await;
+            assert!(matches!(ready.body, Body::Ready(_)));
+            (session, out, inbox)
+        }
+
+        for cascade in [false, true] {
+            let dir = std::env::temp_dir()
+                .join(format!("lfcp-open-revoke-{cascade}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Arc::new(Store::open(&dir).unwrap());
+            let mut config = Config {
+                state_dir: dir.clone(),
+                public_urls: vec!["wss://sync.example.test/v1/ws".into()],
+                ..Config::default()
+            };
+            config.abuse.min_free_bytes = 0;
+            let factory = Lfcp::new(store.clone(), &config);
+            let owner = PrincipalKeys::from_secrets(&[1; 32], [2; 32]);
+            let a = PrincipalKeys::from_secrets(&[3; 32], [4; 32]);
+            let b = PrincipalKeys::from_secrets(&[5; 32], [6; 32]);
+            let root = *owner.descriptor().id();
+            let resource = ResourceId::from_bytes([7; 32]);
+            let genesis = genesis(&owner, resource);
+            let mut head = ReceivedControlRecord::parse(&genesis).unwrap().id();
+            store
+                .host_resource(
+                    genesis,
+                    Hosting {
+                        host: root,
+                        durability: DURABILITY,
+                    },
+                )
+                .await
+                .unwrap();
+            let cert = |device: &PrincipalKeys, mask, signer: &PrincipalKeys| {
+                DeviceCertificate::sign(
+                    DeviceCertificatePayload {
+                        root,
+                        device: device.descriptor().clone(),
+                        kind: DeviceKind::Personal,
+                        mask,
+                        scope: vec![],
+                        serial: [1; 16],
+                    },
+                    signer,
+                )
+                .unwrap()
+            };
+            let ca = cert(&a, vec![1, 2, 12], &owner);
+            let cb = cert(&b, vec![1, 2], &a);
+            let sign = |sequence, previous, body| {
+                ControlRecord::sign(
+                    ControlRecordHeader {
+                        resource_id: resource,
+                        sequence,
+                        previous: Some(previous),
+                        issuer: root,
+                    },
+                    body,
+                    &owner,
+                )
+                .unwrap()
+                .signed_object()
+                .bytes()
+                .to_vec()
+            };
+            for (i, certificates) in [vec![ca.clone()], vec![cb, ca]].into_iter().enumerate() {
+                let grant = sign(
+                    i as u64 + 1,
+                    head,
+                    ControlBody::DeviceGrant(DeviceGrantBody {
+                        root,
+                        chain: CertificateChain::new(certificates, &root).unwrap(),
+                        pairing_device: None,
+                    }),
+                );
+                head = factory
+                    .coordinator
+                    .put(resource, head, grant, 0, &OsRandom)
+                    .await
+                    .unwrap()
+                    .id;
+            }
+            let revoke = sign(
+                3,
+                head,
+                ControlBody::DeviceRevoke(DeviceRevokeBody {
+                    root,
+                    device: *a.descriptor().id(),
+                    reason: 1,
+                    approval: None,
+                }),
+            );
+            let unit = DataUnit::seal(
+                DataUnitHeader {
+                    resource_id: resource,
+                    data_epoch: 0,
+                    actor: *a.descriptor().id(),
+                    sequence: 1,
+                    previous: None,
+                    control_head: Hash32::from_bytes(*head.as_bytes()),
+                },
+                b"before rotation",
+                &Dek::from_bytes([8; 32]),
+                &a,
+            )
+            .unwrap();
+            let (mut device, out, mut inbox) =
+                authenticated(&factory, if cascade { &b } else { &a }, 1).await;
+            let (mut writer, writer_out, mut writer_inbox) =
+                authenticated(&factory, &owner, 2).await;
+            let barrier = Arc::new(OpenBarrier::default());
+            device.open_barrier = Some(barrier.clone());
+            // Keep the OPEN response waiting even after it installs the subscription.
+            out.send(Message::new([1; 16], Body::Ping([1; 8]))).unwrap();
+            let open = Body::ResourceOpen {
+                resource_id: resource,
+                control_heads: vec![],
+                have: vec![],
+                grant_ids: None,
+                flags: Some(3),
+            };
+            let task_out = out.clone();
+            let task_open = open.clone();
+            let task = tokio::spawn(async move {
+                let flow = device
+                    .handle(Message::new([2; 16], task_open), &task_out)
+                    .await;
+                (device, flow)
+            });
+            tokio::time::timeout(Duration::from_secs(5), barrier.authorized.notified())
+                .await
+                .unwrap();
+            {
+                let revoke = factory
+                    .coordinator
+                    .put(resource, head, revoke, 2, &OsRandom);
+                tokio::pin!(revoke);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut revoke)
+                        .await
+                        .is_err(),
+                    "revoke passed OPEN's authority decision before subscription"
+                );
+                barrier.resume.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), &mut revoke)
+                    .await
+                    .expect("outbound backpressure must not block revoke")
+                    .unwrap();
+            }
+            assert!(!factory.coordinator.hub().is_subscribed(resource, 1));
+            assert!(
+                !task.is_finished(),
+                "OPEN is still waiting for outbound space"
+            );
+            assert!(matches!(
+                inbox.recv().await.unwrap().into_message().unwrap().body,
+                Body::Ping(_)
+            ));
+            let (mut device, flow) = task.await.unwrap();
+            assert_eq!(flow, Flow::Continue);
+            assert!(matches!(
+                inbox.recv().await.unwrap().into_message().unwrap().body,
+                Body::ResourceOpened { .. }
+            ));
+            let ack = reply(
+                &mut writer,
+                &writer_out,
+                &mut writer_inbox,
+                Body::DataPut {
+                    resource_id: resource,
+                    units: vec![unit.signed_object().bytes().to_vec()],
+                },
+            )
+            .await;
+            assert!(matches!(ack.body, Body::Ack(_)), "{:?}", ack.body);
+            let pong = reply(&mut device, &out, &mut inbox, Body::Ping([77; 8])).await;
+            assert_eq!(pong.body, Body::Pong([77; 8]), "no DATA_BATCH after revoke");
+            device.open_barrier = None;
+            let reopened = reply(&mut device, &out, &mut inbox, open).await;
+            if cascade {
+                assert!(
+                    matches!(reopened.body, Body::Nack(e) if e.code == WireCode::AuthorizationFailed.number())
+                );
+            } else {
+                assert!(
+                    matches!(reopened.body, Body::ResourceOpened { control_heads, have, snapshot: None, route_version: None, coordinator: None, .. }
+                    if control_heads.len() == 1 && control_heads[0].sequence == 3 && have.is_empty())
+                );
+            }
+            device.closed();
+            writer.closed();
+            drop((device, writer, factory, store));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }
