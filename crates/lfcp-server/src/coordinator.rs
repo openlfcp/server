@@ -40,9 +40,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use lfcp::base::{ChainRule, ControlRecordId, Error, PrincipalId, ResourceId};
-use lfcp::wire::control::authority::{
-    ability, propose_transition, validate_authorized, ControlState,
-};
+pub use lfcp::wire::control::authority::ReadAccess;
+use lfcp::wire::control::authority::{propose_transition, validate_authorized, ControlState};
 use lfcp::wire::control::body::ControlBody;
 use lfcp::wire::control::chain::ChainOutcome;
 use lfcp::wire::control::{ControlRecord, ReceivedControlRecord};
@@ -183,15 +182,25 @@ impl Chain {
         self.accepted.contains(record)
     }
 
-    /// §84 read authorization at the accepted head: `data/read`, or the
-    /// subject of an invitation grant that still confers `invite/claim`
-    /// (§73: the Invitation Principal opens the Resource to claim).
-    pub fn may_read(&self, principal: &PrincipalId) -> bool {
-        let state = self.state();
-        state.holds(principal, ability::DATA_READ)
-            || state
-                .grants()
-                .any(|g| &g.subject == principal && state.confers_invite(g))
+    /// §41/§84 read authorization at the accepted head, from sdk-rs
+    /// (`ControlState::may_read`):
+    ///
+    /// - [`ReadAccess::Full`]: `holds(principal, data/read)` through
+    ///   §80.1 (a device acts for its root within its mask), or the subject
+    ///   of an invitation grant that still confers `invite/claim` (§73:
+    ///   the Invitation Principal opens the Resource to claim);
+    /// - [`ReadAccess::ControlPrefix`]: the Control read for a revoked
+    ///   reader (identity-01, §41): a registered device that held
+    ///   `data/read` immediately before the first `DEVICE_REVOKE` naming it
+    ///   reads the Control Chain through that record, and nothing else;
+    /// - [`ReadAccess::Denied`]: anyone else, including an unbound
+    ///   Principal, an intermediate-only or out-of-scope device, a device
+    ///   that never held `data/read`, and a device whose root lost standing
+    ///   without a `DEVICE_REVOKE`.
+    ///
+    /// Uploads never depend on it (§84).
+    pub fn may_read(&self, principal: &PrincipalId) -> ReadAccess {
+        self.state().may_read(principal)
     }
 }
 
@@ -513,8 +522,11 @@ impl Hub {
         self.lock().get(&resource).map_or(0, HashMap::len)
     }
 
-    /// Drop the subscribers of `resource` that no longer have read
-    /// authority in `chain`. Returns their connections.
+    /// Drop the subscribers of `resource` that no longer have full read
+    /// authority in `chain`. Returns their connections. A device that the
+    /// committed record revoked keeps at most the Control prefix read
+    /// (§41), which has no live pushes: it is dropped before the record is
+    /// pushed (§69).
     pub fn revalidate(&self, resource: ResourceId, chain: &Chain) -> Vec<u64> {
         let mut subscribers = self.lock();
         let Some(by_conn) = subscribers.get_mut(&resource) else {
@@ -522,7 +534,7 @@ impl Hub {
         };
         let lost: Vec<u64> = by_conn
             .iter()
-            .filter(|(_, s)| !chain.may_read(&s.principal))
+            .filter(|(_, s)| chain.may_read(&s.principal) != ReadAccess::Full)
             .map(|(&conn, _)| conn)
             .collect();
         for conn in &lost {

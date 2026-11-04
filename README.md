@@ -390,7 +390,23 @@ After READY:
   §73); otherwise `NACK(AUTHORIZATION_FAILED)`. `RESOURCE_OPENED` carries
   every Control Head the server knows (a fork is not hidden), its Have, a
   summary of the newest stored Snapshot, the route version and the
-  coordinator.
+  coordinator. A device acts for its root within its mask (`holds`,
+  WIRE-01 §80.1).
+- Control read for a revoked reader (`identity-01`, WIRE-01 §41): a
+  registered device that held `data/read` immediately before the first
+  `DEVICE_REVOKE` naming it (a revoked device, or a consumed pairing
+  device) reads the accepted Control Chain through that record, so that it
+  can prove its revocation to its human. `RESOURCE_OPENED` names that
+  record as the only Control Head, with an empty Have, no Snapshot summary,
+  no route version or coordinator and no live subscription; `CONTROL_HAVE`
+  answers that head; `CONTROL_GET` returns the accepted records up to it
+  (a range is cut there; fork evidence is not part of the prefix), and a
+  range wholly after it is `NACK(AUTHORIZATION_FAILED)`, as are
+  `DATA_HAVE`, `DATA_GET`, `KEY_PACKAGE_GET` and `SNAPSHOT_GET`. An unbound
+  or intermediate-only device, one that never held `data/read`, and one
+  whose root lost standing without a `DEVICE_REVOKE` read nothing. A
+  `DEVICE_REVOKE` drops the revoked device's live subscriptions before it
+  is pushed. Uploads stay checked by object, from any session.
 - `RESOURCE_CLOSE`: drops the session's subscription and answers `ACK`;
   stored data is untouched.
 - Presence and mirror seeding (client `CONTROL_BATCH`, `DATA_BATCH`,

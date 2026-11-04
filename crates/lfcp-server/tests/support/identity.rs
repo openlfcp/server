@@ -170,3 +170,60 @@ fn hex(value: &Json) -> Option<Vec<u8>> {
     let text = value["hex"].as_str().or_else(|| value.as_str())?;
     lfcp::base::from_hex(text).ok()
 }
+
+/// A scratch directory for one case: under `/dev/shm` when it exists (many
+/// small stores with `synchronous = FULL`), else the temporary directory.
+pub fn scratch(name: &str) -> std::path::PathBuf {
+    let base = std::path::Path::new("/dev/shm");
+    let base = if base.is_dir() {
+        base.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    let dir = base.join(format!("lfcp-identity-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// Store `records` (Genesis first) as a hosted Resource without validation
+/// (the coordinator validates the chain when it loads it): each record that
+/// continues the accepted head moves it by compare-and-set, any other is
+/// kept as fork evidence. Returns the accepted head.
+pub async fn store_chain(store: &lfcp_server::store::Store, records: &[Record]) -> ControlRecordId {
+    use lfcp::wire::control::ReceivedControlRecord;
+    use lfcp_server::store::{CasOutcome, Hosting};
+    let genesis = ReceivedControlRecord::parse(&records[0].bytes).unwrap();
+    store
+        .host_resource(
+            records[0].bytes.clone(),
+            Hosting {
+                host: genesis.header().issuer,
+                durability: 2,
+            },
+        )
+        .await
+        .unwrap();
+    let mut head = genesis.id();
+    for record in &records[1..] {
+        let parsed = ReceivedControlRecord::parse(&record.bytes)
+            .unwrap_or_else(|e| panic!("{}: {e}", record.name));
+        if parsed.header().previous == Some(head) {
+            match store
+                .commit_control_record(record.bytes.clone(), head)
+                .await
+                .unwrap()
+            {
+                CasOutcome::Committed(_) => {
+                    head = parsed.id();
+                    continue;
+                }
+                other => panic!("{}: {other:?}", record.name),
+            }
+        }
+        store
+            .put_control_record(record.bytes.clone())
+            .await
+            .unwrap();
+    }
+    head
+}
