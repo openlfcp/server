@@ -1227,6 +1227,20 @@ pub enum Listing {
         /// The last sequence.
         to: u64,
     },
+    /// The Control Records on the chain that ends at `head` (`head` and
+    /// its predecessors back to Genesis, through `previous`) with sequence
+    /// in `from..=to`, by sequence: the Control prefix a revoked reader
+    /// may read (WIRE-01 §41), without competing records.
+    ControlPrefix {
+        /// The Resource.
+        resource: ResourceId,
+        /// The last record of the prefix.
+        head: ControlRecordId,
+        /// The first sequence.
+        from: u64,
+        /// The last sequence.
+        to: u64,
+    },
     /// Data Units of each `(actor, start, end)` range in turn, by sequence
     /// then unit ID. Ranges must not overlap, or a unit is listed twice.
     Data {
@@ -1289,7 +1303,7 @@ pub fn page_cost(len: usize) -> usize {
 impl Listing {
     fn segments(&self) -> usize {
         match self {
-            Listing::Control { .. } => 1,
+            Listing::Control { .. } | Listing::ControlPrefix { .. } => 1,
             Listing::Data { ranges, .. } => ranges.len(),
             Listing::KeyPackages { epochs, .. } => epochs.len(),
         }
@@ -1312,6 +1326,30 @@ impl Listing {
                 format!(
                     "SELECT seq, record_id, length(bytes){column} FROM control_records
                      WHERE resource_id = ?1 AND seq BETWEEN ?2 AND ?3 AND (seq, record_id) > (?4, ?5)
+                     ORDER BY seq, record_id"
+                ),
+                vec![
+                    resource.as_bytes().to_vec().into(),
+                    i64_of(*from)?.into(),
+                    i64_of((*to).min(i64::MAX as u64))?.into(),
+                ],
+            ),
+            Listing::ControlPrefix {
+                resource,
+                from,
+                to,
+                ..
+            } => (
+                format!(
+                    "WITH RECURSIVE path(id) AS (
+                         SELECT ?6
+                         UNION ALL
+                         SELECT c.previous_id FROM control_records c JOIN path ON c.record_id = path.id
+                         WHERE c.previous_id IS NOT NULL
+                     )
+                     SELECT seq, record_id, length(bytes){column} FROM control_records
+                     WHERE resource_id = ?1 AND record_id IN path AND seq BETWEEN ?2 AND ?3
+                       AND (seq, record_id) > (?4, ?5)
                      ORDER BY seq, record_id"
                 ),
                 vec![
@@ -1363,6 +1401,7 @@ impl Listing {
             Listing::KeyPackages { recipient, .. } => {
                 binds.push(recipient.as_bytes().to_vec().into())
             }
+            Listing::ControlPrefix { head, .. } => binds.push(head.as_bytes().to_vec().into()),
             Listing::Control { .. } => {}
         }
         let mut stmt = conn.prepare(&sql)?;

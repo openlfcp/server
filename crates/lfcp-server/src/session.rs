@@ -10,15 +10,15 @@
 //! | READY | profile, server ID, configured max message bytes, the store's durability (2), configured heartbeat, no extensions | §37 |
 //! | before READY | Resource, Control, Data, Key and Snapshot messages: `NACK(AUTHORIZATION_FAILED)`, stay open; `PING`/`PONG`/`ERROR` allowed; any other out-of-order message (or an undecodable one) is `ERROR(MALFORMED_MESSAGE)`, close | §64, G-SM4 |
 //! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature or, with field 5, the owner's device chain and leaf signature, ws/wss URLs), hosting policy keyed by the Genesis owner for a Genesis with field 5, else by the session Principal (`identity-01`; the storage floor, and a quota of Resources and bytes per hosting Principal, counted under the recorded host or the owner: `NACK(QUOTA_EXCEEDED)` with a diagnostic; new Resources per client IP per day: `NACK(RATE_LIMITED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
-//! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read`, or be an invitation subject, at the accepted Control Head, else `NACK(AUTHORIZATION_FAILED)`; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator | §41, §42, §84, §73 |
+//! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read` (a device through its root and mask, §80.1), or be an invitation subject, at the accepted Control Head; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator. A revoked reader (identity-01): `RESOURCE_OPENED` with the record that revoked it as the only head, empty Have, nothing else, no subscription. Anyone else: `NACK(AUTHORIZATION_FAILED)` | §41, §42, §84, §73 |
 //! | RESOURCE_CLOSE | drops the session's subscription only; `ACK` | §43 |
 //! | CONTROL_PUT | the storage floor and quota as for puts, with the control reserve (revocation always gets through, [`crate::limits::WriteClass`]); [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
-//! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows | §44 |
-//! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)` | §45, §46 |
+//! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows (a revoked reader: the record that revoked it) | §44, §41 |
+//! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)`. A revoked reader: the accepted records through the one that revoked it, the range cut there; a range after it is `NACK(AUTHORIZATION_FAILED)` | §45, §46, §41 |
 //! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | from any authenticated session: the object is authorized, not the uploader (relay, §84); every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details); for DATA_PUT, equivocation (stored as evidence, `NACK(ACTOR_EQUIVOCATION)`), then each `previous` held, earlier in the put or covered by a stored Snapshot, else `NACK(UNKNOWN_PREVIOUS)` naming it (§51.1); then the storage floor ([`crate::limits::Floor`]) and the storage quota of the hosting Principal and of the Resource (`NACK(QUOTA_EXCEEDED)` with a diagnostic), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60, §84 |
 //! | an equivocating Data Unit | only the equivocating units of the request are stored, as evidence; none is accepted or pushed; `NACK(ACTOR_EQUIVOCATION)` | §26.2, §51 |
-//! | DATA_HAVE | the client's Have must normalize; answered with the server's | §48 |
-//! | DATA_GET / KEY_PACKAGE_GET / SNAPSHOT_GET | more than 256 ranges or 256 distinct epochs is `NACK(MALFORMED_MESSAGE)` before any lookup, and overlapping ranges are merged; read authority; Key Packages only to their recipient; size-limited batches; no stored Snapshot is `NACK(MISSING_DEPENDENCY)` | §49, §52, §55 |
+//! | DATA_HAVE | the client's Have must normalize; full read authority; answered with the server's | §48 |
+//! | DATA_GET / KEY_PACKAGE_GET / SNAPSHOT_GET | more than 256 ranges or 256 distinct epochs is `NACK(MALFORMED_MESSAGE)` before any lookup, and overlapping ranges are merged; full read authority (a revoked reader's Control prefix is not enough); Key Packages only to their recipient; size-limited batches; no stored Snapshot is `NACK(MISSING_DEPENDENCY)` | §49, §52, §55 |
 //! | CONTROL/DATA/KEY_PACKAGE_BATCH, SNAPSHOT from a client | `NACK(PROTOCOL_UNSUPPORTED)`: mirror seeding (§46) is not offered | §46 |
 //! | live pushes | a committed Control Record (flag bit 1) or newly accepted Data Units (bit 0) to every other subscribed session; after each Control commit, subscribers without read authority are dropped | §41, §69 |
 //!
@@ -49,17 +49,17 @@ use lfcp::wire::control::chain::ChainOutcome;
 use lfcp::wire::control::ControlRecord;
 use lfcp::wire::data_unit::{check_put_previous, StoredUnits};
 use lfcp::wire::have::HaveVector;
-use lfcp::wire::message::DataRange;
 use lfcp::wire::message::{
     AckBody, AuthBody, Body, ChallengeBody, ErrorBody, HelloBody, HostingCredential, Message,
     ReadyBody, SnapshotSummary, WireActorHave,
 };
+use lfcp::wire::message::{ControlHead, DataRange};
 use lfcp::wire::session::{select_wire_profile, verify_auth, WIRE_PROFILE};
 use lfcp::wire::snapshot::ReceivedSnapshot;
 use lfcp::wire::state::{server_accepts, ServerSession, ServerSessionEvent};
 
 use crate::config::Config;
-use crate::coordinator::{Chain, Coordinator, Failure};
+use crate::coordinator::{Chain, Coordinator, Failure, ReadAccess};
 use crate::identity::ServerId;
 use crate::ingest::{self, IngestPolicy, ObjectKind, Unlimited};
 use crate::limits::{refusal, Floor, OsDiskSpace, Quota, WriteClass};
@@ -584,8 +584,14 @@ impl LfcpSession {
             return self.nack(out, request, WireCode::AuthorizationFailed).await;
         };
         let principal = *auth.principal.id();
-        let chain = match self.readable(request, resource_id, &principal, out).await {
-            Ok(chain) => chain,
+        let chain = match self
+            .control_readable(request, resource_id, &principal, out)
+            .await
+        {
+            Ok((chain, None)) => chain,
+            Ok((_, Some(prefix))) => {
+                return self.open_prefix(request, resource_id, prefix, out).await
+            }
             Err(flow) => return flow,
         };
         let store = self.shared.coordinator.store();
@@ -634,6 +640,44 @@ impl LfcpSession {
         .await
     }
 
+    /// RESOURCE_OPEN by a revoked reader (§41, identity-01):
+    /// `RESOURCE_OPENED` naming the record that revoked it as the only
+    /// Control Head, an empty Have, no Snapshot summary, no route version
+    /// or coordinator (they are the current head's) and no live
+    /// subscription; an earlier subscription of the session ends.
+    async fn open_prefix(
+        &mut self,
+        request: [u8; 16],
+        resource_id: ResourceId,
+        prefix: ControlHead,
+        out: &Outbound,
+    ) -> Flow {
+        self.subscriptions.remove(&resource_id);
+        self.shared
+            .coordinator
+            .hub()
+            .unsubscribe(resource_id, self.conn);
+        tracing::debug!(
+            conn = self.conn,
+            resource = %resource_id.to_hex(),
+            seq = prefix.sequence,
+            "opened for the Control prefix of a revoked reader"
+        );
+        self.send(
+            out,
+            Some(request),
+            Body::ResourceOpened {
+                resource_id,
+                control_heads: vec![prefix],
+                have: Vec::new(),
+                snapshot: None,
+                route_version: None,
+                coordinator: None,
+            },
+        )
+        .await
+    }
+
     async fn on_close(
         &mut self,
         request: [u8; 16],
@@ -658,8 +702,10 @@ impl LfcpSession {
         .await
     }
 
-    /// The accepted chain of `resource`, if `principal` may read it (§84);
-    /// otherwise the NACK already sent.
+    /// The accepted chain of `resource`, if `principal` may read it in
+    /// full (§41, §84); otherwise the NACK already sent. A revoked reader's
+    /// Control prefix read (§41) is not enough: Data, Key Package and
+    /// Snapshot reads are refused with `AUTHORIZATION_FAILED`.
     async fn readable(
         &self,
         request: [u8; 16],
@@ -667,9 +713,39 @@ impl LfcpSession {
         principal: &PrincipalId,
         out: &Outbound,
     ) -> Result<Chain, Flow> {
+        match self
+            .control_readable(request, resource, principal, out)
+            .await?
+        {
+            (chain, None) => Ok(chain),
+            (_, Some(_)) => Err(self.nack(out, request, WireCode::AuthorizationFailed).await),
+        }
+    }
+
+    /// The accepted chain of `resource` and, for a revoked reader (§41,
+    /// identity-01), the last Control Record it may read; `None` for a full
+    /// reader. Otherwise the NACK already sent.
+    async fn control_readable(
+        &self,
+        request: [u8; 16],
+        resource: ResourceId,
+        principal: &PrincipalId,
+        out: &Outbound,
+    ) -> Result<(Chain, Option<ControlHead>), Flow> {
         match self.shared.coordinator.chain(resource).await {
-            Ok(Some(chain)) if chain.may_read(principal) => Ok(chain),
-            Ok(Some(_)) => Err(self.nack(out, request, WireCode::AuthorizationFailed).await),
+            Ok(Some(chain)) => match chain.may_read(principal) {
+                ReadAccess::Full => Ok((chain, None)),
+                ReadAccess::ControlPrefix(head) => Ok((
+                    chain,
+                    Some(ControlHead {
+                        sequence: head.sequence,
+                        id: head.id,
+                    }),
+                )),
+                ReadAccess::Denied => {
+                    Err(self.nack(out, request, WireCode::AuthorizationFailed).await)
+                }
+            },
             Ok(None) => Err(self.nack(out, request, WireCode::ResourceNotHosted).await),
             Err(failure) => Err(self.nack_failure(out, request, failure).await),
         }
@@ -747,10 +823,19 @@ impl LfcpSession {
         out: &Outbound,
     ) -> Flow {
         let principal = self.principal();
-        if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
-            return flow;
-        }
-        match self.shared.coordinator.heads(resource_id).await {
+        let prefix = match self
+            .control_readable(request, resource_id, &principal, out)
+            .await
+        {
+            Ok((_, prefix)) => prefix,
+            Err(flow) => return flow,
+        };
+        // A revoked reader's head is the record that revoked it (§41).
+        let heads = match prefix {
+            Some(prefix) => Ok(vec![prefix]),
+            None => self.shared.coordinator.heads(resource_id).await,
+        };
+        match heads {
             Ok(control_heads) => {
                 self.send(
                     out,
@@ -781,13 +866,28 @@ impl LfcpSession {
             return self.nack(out, request, WireCode::MalformedMessage).await;
         }
         let principal = self.principal();
-        if let Err(flow) = self.readable(request, resource_id, &principal, out).await {
-            return flow;
-        }
-        let listing = Listing::Control {
-            resource: resource_id,
-            from: start,
-            to: end,
+        let listing = match self
+            .control_readable(request, resource_id, &principal, out)
+            .await
+        {
+            Ok((_, None)) => Listing::Control {
+                resource: resource_id,
+                from: start,
+                to: end,
+            },
+            // A revoked reader (§41): the accepted records through the one
+            // that revoked it, the range cut there; a range wholly after
+            // it asks only for later Control Records.
+            Ok((_, Some(prefix))) if start > prefix.sequence => {
+                return self.nack(out, request, WireCode::AuthorizationFailed).await
+            }
+            Ok((_, Some(prefix))) => Listing::ControlPrefix {
+                resource: resource_id,
+                head: prefix.id,
+                from: start,
+                to: end.min(prefix.sequence),
+            },
+            Err(flow) => return flow,
         };
         let batch = Body::ControlBatch {
             resource_id,
