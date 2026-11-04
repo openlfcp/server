@@ -470,3 +470,203 @@ async fn control_catch_up_and_every_key_package_of_a_tuple() {
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- identity-01 (LFCP-04-408 V2) -----------------------------------------
+
+mod identity {
+    use super::*;
+    use lfcp::wire::message::WireActorHave;
+    use support::identity::{ask, nack_code, scratch, session, store_chain, Identity};
+
+    fn package_ids(body: &Body) -> BTreeSet<[u8; 32]> {
+        match body {
+            Body::KeyPackageBatch { packages, .. } => packages
+                .iter()
+                .map(|p| *ReceivedKeyPackage::parse(p).unwrap().id().as_bytes())
+                .collect(),
+            other => panic!("expected KEY_PACKAGE_BATCH, got {other:?}"),
+        }
+    }
+
+    fn ids(v: &Identity, cases: &[&str]) -> BTreeSet<[u8; 32]> {
+        cases
+            .iter()
+            .map(|c| {
+                *ReceivedKeyPackage::parse(&v.cose(c))
+                    .unwrap()
+                    .id()
+                    .as_bytes()
+            })
+            .collect()
+    }
+
+    /// Key Packages between the devices of one human (WIRE-01 §25.2
+    /// same-root rule): a device without key/distribute delivers an epoch
+    /// key to its root and its siblings; each fetches its own later
+    /// (KEY_PACKAGE_GET, §52), nobody else's. A device that pairing just
+    /// registered in the Identity Resource fetches the keys its approver
+    /// sealed to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_root_key_packages_reach_the_siblings_that_fetch_them() {
+        let v = Identity::load();
+        let dir = scratch("sync-same-root");
+        let server = start(&dir, Options::default()).await;
+        let x = v.resource("X");
+        store_chain(&server.store, &v.chain("KP_dev_b_to_dev_a")).await;
+        let mut dev_b = session(&v, &server, "DEV_B").await;
+        let reply = ask(
+            &mut dev_b,
+            Body::KeyPackagePut {
+                resource_id: x,
+                packages: vec![v.cose("KP_dev_b_to_dev_a"), v.cose("KP_dev_b_to_owner")],
+            },
+        )
+        .await;
+        assert!(matches!(reply, Body::Ack(_)), "{reply:?}");
+        drop(dev_b);
+
+        let get = |resource, recipient| Body::KeyPackageGet {
+            resource_id: resource,
+            recipient,
+            epochs: vec![0],
+        };
+        for (label, cases) in [
+            ("DEV_A", &["KP_dev_b_to_dev_a"][..]),
+            ("OWNER", &["KP_dev_b_to_owner"][..]),
+        ] {
+            let mut client = session(&v, &server, label).await;
+            let reply = ask(&mut client, get(x, v.principal_id(label))).await;
+            assert_eq!(package_ids(&reply), ids(&v, cases), "{label}");
+        }
+        // Another human's device asks for DEV_A's packages: refused.
+        let mut dev_c = session(&v, &server, "DEV_C").await;
+        let reply = ask(&mut dev_c, get(x, v.principal_id("DEV_A"))).await;
+        assert_eq!(nack_code(&reply), 4);
+
+        // Pairing in I (flow F01): DEV_B, registered by P4, fetches the
+        // package DEV_A sealed to it.
+        let i = v.resource("I");
+        store_chain(&server.store, &v.chain("flow.kp_dev_a_to_dev_b_in_i")).await;
+        let mut dev_a = session(&v, &server, "DEV_A").await;
+        let reply = ask(
+            &mut dev_a,
+            Body::KeyPackagePut {
+                resource_id: i,
+                packages: vec![v.cose("flow.kp_dev_a_to_dev_b_in_i")],
+            },
+        )
+        .await;
+        assert!(matches!(reply, Body::Ack(_)), "{reply:?}");
+        let mut dev_b = session(&v, &server, "DEV_B").await;
+        let reply = ask(&mut dev_b, get(i, v.principal_id("DEV_B"))).await;
+        assert_eq!(
+            package_ids(&reply),
+            ids(&v, &["flow.kp_dev_a_to_dev_b_in_i"])
+        );
+
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Objects by devices are relayed (§84): any session uploads them, live
+    /// Data subscribers that read (devices of two humans) receive the exact
+    /// bytes, and a device that connects later catches up through
+    /// DATA_HAVE and DATA_GET.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn device_units_are_relayed_live_and_on_catch_up() {
+        let v = Identity::load();
+        let dir = scratch("sync-relay");
+        let server = start(&dir, Options::default()).await;
+        let x = v.resource("X");
+        store_chain(&server.store, &v.chain("D_bridge_writes_x")).await;
+        let open = Body::ResourceOpen {
+            resource_id: x,
+            control_heads: vec![],
+            have: vec![],
+            grant_ids: None,
+            flags: Some(0b001),
+        };
+        let mut live = Vec::new();
+        for label in ["DEV_B", "DEV_C"] {
+            let mut client = session(&v, &server, label).await;
+            let reply = ask(&mut client, open.clone()).await;
+            assert!(matches!(reply, Body::ResourceOpened { .. }), "{label}");
+            live.push((label, client));
+        }
+        // OWNER relays a unit of DEV_A and one of BOB's service device.
+        let relayed = vec![v.cose("D_dev_a_seq1"), v.cose("D_bridge_writes_x")];
+        let mut relay = session(&v, &server, "OWNER").await;
+        let reply = ask(
+            &mut relay,
+            Body::DataPut {
+                resource_id: x,
+                units: relayed.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(reply, Body::Ack(_)), "{reply:?}");
+        for (label, client) in &mut live {
+            assert_eq!(
+                client.recv().await.body,
+                Body::DataBatch {
+                    resource_id: x,
+                    units: relayed.clone(),
+                },
+                "{label}"
+            );
+        }
+
+        // DEV_E (BOB's, certified by DEV_C) catches up from nothing.
+        let mut late = session(&v, &server, "DEV_E").await;
+        let Body::DataHave { have, .. } = ask(
+            &mut late,
+            Body::DataHave {
+                resource_id: x,
+                have: vec![],
+            },
+        )
+        .await
+        else {
+            panic!("DATA_HAVE");
+        };
+        let actors: BTreeMap<[u8; 32], u64> = have
+            .iter()
+            .map(|h: &WireActorHave| (*h.principal.as_bytes(), h.contiguous))
+            .collect();
+        assert_eq!(
+            actors,
+            [
+                (*v.principal_id("DEV_A").as_bytes(), 1),
+                (*v.principal_id("BRIDGE").as_bytes(), 1)
+            ]
+            .into_iter()
+            .collect()
+        );
+        let ranges = have
+            .iter()
+            .map(|h| DataRange {
+                principal: h.principal,
+                start: 1,
+                end: 1,
+            })
+            .collect();
+        let Body::DataBatch { units, .. } = ask(
+            &mut late,
+            Body::DataGet {
+                resource_id: x,
+                ranges,
+            },
+        )
+        .await
+        else {
+            panic!("DATA_GET");
+        };
+        assert_eq!(
+            units.into_iter().collect::<BTreeSet<_>>(),
+            relayed.into_iter().collect::<BTreeSet<_>>()
+        );
+
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
