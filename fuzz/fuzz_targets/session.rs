@@ -16,7 +16,9 @@
 //!
 //! `LFCP_FUZZ_WRITE_SEEDS=<dir>` writes the seed corpus (a full owner
 //! session: open, have, get, grant, Data Units, an invitation and its
-//! claim, a revoke, key package and Snapshot reads) and exits.
+//! claim, a revoke, key package and Snapshot reads; then identity-01: a
+//! DEVICE_GRANT, a device's Data Unit, a DEVICE_REVOKE, the Control read
+//! after it and a Genesis with field 5 signed by the device) and exits.
 
 #![no_main]
 
@@ -27,7 +29,11 @@ use lfcp::base::{Hash32, PrincipalId};
 use lfcp::principal::PrincipalKeys;
 use lfcp::wire::control::authority::ability;
 use lfcp::wire::control::body::{
-    CapabilityClaimBody, CapabilityGrantBody, CapabilityRevokeBody, ControlBody,
+    CapabilityClaimBody, CapabilityGrantBody, CapabilityRevokeBody, ControlBody, DeviceGrantBody,
+    DeviceRevokeBody, Endpoint, GenesisBody,
+};
+use lfcp::wire::control::device::{
+    CertificateChain, DeviceCertificate, DeviceCertificatePayload, DeviceKind,
 };
 use lfcp::wire::control::{ControlRecord, ControlRecordHeader, ReceivedControlRecord};
 use lfcp::wire::data_unit::{DataUnit, DataUnitHeader};
@@ -285,6 +291,93 @@ fn write_seeds(dir: &std::path::Path) {
             unit.signed_object().bytes().to_vec()
         })
         .collect();
+    // identity-01: a personal device of the owner, granted after the
+    // revoke, writing one unit, then revoked; and a Genesis it signs for
+    // another Resource with its chain (field 5).
+    let device = PrincipalKeys::from_secrets(&[7; 32], [8; 32]);
+    let root = *alice.descriptor().id();
+    let certificate = DeviceCertificate::sign(
+        DeviceCertificatePayload {
+            root,
+            device: device.descriptor().clone(),
+            kind: DeviceKind::Personal,
+            mask: vec![1, 2, 3, 13],
+            scope: vec![],
+            serial: [0x11; 16],
+        },
+        &alice,
+    )
+    .unwrap();
+    let chain = CertificateChain::new(vec![certificate], &root).unwrap();
+    let device_grant = sign(
+        &alice,
+        5,
+        &revoke,
+        ControlBody::DeviceGrant(DeviceGrantBody {
+            root,
+            chain: chain.clone(),
+            pairing_device: None,
+        }),
+    );
+    let device_unit = DataUnit::seal(
+        DataUnitHeader {
+            resource_id: r,
+            data_epoch: 0,
+            actor: *device.descriptor().id(),
+            sequence: 1,
+            previous: None,
+            control_head: Hash32::from_bytes(
+                *ReceivedControlRecord::parse(&device_grant)
+                    .unwrap()
+                    .id()
+                    .as_bytes(),
+            ),
+        },
+        b"device plaintext",
+        &dek,
+        &device,
+    )
+    .unwrap()
+    .signed_object()
+    .bytes()
+    .to_vec();
+    let device_revoke = sign(
+        &alice,
+        6,
+        &device_grant,
+        ControlBody::DeviceRevoke(DeviceRevokeBody {
+            root,
+            device: *device.descriptor().id(),
+            reason: 1,
+            approval: None,
+        }),
+    );
+    let url = "wss://sync.example.test/v1/ws".to_owned();
+    let device_genesis = ControlRecord::sign(
+        ControlRecordHeader {
+            resource_id: lfcp::base::ResourceId::from_bytes([0x43; 32]),
+            sequence: 0,
+            previous: None,
+            issuer: *device.descriptor().id(),
+        },
+        ControlBody::Genesis(GenesisBody {
+            data_profile: "org.openlfcp.shared-objects.v1".into(),
+            owner: alice.descriptor().clone(),
+            dek_commitment: Hash32::from_bytes([3; 32]),
+            endpoints: vec![Endpoint {
+                url: url.clone(),
+                priority: 0,
+                flags: None,
+            }],
+            coordinator: url,
+            device_chain: Some(chain),
+        }),
+        &device,
+    )
+    .unwrap()
+    .signed_object()
+    .bytes()
+    .to_vec();
     let me: PrincipalId = *alice.descriptor().id();
     let id_of = |rec: &[u8]| ReceivedControlRecord::parse(rec).unwrap().id();
     let mut n = 0u8;
@@ -359,6 +452,29 @@ fn write_seeds(dir: &std::path::Path) {
             snapshot_id: None,
         }),
         msg(Body::Ping([7; 8])),
+        msg(Body::ControlPut {
+            resource_id: r,
+            expected_head: id_of(&revoke),
+            record: device_grant.clone(),
+        }),
+        msg(Body::DataPut {
+            resource_id: r,
+            units: vec![device_unit],
+        }),
+        msg(Body::ControlPut {
+            resource_id: r,
+            expected_head: id_of(&device_grant),
+            record: device_revoke,
+        }),
+        msg(Body::ControlGet {
+            resource_id: r,
+            start: 4,
+            end: 8,
+        }),
+        msg(Body::ResourceHost {
+            genesis: device_genesis,
+            hosting_credential: None,
+        }),
         msg(Body::ResourceClose { resource_id: r }),
     ];
     let write = |name: &str, flags: u8, recs: &[Vec<u8>]| {
