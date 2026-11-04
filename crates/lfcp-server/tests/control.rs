@@ -837,3 +837,374 @@ async fn control_reads_need_read_authority_and_return_every_record() {
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- identity-01 (LFCP-04-408 V2) -----------------------------------------
+
+mod identity {
+    use super::*;
+    use support::identity::{
+        ask, control_ack, nack_code, put, scratch, session, signer, store_chain, Identity,
+    };
+
+    fn server_options() -> Options {
+        options(vec![SYNC_A.into()], Arc::default())
+    }
+
+    /// One session per fixture Principal (new connections per address are
+    /// rate limited).
+    struct Sessions<'a> {
+        v: &'a Identity,
+        server: &'a support::lfcp::Running,
+        open: std::collections::HashMap<String, Client>,
+    }
+
+    impl<'a> Sessions<'a> {
+        fn new(v: &'a Identity, server: &'a support::lfcp::Running) -> Self {
+            Sessions {
+                v,
+                server,
+                open: Default::default(),
+            }
+        }
+
+        async fn of(&mut self, label: &str) -> &mut Client {
+            if !self.open.contains_key(label) {
+                let client = session(self.v, self.server, label).await;
+                self.open.insert(label.to_owned(), client);
+            }
+            self.open.get_mut(label).unwrap()
+        }
+
+        /// The reply to case `id`'s record put at `head` by its signer.
+        async fn put(&mut self, id: &str, head: ControlRecordId) -> Body {
+            let v = self.v;
+            let client = self.of(&signer(v, id)).await;
+            ask(client, put(v, id, head)).await
+        }
+
+        /// Commit the published records `ids` in order, each by its
+        /// signer, each on the previous one; returns the last head.
+        async fn commit(&mut self, ids: &[&str], mut head: ControlRecordId) -> ControlRecordId {
+            for id in ids {
+                let reply = self.put(id, head).await;
+                assert_eq!(reply, control_ack(self.v.record_id(id)), "{id}");
+                head = self.v.record_id(id);
+            }
+            head
+        }
+    }
+
+    async fn host(v: &Identity, server: &support::lfcp::Running, genesis: &str) {
+        let mut client = session(v, server, &signer(v, genesis)).await;
+        let reply = ask(
+            &mut client,
+            Body::ResourceHost {
+                genesis: v.cose(genesis),
+                hosting_credential: None,
+            },
+        )
+        .await;
+        assert!(matches!(reply, Body::ResourceHosted { .. }), "{reply:?}");
+    }
+
+    async fn stored(server: &support::lfcp::Running, resource: ResourceId) -> usize {
+        server
+            .store
+            .control_records(resource, 0, u64::MAX)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// DEVICE_GRANT and DEVICE_REVOKE records (types 9, 10) of the
+    /// published chain commit through CONTROL_PUT by the sessions of their
+    /// signers (a device included), each by compare-and-swap on the
+    /// previous head; a repeated put is acknowledged again; a put on a
+    /// stale head names the current one; refused proposals are not stored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn device_records_commit_through_control_put() {
+        let v = Identity::load();
+        let dir = scratch("control-devices");
+        let server = start(&dir, server_options()).await;
+        let x = v.resource("X");
+        host(&v, &server, "J0_genesis").await;
+        let mut sessions = Sessions::new(&v, &server);
+        let j2 = sessions
+            .commit(
+                &["J1_grant_bob", "J2_grant_carol"],
+                v.record_id("J0_genesis"),
+            )
+            .await;
+
+        // Refused at J2, whoever proposes them, and nothing is stored.
+        for (id, code) in [
+            ("device_grant_body_extra_key", MALFORMED_MESSAGE),
+            ("device_grant_root_unknown", MISSING_DEPENDENCY),
+            ("device_grant_issuer_unrelated", AUTHORIZATION_FAILED),
+        ] {
+            assert_eq!(v.case(id)["context"]["head"]["case"], "J2_grant_carol");
+            assert_eq!(nack_code(&sessions.put(id, j2).await), code, "{id}");
+        }
+        assert_eq!(stored(&server, x).await, 3);
+
+        let i1 = sessions.commit(&["I1_device_grant_dev_a"], j2).await;
+        for (id, code) in [
+            ("device_revoke_with_field_3", MALFORMED_MESSAGE),
+            ("device_grant_issuer_unknown", MISSING_DEPENDENCY),
+            ("device_revoke_wrong_root", AUTHORIZATION_FAILED),
+            ("device_grant_repeat_same_leaf_fresh", AUTHORIZATION_FAILED),
+            (
+                "device_grant_self_recertify_active_managing",
+                AUTHORIZATION_FAILED,
+            ),
+        ] {
+            assert_eq!(
+                v.case(id)["context"]["head"]["case"],
+                "I1_device_grant_dev_a",
+                "{id}"
+            );
+            assert_eq!(v.expected_code(id), Some(code), "{id}");
+            assert_eq!(nack_code(&sessions.put(id, i1).await), code, "{id}");
+        }
+        assert_eq!(stored(&server, x).await, 4);
+
+        let i10 = sessions
+            .commit(
+                &[
+                    "I2_device_grant_self_dev_b",
+                    "I3_owner_action_by_dev_a",
+                    "I4_device_grant_dev_c_bob",
+                    "I5_device_grant_dev_e_by_dev_c",
+                    "I6_grant_by_member_device",
+                    "I7_revoke_covered_by_sibling",
+                    "I8_bridge_grant",
+                    "I9_device_revoke_dev_a",
+                    "I10_recertify_dev_b",
+                ],
+                i1,
+            )
+            .await;
+        assert_eq!(stored(&server, x).await, 13);
+
+        // A repeated put of an accepted record is the same ACK, at any
+        // expected head (at-least-once delivery).
+        let owner = sessions.of("OWNER").await;
+        for expected in [j2, i10] {
+            assert_eq!(
+                ask(owner, put(&v, "I1_device_grant_dev_a", expected)).await,
+                control_ack(i1)
+            );
+        }
+        // A record proposed on I9 after I10 committed: the head moved.
+        let reply = ask(
+            owner,
+            put(
+                &v,
+                "flow.revoke_suspended_dev_b",
+                v.record_id("I9_device_revoke_dev_a"),
+            ),
+        )
+        .await;
+        assert_eq!(nack_code(&reply), CONTROL_HEAD_MISMATCH);
+        let Body::Nack(body) = reply else {
+            unreachable!()
+        };
+        assert_eq!(
+            body.details,
+            Some(lfcp::cbor::Value::bytes(i10.as_bytes().to_vec()))
+        );
+        assert_eq!(stored(&server, x).await, 13);
+        assert_eq!(server.store.head(x).await.unwrap().unwrap().id, i10);
+
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two valid revocations of DEV_B on one head (the owner's and DEV_A's,
+    /// identity flow F06): exactly one commits; the other is
+    /// CONTROL_HEAD_MISMATCH naming the winner and is not stored; DEV_A's
+    /// fresh proposal on the new head is then refused (DEV_B is revoked).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn competing_device_revocations_commit_exactly_once() {
+        let v = Identity::load();
+        let dir = scratch("control-device-race");
+        let server = start(&dir, server_options()).await;
+        let x = v.resource("X");
+        store_chain(&server.store, &v.chain("flow.f06_owner_revokes_dev_b")).await;
+        let i2 = v.record_id("I2_device_grant_self_dev_b");
+        assert_eq!(server.store.head(x).await.unwrap().unwrap().id, i2);
+
+        let ids = [
+            "flow.f06_owner_revokes_dev_b",
+            "flow.f06_dev_a_stale_proposal",
+        ];
+        let mut owner = session(&v, &server, "OWNER").await;
+        let mut dev_a = session(&v, &server, "DEV_A").await;
+        let (a, b) = tokio::join!(
+            ask(&mut owner, put(&v, ids[0], i2)),
+            ask(&mut dev_a, put(&v, ids[1], i2)),
+        );
+        let replies = [a, b];
+        let winners: Vec<usize> = (0..2)
+            .filter(|&i| matches!(replies[i], Body::Ack(_)))
+            .collect();
+        assert_eq!(winners.len(), 1, "{replies:?}");
+        let (w, l) = (winners[0], 1 - winners[0]);
+        let winner = v.record_id(ids[w]);
+        assert_eq!(replies[w], control_ack(winner));
+        assert_eq!(nack_code(&replies[l]), CONTROL_HEAD_MISMATCH);
+        assert_eq!(
+            server.store.control_records(x, 5, 5).await.unwrap().len(),
+            1
+        );
+        assert_eq!(server.store.head(x).await.unwrap().unwrap().id, winner);
+        // The loser's revocation is redundant now.
+        if w == 0 {
+            let reply = ask(&mut dev_a, put(&v, "flow.f06_dev_a_fresh_revoke", winner)).await;
+            assert_eq!(nack_code(&reply), AUTHORIZATION_FAILED);
+        }
+
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Pairing (identity flow F01, resource I): the coordinator checks the
+    /// approval of a DEVICE_GRANT against the consuming DEVICE_REVOKE
+    /// (reason 3, the approved payload digest) at the expected head.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_approval_is_checked_by_compare_and_swap() {
+        let v = Identity::load();
+        let dir = scratch("control-pairing");
+        let server = start(&dir, server_options()).await;
+        let i = v.resource("I");
+        host(&v, &server, "P0_genesis_i").await;
+        let mut sessions = Sessions::new(&v, &server);
+        let p2 = sessions
+            .commit(
+                &["P1_device_grant_dev_a_i", "P2_pairing_device"],
+                v.record_id("P0_genesis_i"),
+            )
+            .await;
+        for (id, code) in [
+            (
+                "device_grant_approval_without_consume",
+                AUTHORIZATION_FAILED,
+            ),
+            ("device_revoke_reason3_without_field4", MALFORMED_MESSAGE),
+            ("device_revoke_field4_with_reason_0", MALFORMED_MESSAGE),
+        ] {
+            assert_eq!(nack_code(&sessions.put(id, p2).await), code, "{id}");
+        }
+        let p3 = sessions.commit(&["P3_consume_for_dev_b"], p2).await;
+        for (id, code) in [
+            ("device_grant_approval_mismatch", AUTHORIZATION_FAILED),
+            ("device_grant_field2_personal", AUTHORIZATION_FAILED),
+            ("device_revoke_consume_twice", AUTHORIZATION_FAILED),
+        ] {
+            assert_eq!(nack_code(&sessions.put(id, p3).await), code, "{id}");
+        }
+        assert_eq!(stored(&server, i).await, 4);
+        let p4 = sessions.commit(&["P4_register_dev_b_approved"], p3).await;
+        assert_eq!(server.store.head(i).await.unwrap().unwrap().id, p4);
+        assert_eq!(stored(&server, i).await, 5);
+
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// After each commit the subscribers are revalidated (§69): a
+    /// DEVICE_REVOKE ends the live pushes of the revoked device and of the
+    /// devices it suspends (DEV_B, certified by DEV_A) before it is pushed;
+    /// a full reader still receives it. A recertified device reads again
+    /// after a new RESOURCE_OPEN.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_revoke_ends_the_live_pushes_of_the_devices_it_disables() {
+        let v = Identity::load();
+        let dir = scratch("control-revalidate");
+        let server = start(&dir, server_options()).await;
+        let x = v.resource("X");
+        let chain = v.chain("I9_device_revoke_dev_a");
+        let i8 = store_chain(&server.store, &chain).await;
+        assert_eq!(i8, v.record_id("I8_bridge_grant"));
+        let live = |resource| Body::ResourceOpen {
+            resource_id: resource,
+            control_heads: vec![],
+            have: vec![],
+            grant_ids: None,
+            flags: Some(0b011),
+        };
+        let mut subscribers = Vec::new();
+        for label in ["BOB", "DEV_A", "DEV_B", "DEV_C"] {
+            let mut client = session(&v, &server, label).await;
+            let reply = ask(&mut client, live(x)).await;
+            assert!(
+                matches!(reply, Body::ResourceOpened { .. }),
+                "{label}: {reply:?}"
+            );
+            subscribers.push((label, client));
+        }
+        let mut owner = session(&v, &server, "OWNER").await;
+        let reply = ask(&mut owner, put(&v, "I9_device_revoke_dev_a", i8)).await;
+        assert_eq!(reply, control_ack(v.record_id("I9_device_revoke_dev_a")));
+        let pushed = |record: &str| Body::ControlBatch {
+            resource_id: x,
+            records: vec![v.cose(record)],
+        };
+        for (label, client) in &mut subscribers {
+            match *label {
+                "BOB" | "DEV_C" => {
+                    assert_eq!(
+                        client.recv().await.body,
+                        pushed("I9_device_revoke_dev_a"),
+                        "{label}"
+                    )
+                }
+                _ => {
+                    client.request(Body::Ping([9; 8])).await;
+                    assert_eq!(client.recv().await.body, Body::Pong([9; 8]), "{label}");
+                }
+            }
+        }
+        // I10 recertifies DEV_B by OWNER: pushed to the readers that kept
+        // their subscription, not to DEV_B, whose subscription ended.
+        let reply = ask(
+            &mut owner,
+            put(
+                &v,
+                "I10_recertify_dev_b",
+                v.record_id("I9_device_revoke_dev_a"),
+            ),
+        )
+        .await;
+        assert_eq!(reply, control_ack(v.record_id("I10_recertify_dev_b")));
+        for (label, client) in &mut subscribers {
+            match *label {
+                "BOB" | "DEV_C" => {
+                    assert_eq!(
+                        client.recv().await.body,
+                        pushed("I10_recertify_dev_b"),
+                        "{label}"
+                    )
+                }
+                _ => {
+                    client.request(Body::Ping([10; 8])).await;
+                    assert_eq!(client.recv().await.body, Body::Pong([10; 8]), "{label}");
+                }
+            }
+        }
+        // DEV_B reads in full again; DEV_A only its prefix.
+        let (_, dev_b) = &mut subscribers[2];
+        let Body::ResourceOpened { control_heads, .. } = ask(dev_b, live(x)).await else {
+            panic!("DEV_B reopens");
+        };
+        assert_eq!(control_heads[0].id, v.record_id("I10_recertify_dev_b"));
+        let (_, dev_a) = &mut subscribers[1];
+        let Body::ResourceOpened { control_heads, .. } = ask(dev_a, live(x)).await else {
+            panic!("DEV_A reopens its prefix");
+        };
+        assert_eq!(control_heads[0].id, v.record_id("I9_device_revoke_dev_a"));
+
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
