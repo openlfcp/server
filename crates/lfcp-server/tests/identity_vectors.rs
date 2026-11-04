@@ -1,4 +1,4 @@
-//! LFCP-IDENTITY-TEST-VECTORS-01 (spec#3, mvp-0.4-baseline.1) through the
+//! LFCP-IDENTITY-TEST-VECTORS-01 (mvp-0.4-baseline.2) through the
 //! server's own code paths, for every case a server decides (WIRE-01 §37
 //! `identity-01`, §41, §84; the corpus list is IDENTITY-PROFILE-01 §12):
 //!
@@ -162,7 +162,19 @@ async fn control_records_through_control_put() {
         .filter(|c| c["kind"] == "control_record")
         .map(|c| c["id"].as_str().unwrap().to_owned())
         .collect();
-    assert!(ids.len() > 150, "{} cases", ids.len());
+    assert_eq!(ids.len(), 196, "baseline.2 Control Record cases");
+    // I9: epoch placement precedes dependencies, signatures and authority,
+    // but follows structural validation (§19, §62).
+    for required in [
+        "key_epoch_wrong_number",
+        "key_epoch_repeats_current_number",
+        "key_epoch_wrong_number_and_bad_sig",
+        "key_epoch_wrong_number_unknown_issuer",
+        "key_epoch_wrong_number_without_key_rotate",
+        "key_epoch_wrong_number_noncanonical_frontier",
+    ] {
+        assert!(ids.iter().any(|id| id == required), "{required}");
+    }
     let mut results = Vec::new();
     for id in ids {
         let outcome = control_outcome(&v, &id).await;
@@ -184,7 +196,11 @@ async fn data_units_key_packages_and_snapshots_through_ingest() {
         })
         .map(|c| c["id"].as_str().unwrap().to_owned())
         .collect();
-    assert!(ids.len() > 50, "{} cases", ids.len());
+    assert_eq!(
+        ids.len(),
+        72,
+        "baseline.2 Data Units, Key Packages and Snapshots"
+    );
     let mut results = Vec::new();
     for id in ids {
         let outcome = object_outcome(&v, &id).await;

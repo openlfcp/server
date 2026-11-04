@@ -1,14 +1,16 @@
-//! The Control read for a revoked reader (WIRE-01 §41, identity-01; task
-//! LFCP-04-408 V3) and the other session cases of
+//! The Control read for a revoked reader (WIRE-01 §41, identity-01;
+//! mvp-0.4-baseline.2) and the other session cases of
 //! LFCP-IDENTITY-TEST-VECTORS-01, over real WebSocket sessions.
 //!
 //! A registered device that held `data/read` immediately before the first
 //! `DEVICE_REVOKE` naming it reads the accepted Control Chain through that
 //! record: `RESOURCE_OPENED` names it as the only head, with an empty Have,
-//! no Snapshot summary and no live subscription; `CONTROL_HAVE` answers it;
-//! `CONTROL_GET` returns the accepted records up to it. Every other read is
-//! `NACK(AUTHORIZATION_FAILED)`. Presence is refused to every session: the
-//! server does not offer the `presence` extension (§58). Uploads are
+//! no Snapshot summary, no fields 4/5 and no live subscription;
+//! `CONTROL_HAVE` answers it; `CONTROL_GET` returns the accepted records
+//! up to it. Every other read is `NACK(AUTHORIZATION_FAILED)`. Presence is
+//! refused to every session: the
+//! server does not offer the `presence` extension (§41, §58), so its reply is
+//! `PROTOCOL_UNSUPPORTED`, including for revoked readers. Uploads are
 //! checked by object, whoever sends them (§84).
 
 mod support;
@@ -17,7 +19,7 @@ use lfcp::base::{PrincipalId, ResourceId};
 use lfcp::principal::PrincipalKeys;
 use lfcp::wire::control::body::{CapabilityGrantBody, ControlBody};
 use lfcp::wire::control::{ControlRecord, ControlRecordHeader, ReceivedControlRecord};
-use lfcp::wire::message::{Body, ControlHead, DataRange};
+use lfcp::wire::message::{Body, ControlHead, DataRange, DecodeOptions, Message};
 use support::identity::{scratch, store_chain, Identity};
 use support::lfcp::{start, Client, Options, Running};
 
@@ -455,17 +457,45 @@ async fn the_prefix_is_the_accepted_chain_through_the_revocation() {
         nack_code(&ask(&mut revoked, control_get(resource, 12, 12)).await),
         AUTHORIZATION_FAILED
     );
-    let Body::ResourceOpened {
-        control_heads,
-        have,
-        snapshot,
-        ..
-    } = ask(&mut revoked, open(resource)).await
-    else {
-        panic!("DEV_A opens its prefix");
-    };
-    assert_eq!(control_heads, vec![revocation]);
-    assert!(have.is_empty() && snapshot.is_none());
+    // Inspect the wire map as well as the decoded body: §41 requires
+    // fields 3/4/5 to be absent, not null or current-head metadata.
+    let request = revoked.request(open(resource)).await;
+    let bytes = revoked.recv_bytes().await;
+    let wire = lfcp::cbor::decode_strict(&bytes).unwrap();
+    let body = wire.get_uint(4).unwrap();
+    for field in [3, 4, 5] {
+        assert_eq!(body.get_uint(field), None, "RESOURCE_OPENED field {field}");
+    }
+    let reply = Message::decode(&bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(reply.correlation_id, Some(request));
+    assert_eq!(
+        reply.body,
+        Body::ResourceOpened {
+            resource_id: resource,
+            control_heads: vec![revocation],
+            have: vec![],
+            snapshot: None,
+            route_version: None,
+            coordinator: None,
+        }
+    );
+    // Presence has the same unsupported-extension result for a full
+    // reader as for the revoked reader checked by refused_reads below.
+    assert_eq!(
+        nack_code(
+            &ask(
+                &mut full,
+                Body::Presence {
+                    resource_id: resource,
+                    principal: *owner.descriptor().id(),
+                    ttl_ms: 1000,
+                    payload: vec![],
+                },
+            )
+            .await
+        ),
+        PROTOCOL_UNSUPPORTED
+    );
     refused_reads(&mut revoked, resource, v.principal_id("DEV_A"), 11).await;
     // A reversed range stays malformed.
     assert_eq!(

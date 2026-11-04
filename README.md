@@ -41,7 +41,7 @@ not claim full LFCP-WIRE-01 conformance.
 - `lfcp-admin` CLI (POST-014): pairing and signed admin calls.
 - Abuse limits (POST-003): quota hosting mode by default, client IP behind
   a trusted proxy, per-IP and rate limits, a global storage floor.
-- Multi-device root identity (LFCP-04-408, `mvp-0.4-baseline.1`): READY
+- Multi-device root identity (LFCP-04-408, `mvp-0.4-baseline.2`): READY
   lists the server extension `identity-01` (WIRE-01 §37). `DEVICE_GRANT`
   and `DEVICE_REVOKE` (types 9, 10), Genesis field 5 and transfer commit
   field 2 are validated by sdk-rs as a client validates them; Data Units,
@@ -407,15 +407,17 @@ After READY:
   device) reads the accepted Control Chain through that record, so that it
   can prove its revocation to its human. `RESOURCE_OPENED` names that
   record as the only Control Head, with an empty Have, no Snapshot summary,
-  no route version or coordinator and no live subscription; `CONTROL_HAVE`
-  answers that head; `CONTROL_GET` returns the accepted records up to it
+  no route version or coordinator (fields 4 and 5 are absent) and no live
+  subscription; `CONTROL_HAVE` answers that head; `CONTROL_GET` returns the accepted records up to it
   (a range is cut there; fork evidence is not part of the prefix), and a
   range wholly after it is `NACK(AUTHORIZATION_FAILED)`, as are
   `DATA_HAVE`, `DATA_GET`, `KEY_PACKAGE_GET` and `SNAPSHOT_GET`. An unbound
   or intermediate-only device, one that never held `data/read`, and one
   whose root lost standing without a `DEVICE_REVOKE` read nothing. A
   `DEVICE_REVOKE` drops the revoked device's live subscriptions before it
-  is pushed. Uploads stay checked by object, from any session.
+  is pushed. This server does not support `presence`, so it answers presence
+  with `NACK(PROTOCOL_UNSUPPORTED)` for every session, revoked readers
+  included (§41, §58). Uploads stay checked by object, from any session.
 - `RESOURCE_CLOSE`: drops the session's subscription and answers `ACK`;
   stored data is untouched.
 - Presence and mirror seeding (client `CONTROL_BATCH`, `DATA_BATCH`,
@@ -786,13 +788,17 @@ warns when the `lfcp` crate has uncommitted changes. Move the lock
 deliberately when the server needs newer sdk-rs code. A git or tag
 dependency replaces this at a release milestone.
 
-`spec.lock` pins `openlfcp/spec` (`mvp-0.4-baseline.1`: `mvp-0.2-baseline.12`
+`spec.lock` pins `openlfcp/spec` (`mvp-0.4-baseline.2`: `mvp-0.2-baseline.12`
 plus multi-device root identity, ADR 0011: Device Principals and
 certificate chains, Control Record types `9` and `10`, Genesis field `5`,
 transfer commit field `2`, the same-root Key Package rule, the `identity-01`
 server extension, the Control read for a revoked reader, the §62 ordering,
 IDENTITY-PROFILE-01 and the identity vector corpora; one published value
-moved, `unknown_core_type_C1` now uses type `31`); tests read vectors
+moved in baseline.1, `unknown_core_type_C1` now uses type `31`). Baseline.2
+clarifies the epoch-number validation order (§19, §62), owner-keyed hosting
+and re-hosting (§39, §41.1; I12), revoked-reader replies (§41) and identity
+profile admission, and corrects the complete `READY_identity_01` vector
+(type 3, `LFCP-WIRE-01`). Tests read vectors
 from `../spec` (or `$LFCP_SPEC_DIR`) with `git show` at the locked commit.
 
 ## Build from a clean checkout
