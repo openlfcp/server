@@ -1,6 +1,6 @@
 //! LFCP-IDENTITY-TEST-VECTORS-01 (spec#3, mvp-0.4-baseline.1) through the
-//! server's own code paths, for every case a server decides (WIRE-01 §3.11
-//! of the identity draft, IDENTITY-PROFILE-01 §12):
+//! server's own code paths, for every case a server decides (WIRE-01 §37
+//! `identity-01`, §41, §84; the corpus list is IDENTITY-PROFILE-01 §12):
 //!
 //! | Kind | Server path |
 //! | --- | --- |
