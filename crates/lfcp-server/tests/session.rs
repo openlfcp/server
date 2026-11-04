@@ -9,7 +9,9 @@ use std::sync::Arc;
 use lfcp::base::{ControlRecordId, ResourceId};
 use lfcp::wire::control::body::ControlBody;
 use lfcp::wire::control::ReceivedControlRecord;
-use lfcp::wire::message::{Body, ControlHead, HelloBody, HostingCredential, Message};
+use lfcp::wire::message::{
+    Body, ControlHead, DecodeOptions, HelloBody, HostingCredential, Message,
+};
 use lfcp::wire::session::WIRE_PROFILE;
 use lfcp::wire::snapshot::ReceivedSnapshot;
 use lfcp_server::store::{CasOutcome, Put};
@@ -44,6 +46,19 @@ fn script_vector_handshake(v: &Vectors, script: &Script) {
     script.push(id16(&v.session("session_id")));
     script.push(message_id(&v.message("CHALLENGE")));
     script.push(message_id(&v.message("READY")));
+}
+
+/// The published READY (LFCP-TEST-VECTORS-01, a server without
+/// extensions) as an identity-01 server sends it: the same message with
+/// field 5 = ["identity-01"] (WIRE-01 §37), byte for byte otherwise.
+fn identity_ready(v: &Vectors) -> Vec<u8> {
+    let mut ready = Message::decode(&v.message("READY"), &DecodeOptions::default()).unwrap();
+    let Body::Ready(body) = &mut ready.body else {
+        panic!("READY")
+    };
+    assert_eq!(body.extensions, Some(vec![]));
+    body.extensions = Some(vec!["identity-01".into()]);
+    ready.encode()
 }
 
 fn vector_options(v: &Vectors) -> (Options, Arc<Script>) {
@@ -97,9 +112,10 @@ async fn the_published_handshake_and_hosting_are_reproduced_byte_for_byte() {
     client.send_bytes(v.message("HELLO")).await;
     assert_eq!(client.recv_bytes().await, v.message("CHALLENGE"));
     // AUTH, BOB's proof over this exact transcript → READY (§36, §37):
-    // 8 MiB, durability 2, heartbeat 30000 ms, no extensions.
+    // 8 MiB, durability 2, heartbeat 30000 ms, and the extension
+    // identity-01 (the published READY lists none).
     client.send_bytes(v.message("AUTH")).await;
-    assert_eq!(client.recv_bytes().await, v.message("READY"));
+    assert_eq!(client.recv_bytes().await, identity_ready(&v));
 
     // RESOURCE_HOST(C0), no hosting credential (self-hosted MVP mode) →
     // RESOURCE_HOSTED at durability 2.
@@ -330,7 +346,7 @@ async fn resource_messages_before_ready_are_refused_and_the_session_continues() 
 
     // The handshake still completes.
     client.send_bytes(v.message("AUTH")).await;
-    assert_eq!(client.recv_bytes().await, v.message("READY"));
+    assert_eq!(client.recv_bytes().await, identity_ready(&v));
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
