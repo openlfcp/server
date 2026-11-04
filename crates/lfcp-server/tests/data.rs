@@ -1552,3 +1552,202 @@ async fn any_session_may_relay_a_validly_signed_object() {
         "BOB's Snapshot"
     );
 }
+
+// ---- identity-01 (LFCP-04-408 V2) -----------------------------------------
+
+mod identity {
+    use super::*;
+    use lfcp::wire::key_package::ReceivedKeyPackage;
+    use support::identity::{ask, nack_code, scratch, session, store_chain, Identity};
+
+    fn units_of(body: &Body) -> Vec<Vec<u8>> {
+        match body {
+            Body::DataBatch { units, .. } => units.clone(),
+            other => panic!("expected DATA_BATCH, got {other:?}"),
+        }
+    }
+
+    /// Data Units, Key Packages and Snapshots by devices (WIRE-01 §26.3,
+    /// §25.2, §29 through §80.1), on the published chain at I8: each is
+    /// authorized by object at its referenced head whoever uploads it,
+    /// refused objects are not stored, and devices that read get them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objects_by_devices_are_authorized_by_object_and_served() {
+        let v = Identity::load();
+        let dir = scratch("data-devices");
+        let server = start(&dir, Options::default()).await;
+        let x = v.resource("X");
+        store_chain(&server.store, &v.chain("KP_owner_to_dev_b")).await;
+        let mut owner = session(&v, &server, "OWNER").await;
+        let mut dev_b = session(&v, &server, "DEV_B").await;
+
+        // Units of three devices: a managing device, an edit device and a
+        // service device of another human, each through its own session.
+        let units = ["D_dev_a_seq1", "D_dev_b_seq1", "D_bridge_writes_x"];
+        for id in units {
+            let signer = support::identity::signer(&v, id);
+            let mut client = session(&v, &server, &signer).await;
+            let reply = ask(
+                &mut client,
+                Body::DataPut {
+                    resource_id: x,
+                    units: vec![v.cose(id)],
+                },
+            )
+            .await;
+            assert!(matches!(reply, Body::Ack(_)), "{id}: {reply:?}");
+        }
+        let dev_a = v.principal_id("DEV_A");
+        let reply = ask(
+            &mut dev_b,
+            Body::DataGet {
+                resource_id: x,
+                ranges: vec![DataRange {
+                    principal: dev_a,
+                    start: 1,
+                    end: 1,
+                }],
+            },
+        )
+        .await;
+        assert_eq!(units_of(&reply), vec![v.cose("D_dev_a_seq1")]);
+
+        // Key Packages: by key/distribute, by the same-root rule (DEV_B
+        // has no key/distribute), and refused without either.
+        for (id, accepted) in [
+            ("KP_owner_to_dev_b", true),
+            ("KP_dev_a_to_dev_b", true),
+            ("KP_dev_b_to_owner", true),
+            ("KP_dev_b_to_dev_a", true),
+            ("KP_dev_e_to_dev_c", true),
+            ("KP_dev_b_to_carol", false),
+            ("KP_bridge_to_carol", false),
+            ("KP_dev_c_to_carol", false),
+        ] {
+            assert_eq!(v.expected_code(id).is_none(), accepted, "{id}");
+            let reply = ask(
+                &mut owner,
+                Body::KeyPackagePut {
+                    resource_id: x,
+                    packages: vec![v.cose(id)],
+                },
+            )
+            .await;
+            if accepted {
+                assert!(matches!(reply, Body::Ack(_)), "{id}: {reply:?}");
+            } else {
+                assert_eq!(nack_code(&reply), 4, "{id}");
+            }
+        }
+        // Served to the recipient device only.
+        let dev_b_id = v.principal_id("DEV_B");
+        let get = |recipient| Body::KeyPackageGet {
+            resource_id: x,
+            recipient,
+            epochs: vec![0],
+        };
+        let Body::KeyPackageBatch { packages, .. } = ask(&mut dev_b, get(dev_b_id)).await else {
+            panic!("DEV_B's packages");
+        };
+        let mut got: Vec<_> = packages
+            .iter()
+            .map(|p| ReceivedKeyPackage::parse(p).unwrap().id())
+            .collect();
+        got.sort_by_key(|id| *id.as_bytes());
+        let mut want: Vec<_> = ["KP_owner_to_dev_b", "KP_dev_a_to_dev_b"]
+            .iter()
+            .map(|id| ReceivedKeyPackage::parse(&v.cose(id)).unwrap().id())
+            .collect();
+        want.sort_by_key(|id| *id.as_bytes());
+        assert_eq!(got, want);
+        assert_eq!(nack_code(&ask(&mut owner, get(dev_b_id)).await), 4);
+
+        // Snapshots: by a device with snapshot/publish, not by a service
+        // device without it.
+        let reply = ask(
+            &mut owner,
+            Body::SnapshotPut {
+                resource_id: x,
+                snapshot: v.cose("SNAP_by_bridge"),
+            },
+        )
+        .await;
+        assert_eq!(nack_code(&reply), 4);
+        let reply = ask(
+            &mut owner,
+            Body::SnapshotPut {
+                resource_id: x,
+                snapshot: v.cose("SNAP_by_dev_a"),
+            },
+        )
+        .await;
+        assert!(matches!(reply, Body::Ack(_)), "{reply:?}");
+        let reply = ask(
+            &mut dev_b,
+            Body::SnapshotGet {
+                resource_id: x,
+                snapshot_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            reply,
+            Body::Snapshot {
+                resource_id: x,
+                snapshot: v.cose("SNAP_by_dev_a"),
+            }
+        );
+        let sizes = server.store.resource_sizes().await.unwrap();
+        assert_eq!(
+            (
+                sizes[0].data_units,
+                sizes[0].key_packages,
+                sizes[0].snapshots
+            ),
+            (3, 5, 1)
+        );
+
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Units of a revoked device (WIRE-01 §41, §81, §19.1): at a head before
+    /// its revocation they are accepted from any session; at the revoking
+    /// head they are not, nor are those of the device it suspends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn units_of_revoked_and_suspended_devices_follow_their_heads() {
+        let v = Identity::load();
+        let dir = scratch("data-revoked");
+        let server = start(&dir, Options::default()).await;
+        let x = v.resource("X");
+        store_chain(&server.store, &v.chain("D_dev_a_after_revoke")).await;
+        assert_eq!(
+            server.store.head(x).await.unwrap().unwrap().id,
+            v.record_id("I9_device_revoke_dev_a")
+        );
+        let mut bob = session(&v, &server, "BOB").await;
+        let put = |id: &str| Body::DataPut {
+            resource_id: x,
+            units: vec![v.cose(id)],
+        };
+        for (id, code) in [
+            ("D_dev_a_seq1", None),
+            ("D_dev_b_seq1", None),
+            ("D_dev_a_after_revoke", Some(4)),
+            ("D_dev_b_suspended", Some(4)),
+            ("D_dev_a_old_head_after_revoke", None),
+        ] {
+            assert_eq!(v.expected_code(id).or(code), code, "{id}");
+            let reply = ask(&mut bob, put(id)).await;
+            match code {
+                None => assert!(matches!(reply, Body::Ack(_)), "{id}: {reply:?}"),
+                Some(code) => assert_eq!(nack_code(&reply), code, "{id}"),
+            }
+        }
+        let sizes = server.store.resource_sizes().await.unwrap();
+        assert_eq!(sizes[0].data_units, 3);
+
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
