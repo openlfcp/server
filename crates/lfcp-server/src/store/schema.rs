@@ -169,10 +169,9 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     -- The Genesis owner (field 1) of each hosted Resource, the second key
     -- of a quota lookup: a Principal's Resources are the rows it is the
-    -- recorded host of or the owner of. The host of a Genesis with field 5
-    -- is its owner, of any other Genesis the session Principal that
-    -- hosted it; older rows keep their recorded host and gain their owner
-    -- here. Every Genesis
+    -- recorded host of or the owner of. New hosting rows use the Genesis
+    -- owner, with or without field 5; older rows keep their recorded host
+    -- and gain their owner here. Every Genesis
     -- stored before this migration is a pre-identity Genesis, without
     -- field 5 (a pre-identity server refuses it), so its issuer is its
     -- owner.

@@ -9,7 +9,7 @@
 //! | AUTH | sdk-rs `verify_auth` over this session's transcript; any failure is `ERROR(AUTH_FAILED)`, close | §36, G-MSG4 |
 //! | READY | profile, server ID, configured max message bytes, the store's durability (2), configured heartbeat, the extension `identity-01` ([`EXTENSIONS`]) | §37 |
 //! | before READY | Resource, Control, Data, Key and Snapshot messages: `NACK(AUTHORIZATION_FAILED)`, stay open; `PING`/`PONG`/`ERROR` allowed; any other out-of-order message (or an undecodable one) is `ERROR(MALFORMED_MESSAGE)`, close | §64, G-SM4 |
-//! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature or, with field 5, the owner's device chain and leaf signature, ws/wss URLs), hosting policy keyed by the Genesis owner for a Genesis with field 5, else by the session Principal (`identity-01`; the storage floor, and a quota of Resources and bytes per hosting Principal, counted under the recorded host or the owner: `NACK(QUOTA_EXCEEDED)` with a diagnostic; new Resources per client IP per day: `NACK(RATE_LIMITED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
+//! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature or, with field 5, the owner's device chain and leaf signature, ws/wss URLs), hosting policy keyed by the Genesis owner for every new hosting row (`identity-01`; the storage floor, and a quota of Resources and bytes per hosting Principal, counted under the recorded host or the owner: `NACK(QUOTA_EXCEEDED)` with a diagnostic; new Resources per client IP per day: `NACK(RATE_LIMITED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
 //! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read` (a device through its root and mask, §80.1), or be an invitation subject, at the accepted Control Head; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator. A revoked reader (identity-01): `RESOURCE_OPENED` with the record that revoked it as the only head, empty Have, nothing else, no subscription. Anyone else: `NACK(AUTHORIZATION_FAILED)` | §41, §42, §84, §73 |
 //! | RESOURCE_CLOSE | drops the session's subscription only; `ACK` | §43 |
 //! | CONTROL_PUT | the storage floor and quota as for puts, with the control reserve (revocation always gets through, [`crate::limits::WriteClass`]); [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
@@ -70,8 +70,8 @@ use crate::ws::{ConnectionContext, Flow, Outbound, Session, SessionFactory};
 /// Server hosting policy (§36, §39): who may ask this server to host a
 /// Resource. Infrastructure only: it is never Resource authority.
 pub trait HostingPolicy: Send + Sync + 'static {
-    /// Whether `host`, authenticated in this session, may host a new
-    /// Resource, given the hosting credential from `RESOURCE_HOST` or else
+    /// Whether the Genesis owner `host` may host a new Resource, given
+    /// the uploading session's credential from `RESOURCE_HOST` or else
     /// from `AUTH`. The credential must not be logged.
     fn allows(&self, host: &PrincipalId, credential: Option<&HostingCredential>) -> bool;
 
@@ -103,8 +103,8 @@ impl HostingPolicy for OpenHosting {
 /// server validates Control Records of types 9 and 10, Genesis field 5
 /// and transfer commit field 2 (sdk-rs, through `CONTROL_PUT` and
 /// `RESOURCE_HOST`), applies the same-root Key Package rule of §25.2
-/// (sdk-rs `key_package_policy`), keys the hosting policy of a Genesis with
-/// field 5 by its owner (§39) and implements the Control read for revoked
+/// (sdk-rs `key_package_policy`), keys every new hosting row by the Genesis
+/// owner (§39) and implements the Control read for revoked
 /// readers (§41).
 pub const IDENTITY_01: &str = "identity-01";
 
@@ -511,16 +511,11 @@ impl LfcpSession {
             Err(error) => return self.nack_error(out, request, &error).await,
         };
         let resource_id = valid.resource_id;
-        // Step 4: hosting policy, never Resource authority. identity-01
-        // (§39, §41.1): for a Genesis with field 5 the owner, not the
-        // session that uploads it (one of the owner's devices, or anyone
-        // re-hosting it), is the host: the policy and quotas are the
-        // owner's. A Genesis without field 5 is hosted for the session
-        // Principal, as before identity-01 (old clients see no change); the
-        // store records its owner too, so the owner's quota counts it
-        // (Store::principal_usage). The credential and the per-IP rate
-        // limit stay the session's.
-        let host = valid.host(auth.principal.id());
+        // Step 4 (§39, §41.1): every new row is hosted for the Genesis
+        // owner, including a relayed or re-hosted Genesis without field 5.
+        // Existing rows keep their recorded host. Credentials and per-IP
+        // transport limits still belong to the uploading session.
+        let host = valid.owner;
         let credential = credential.as_ref().or(auth.hosting_credential.as_ref());
         if !self.shared.hosting.allows(&host, credential) {
             return self.nack(out, request, WireCode::HostingDenied).await;
@@ -1554,20 +1549,6 @@ pub struct ValidGenesis {
     pub resource_id: ResourceId,
     /// The owner of field 1.
     pub owner: PrincipalId,
-    /// Whether it carries the owner's device chain (field 5).
-    pub device_chain: bool,
-}
-
-impl ValidGenesis {
-    /// The hosting key when `session` uploads it (§39, identity-01): the
-    /// owner for a Genesis with field 5, else the session Principal.
-    pub fn host(&self, session: &PrincipalId) -> PrincipalId {
-        if self.device_chain {
-            self.owner
-        } else {
-            *session
-        }
-    }
 }
 
 /// §39 steps 1–3 with sdk-rs: a Genesis at sequence 0, signed by the owner
@@ -1584,7 +1565,6 @@ pub fn validate_genesis(genesis: &[u8]) -> Result<ValidGenesis, Error> {
             Ok(ValidGenesis {
                 resource_id: chain.head.resource_id,
                 owner: *body.owner.id(),
-                device_chain: body.device_chain.is_some(),
             })
         }
         Ok((ChainOutcome::Conflict(_), _)) => Err(Error::ControlConflict),

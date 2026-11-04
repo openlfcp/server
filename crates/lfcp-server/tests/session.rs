@@ -125,9 +125,11 @@ async fn the_published_handshake_and_hosting_are_reproduced_byte_for_byte() {
     // Persisted before the reply.
     let info = server.store.resource(v.resource()).await.unwrap().unwrap();
     assert_eq!(info.genesis, v.record_id("C0_genesis"));
-    assert_eq!(info.hosting.host, *v.principal("bob").descriptor().id());
+    // identity-01 / I12: a new row belongs to Genesis OWNER, even when
+    // BOB relays the legacy Genesis without field 5.
+    assert_eq!(info.hosting.host, *v.principal("owner").descriptor().id());
 
-    // BOB hosted it, but hosting grants nothing: at C0 only OWNER holds
+    // BOB uploaded it, but hosting grants nothing: at C0 only OWNER holds
     // data/read (§36, §84).
     let open_request = v.message("RESOURCE_OPEN");
     client.send_bytes(open_request.clone()).await;

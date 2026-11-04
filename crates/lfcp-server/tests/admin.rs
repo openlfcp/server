@@ -349,7 +349,8 @@ async fn the_hosting_policy_applies_to_resource_host_and_persists() {
     // A server that never set a policy is in quota mode (POST-003).
     assert_eq!((status, body), (200, json!({ "mode": "quota" })));
 
-    // Only OWNER, or whoever presents the credential "deploy-key".
+    // Genesis OWNER is allowed, as is any owner when the uploader
+    // presents the credential "deploy-key" (identity-01 / I12).
     let owner = v.principal("owner");
     let rule = json!({
         "mode": "allow_list",
@@ -361,7 +362,7 @@ async fn the_hosting_policy_applies_to_resource_host_and_persists() {
         "PUT",
         "/admin/hosting",
         Some(&admin),
-        Some(rule),
+        Some(rule.clone()),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -382,6 +383,47 @@ async fn the_hosting_policy_applies_to_resource_host_and_persists() {
     assert_eq!(status, 400);
 
     let bob = v.principal("bob");
+    // The owner is allowed even when a different Principal uploads its
+    // Genesis, without field 5 or a credential. A wrong credential does
+    // not override the owner's independent allow-list membership.
+    for (uploader, credential) in [
+        (&bob, None),
+        (&bob, Some(b"wrong".as_slice())),
+        (&carol, None),
+    ] {
+        assert!(matches!(
+            host(&server, uploader, &v, credential).await,
+            Body::ResourceHosted { .. }
+        ));
+    }
+    assert_eq!(
+        server
+            .store
+            .resource(v.resource())
+            .await
+            .unwrap()
+            .unwrap()
+            .hosting
+            .host,
+        *owner.descriptor().id()
+    );
+    // Removing OWNER restores the credential requirement for every
+    // uploader, including an administrator. Hosting policy is still
+    // checked when a Resource is already hosted.
+    let credential_only = json!({
+        "mode": "allow_list",
+        "principals": [],
+        "credentials": [to_hex(b"deploy-key")],
+    });
+    let (status, body) = http(
+        server.addr,
+        "PUT",
+        "/admin/hosting",
+        Some(&admin),
+        Some(credential_only),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
     assert_eq!(nack(&host(&server, &bob, &v, None).await), HOSTING_DENIED);
     assert_eq!(
         nack(&host(&server, &bob, &v, Some(b"wrong")).await),
@@ -393,14 +435,23 @@ async fn the_hosting_policy_applies_to_resource_host_and_persists() {
         host(&server, &bob, &v, Some(b"deploy-key")).await,
         Body::ResourceHosted { .. }
     ));
+    let (status, body) = http(
+        server.addr,
+        "PUT",
+        "/admin/hosting",
+        Some(&admin),
+        Some(rule),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
     server.stop().await;
 
     // The policy survives a restart.
     let server = start(&dir, Options::default()).await;
-    assert_eq!(
-        nack(&host(&server, &v.principal("invite"), &v, None).await),
-        HOSTING_DENIED
-    );
+    assert!(matches!(
+        host(&server, &v.principal("invite"), &v, None).await,
+        Body::ResourceHosted { .. }
+    ));
     assert!(matches!(
         host(&server, &owner, &v, None).await,
         Body::ResourceHosted { .. }
