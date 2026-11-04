@@ -49,7 +49,9 @@ not claim full LFCP-WIRE-01 conformance.
   devices are authorized through §80.1; a device-created Resource is
   hosted for its owner; a revoked device reads the Control prefix that
   proves its revocation (§41). Clients and chains without devices see no
-  change.
+  change. `tests/identity_vectors.rs` runs every Control Record and object
+  case of LFCP-IDENTITY-TEST-VECTORS-01 through `CONTROL_PUT` and ingest,
+  and `tests/revoked_reader.rs` its session cases over WebSocket.
 
 ## Store
 
