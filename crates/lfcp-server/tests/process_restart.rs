@@ -598,12 +598,15 @@ fn a_killed_test_process_takes_its_server_with_it() {
     parent.kill().unwrap(); // SIGKILL: no destructor runs in the parent
     parent.wait().unwrap();
     let killed = Instant::now();
-    while alive() || dir.exists() {
+    // The reaper removes the state directory, then the config: wait for
+    // both, or a slow machine sees the config between the two removals.
+    let config = dir.with_extension("toml");
+    while alive() || dir.exists() || config.exists() {
         assert!(
             killed.elapsed() < Duration::from_secs(5),
-            "server {pid} outlived its test process"
+            "server {pid} outlived its test process, or its files remain"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!dir.with_extension("toml").exists());
+    assert!(!config.exists());
 }
