@@ -362,7 +362,7 @@ async fn the_hosting_policy_applies_to_resource_host_and_persists() {
         "PUT",
         "/admin/hosting",
         Some(&admin),
-        Some(rule.clone()),
+        Some(rule),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -435,28 +435,30 @@ async fn the_hosting_policy_applies_to_resource_host_and_persists() {
         host(&server, &bob, &v, Some(b"deploy-key")).await,
         Body::ResourceHosted { .. }
     ));
-    let (status, body) = http(
-        server.addr,
-        "PUT",
-        "/admin/hosting",
-        Some(&admin),
-        Some(rule),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
+    // Keep the credential-only policy across the restart: the default
+    // quota policy would incorrectly admit these credential-less uploads.
     server.stop().await;
 
-    // The policy survives a restart.
     let server = start(&dir, Options::default()).await;
+    let invite = v.principal("invite");
+    for (label, uploader) in [("INVITE", &invite), ("OWNER", &owner)] {
+        let reply = host(&server, uploader, &v, None).await;
+        assert!(
+            matches!(&reply, Body::Nack(e) if e.code == HOSTING_DENIED),
+            "persisted credential-only policy must reject {label}: {reply:?}"
+        );
+    }
     assert!(matches!(
-        host(&server, &v.principal("invite"), &v, None).await,
-        Body::ResourceHosted { .. }
-    ));
-    assert!(matches!(
-        host(&server, &owner, &v, None).await,
+        host(&server, &bob, &v, Some(b"deploy-key")).await,
         Body::ResourceHosted { .. }
     ));
     let admin = token(&server, &carol).await;
+    let (status, body) = http(server.addr, "GET", "/admin/hosting", Some(&admin), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "mode": "allow_list", "principals": [], "credentials": 1 })
+    );
     let (_, body) = http(server.addr, "GET", "/admin/resources", Some(&admin), None).await;
     let list = body["resources"].as_array().unwrap();
     assert_eq!(list.len(), 1);
