@@ -163,7 +163,12 @@ pub struct Head {
 /// Hosting metadata (infrastructure, never authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hosting {
-    /// The session Principal that hosted the Resource here.
+    /// The Principal whose hosting policy and quota the Resource counts
+    /// against: the session Principal that hosted it, or for a Genesis
+    /// with field 5 its owner (WIRE-01 §39, identity-01). Rows recorded by
+    /// an older server keep the host they have. The store also records the
+    /// Genesis owner itself, from the Genesis bytes: a quota lookup counts
+    /// a Principal's Resources under either key ([`Store::principal_usage`]).
     pub host: PrincipalId,
     /// The durability level promised to it (WIRE-01 §37).
     pub durability: u8,
@@ -326,9 +331,10 @@ impl Store {
         hosting: Hosting,
     ) -> Result<Put, StoreError> {
         let record = ReceivedControlRecord::parse(&genesis).map_err(StoreError::Malformed)?;
-        if !matches!(record.body(), ControlBody::Genesis(_)) {
+        let ControlBody::Genesis(body) = record.body() else {
             return Err(StoreError::WrongRecordType);
-        }
+        };
+        let owner = *body.owner.id();
         let header = record.header().clone();
         let id = record.id();
         let control_type = record.body().control_type();
@@ -365,11 +371,12 @@ impl Store {
                 ],
             )?;
             tx.execute(
-                "INSERT INTO hosting (resource_id, host, durability) VALUES (?1, ?2, ?3)",
+                "INSERT INTO hosting (resource_id, host, durability, owner) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     header.resource_id.as_bytes().as_slice(),
                     hosting.host.as_bytes().as_slice(),
-                    hosting.durability
+                    hosting.durability,
+                    owner.as_bytes().as_slice()
                 ],
             )?;
             tx.commit()?;
@@ -922,11 +929,13 @@ pub struct ResourceSize {
 /// hosting Principal's Resources and bytes, and the store's total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
-    /// The Principal that hosted the Resource here.
+    /// The Resource's recorded host ([`Hosting::host`]): the Principal
+    /// whose quota applies.
     pub host: PrincipalId,
     /// The Resource's stored bytes.
     pub resource_bytes: u64,
-    /// The Resources `host` hosts here.
+    /// The Resources `host` hosts here, under either key
+    /// ([`Store::principal_usage`]).
     pub host_resources: u64,
     /// The stored bytes of those Resources.
     pub host_bytes: u64,
@@ -1094,10 +1103,10 @@ impl Store {
             Ok(conn
                 .query_row(
                     "SELECT h.host, u.bytes,
-                       (SELECT COUNT(*) FROM hosting h2 WHERE h2.host = h.host),
+                       (SELECT COUNT(*) FROM hosting h2 WHERE h2.host = h.host OR h2.owner = h.host),
                        (SELECT COALESCE(SUM(u2.bytes), 0) FROM hosting h2
                           JOIN resource_usage u2 ON u2.resource_id = h2.resource_id
-                          WHERE h2.host = h.host),
+                          WHERE h2.host = h.host OR h2.owner = h.host),
                        (SELECT COALESCE(SUM(bytes), 0) FROM resource_usage)
                      FROM hosting h JOIN resource_usage u ON u.resource_id = h.resource_id
                      WHERE h.resource_id = ?1",
@@ -1117,12 +1126,16 @@ impl Store {
         .await
     }
 
-    /// The Resources `principal` hosts here and their stored bytes.
+    /// The Resources `principal` hosts here and their stored bytes: the
+    /// rows it is the recorded host of or the Genesis owner of, each
+    /// counted once (WIRE-01 §39: a quota lookup counts a Principal's
+    /// Resources under either key).
     pub async fn principal_usage(&self, principal: PrincipalId) -> Result<(u64, u64), StoreError> {
         self.call(move |conn| {
             Ok(conn.query_row(
                 "SELECT COUNT(*), COALESCE(SUM(u.bytes), 0) FROM hosting h
-                   JOIN resource_usage u ON u.resource_id = h.resource_id WHERE h.host = ?1",
+                   JOIN resource_usage u ON u.resource_id = h.resource_id
+                   WHERE h.host = ?1 OR h.owner = ?1",
                 [principal.as_bytes().as_slice()],
                 |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
             )?)

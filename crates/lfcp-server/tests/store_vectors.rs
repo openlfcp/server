@@ -808,10 +808,12 @@ async fn stored_bytes_are_accounted_and_backfilled() {
     let path = store.path().to_path_buf();
     drop(store);
 
-    // A database from before migration 3 is backfilled when it opens.
+    // A database from before migration 3 is backfilled when it opens
+    // (and gets migration 4, whose objects it did not have either).
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TRIGGER resource_usage_on_host; DROP TRIGGER resource_usage_on_control;
+        "DROP INDEX hosting_by_owner; ALTER TABLE hosting DROP COLUMN owner;
+         DROP TRIGGER resource_usage_on_host; DROP TRIGGER resource_usage_on_control;
          DROP TRIGGER resource_usage_on_data; DROP TRIGGER resource_usage_on_key_package;
          DROP TRIGGER resource_usage_on_snapshot; DROP INDEX hosting_by_host;
          DROP TABLE resource_usage; DROP TABLE quota_overrides;
@@ -830,5 +832,80 @@ async fn stored_bytes_are_accounted_and_backfilled() {
         bytes
     );
     drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Migration 4 (identity-01, WIRE-01 §39): a hosting row keeps its
+/// recorded host and gains the Genesis owner, so a quota lookup counts the
+/// Resource under either key, once. A database from before migration 4
+/// gets the owner from its Genesis issuer (every pre-identity Genesis is
+/// signed by its owner); its recorded host is not rewritten.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosting_rows_keep_their_host_and_gain_the_genesis_owner() {
+    let v = Vectors::load();
+    let dir = temp_dir("owner-key");
+    let owner = *v.principal("owner").descriptor().id();
+    // A session that is not the owner hosted a Genesis without field 5
+    // (§41.1 re-hosting by a member): the row is keyed by the session.
+    let session = lfcp::base::PrincipalId::from_bytes([9; 32]);
+    let store = Store::open(&dir).unwrap();
+    store
+        .host_resource(
+            v.cose("C0_genesis"),
+            Hosting {
+                host: session,
+                durability: 2,
+            },
+        )
+        .await
+        .unwrap();
+    let bytes = v.cose("C0_genesis").len() as u64;
+    let resource = v.resource();
+    let check = |store: Store| async move {
+        assert_eq!(store.principal_usage(session).await.unwrap(), (1, bytes));
+        assert_eq!(store.principal_usage(owner).await.unwrap(), (1, bytes));
+        let usage = store.usage(resource).await.unwrap().unwrap();
+        assert_eq!(usage.host, session, "the recorded host is kept");
+        assert_eq!((usage.host_resources, usage.host_bytes), (1, bytes));
+        assert_eq!(
+            store
+                .resource(resource)
+                .await
+                .unwrap()
+                .unwrap()
+                .hosting
+                .host,
+            session
+        );
+        store
+    };
+    let store = check(store).await;
+    let path = store.path().to_path_buf();
+    drop(store);
+
+    // The same row as a server before migration 4 left it.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP INDEX hosting_by_owner; ALTER TABLE hosting DROP COLUMN owner;
+         UPDATE schema_version SET version = 3;",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        schema::latest_version()
+    );
+    let store = check(store).await;
+    drop(store);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let (host, row_owner): (Vec<u8>, Vec<u8>) = conn
+        .query_row("SELECT host, owner FROM hosting", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(host, session.as_bytes().to_vec());
+    assert_eq!(row_owner, owner.as_bytes().to_vec());
+    drop(conn);
     std::fs::remove_dir_all(&dir).unwrap();
 }

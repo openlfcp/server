@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod durability;
+pub mod identity;
 pub mod lfcp;
 pub mod sections;
 pub mod spec;
