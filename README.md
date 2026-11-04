@@ -82,6 +82,18 @@ acknowledged after its transaction commits.
 - Hosting metadata (who hosted a Resource here, the promised durability)
   is infrastructure only. Resource authority always comes from the stored
   Control Chain.
+- Hosting key (migration 4, `identity-01`, WIRE-01 §39): for a Genesis
+  with field 5 (created by one of the owner's devices) the hosting policy,
+  the allow-list and the quotas are keyed by the Genesis owner (field 1),
+  not by the session that uploads it, so the Resource counts against the
+  human, whichever device or peer uploads it. A Genesis without field 5 is
+  hosted for the uploading session's Principal, as before. Every row also
+  records the Genesis owner (`hosting.owner`; rows of an older server get
+  it from their Genesis issuer, which is the owner of every pre-identity
+  Genesis, and keep their recorded host). A Principal's Resources for its
+  quota are the rows it is the host or the owner of, each counted once.
+  The hosting credential and the per-IP hosting rate stay those of the
+  uploading session.
 - Storage accounting (migration 3, POST-003): `resource_usage` holds each
   Resource's stored bytes, kept by insert triggers in the writing
   transaction and backfilled from an older database when it migrates;
@@ -190,7 +202,7 @@ reaches the proxy. `deploy/` does this for Caddy (see "Docker").
 | new WebSockets per client IP (`connections_per_ip_per_minute`, token bucket) | 20/min | HTTP 429, `Retry-After` until a token refills, `too many new connections from this address` |
 | messages per WebSocket connection (`ws_messages_per_second`, `ws_message_burst`, token bucket) | 50/s, burst 200 | `ERROR(RATE_LIMITED)`, `message rate limit exceeded`, close 1008 |
 | admin requests per client IP (`admin_requests_per_ip_per_minute`; `/setup`, `/admin/*`, not `/health`) | 60/min | HTTP 429, `Retry-After`, `{"error": "too many admin requests from this address; retry later"}`, before the body is read |
-| quota mode: Resources per hosting Principal (`quota_resources_per_principal`) | 20 | `RESOURCE_HOST`: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: Resources per hosting Principal` |
+| quota mode: Resources per hosting Principal, the Genesis owner (`quota_resources_per_principal`) | 20 | `RESOURCE_HOST`: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: Resources per hosting Principal` |
 | quota mode: stored bytes per hosting Principal (`quota_bytes_per_principal`) | 256 MiB | `RESOURCE_HOST` and puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: stored bytes per hosting Principal`; control puts only past it plus the reserve |
 | quota mode: stored bytes per Resource (`quota_bytes_per_resource`) | 128 MiB | puts: `NACK(QUOTA_EXCEEDED)`, `quota exceeded: stored bytes per Resource`; control puts only past it plus the reserve |
 | quota mode: new Resources per client IP per 24 h (`hosts_per_ip_per_day`) | 10 | `RESOURCE_HOST`: `NACK(RATE_LIMITED)`, `rate limited: new Resources per client address per day` |

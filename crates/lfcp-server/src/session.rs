@@ -9,7 +9,7 @@
 //! | AUTH | sdk-rs `verify_auth` over this session's transcript; any failure is `ERROR(AUTH_FAILED)`, close | §36, G-MSG4 |
 //! | READY | profile, server ID, configured max message bytes, the store's durability (2), configured heartbeat, no extensions | §37 |
 //! | before READY | Resource, Control, Data, Key and Snapshot messages: `NACK(AUTHORIZATION_FAILED)`, stay open; `PING`/`PONG`/`ERROR` allowed; any other out-of-order message (or an undecodable one) is `ERROR(MALFORMED_MESSAGE)`, close | §64, G-SM4 |
-//! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature, ws/wss URLs), hosting policy (the storage floor, and a quota of Resources and bytes per hosting Principal: `NACK(QUOTA_EXCEEDED)` with a diagnostic; new Resources per client IP per day: `NACK(RATE_LIMITED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
+//! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature or, with field 5, the owner's device chain and leaf signature, ws/wss URLs), hosting policy keyed by the Genesis owner for a Genesis with field 5, else by the session Principal (`identity-01`; the storage floor, and a quota of Resources and bytes per hosting Principal, counted under the recorded host or the owner: `NACK(QUOTA_EXCEEDED)` with a diagnostic; new Resources per client IP per day: `NACK(RATE_LIMITED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
 //! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read`, or be an invitation subject, at the accepted Control Head, else `NACK(AUTHORIZATION_FAILED)`; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator | §41, §42, §84, §73 |
 //! | RESOURCE_CLOSE | drops the session's subscription only; `ACK` | §43 |
 //! | CONTROL_PUT | the storage floor and quota as for puts, with the control reserve (revocation always gets through, [`crate::limits::WriteClass`]); [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
@@ -44,7 +44,9 @@ use lfcp::base::{ControlRecordId, DataUnitId, Error, Hash32, PrincipalId, Resour
 use lfcp::cbor::Value;
 use lfcp::principal::PrincipalDescriptor;
 use lfcp::wire::control::authority::validate_authorized;
+use lfcp::wire::control::body::ControlBody;
 use lfcp::wire::control::chain::ChainOutcome;
+use lfcp::wire::control::ControlRecord;
 use lfcp::wire::data_unit::{check_put_previous, StoredUnits};
 use lfcp::wire::have::HaveVector;
 use lfcp::wire::message::DataRange;
@@ -488,12 +490,21 @@ impl LfcpSession {
             return self.nack(out, request, WireCode::AuthorizationFailed).await;
         };
         // §39 steps 1–3: Genesis structure, Resource ID and signature.
-        let resource_id = match validate_genesis(&genesis) {
-            Ok(resource_id) => resource_id,
+        let valid = match validate_genesis(&genesis) {
+            Ok(valid) => valid,
             Err(error) => return self.nack_error(out, request, &error).await,
         };
-        // Step 4: hosting policy, never Resource authority.
-        let host = *auth.principal.id();
+        let resource_id = valid.resource_id;
+        // Step 4: hosting policy, never Resource authority. identity-01
+        // (§39, §41.1): for a Genesis with field 5 the owner, not the
+        // session that uploads it (one of the owner's devices, or anyone
+        // re-hosting it), is the host: the policy and quotas are the
+        // owner's. A Genesis without field 5 is hosted for the session
+        // Principal, as before identity-01 (old clients see no change); the
+        // store records its owner too, so the owner's quota counts it
+        // (Store::principal_usage). The credential and the per-IP rate
+        // limit stay the session's.
+        let host = valid.host(auth.principal.id());
         let credential = credential.as_ref().or(auth.hosting_credential.as_ref());
         if !self.shared.hosting.allows(&host, credential) {
             return self.nack(out, request, WireCode::HostingDenied).await;
@@ -1398,12 +1409,46 @@ fn session_code(error: &Error) -> WireCode {
         .unwrap_or(WireCode::MalformedMessage)
 }
 
+/// A Genesis that passed [`validate_genesis`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidGenesis {
+    /// Its Resource ID.
+    pub resource_id: ResourceId,
+    /// The owner of field 1.
+    pub owner: PrincipalId,
+    /// Whether it carries the owner's device chain (field 5).
+    pub device_chain: bool,
+}
+
+impl ValidGenesis {
+    /// The hosting key when `session` uploads it (§39, identity-01): the
+    /// owner for a Genesis with field 5, else the session Principal.
+    pub fn host(&self, session: &PrincipalId) -> PrincipalId {
+        if self.device_chain {
+            self.owner
+        } else {
+            *session
+        }
+    }
+}
+
 /// §39 steps 1–3 with sdk-rs: a Genesis at sequence 0, signed by the owner
-/// in its body (S2: `INVALID_SIGNATURE`), whose URLs are ws/wss (G-CP4:
-/// `MALFORMED_MESSAGE`). Returns its Resource ID.
-pub fn validate_genesis(genesis: &[u8]) -> Result<ResourceId, Error> {
+/// in its body (S2: `INVALID_SIGNATURE`), or with field 5 by the leaf of
+/// the owner's device chain (§15), whose URLs are ws/wss (G-CP4:
+/// `MALFORMED_MESSAGE`). Returns its Resource ID and owner.
+pub fn validate_genesis(genesis: &[u8]) -> Result<ValidGenesis, Error> {
     match validate_authorized(&[genesis], None) {
-        Ok((ChainOutcome::Linear(chain), _)) => Ok(chain.head.resource_id),
+        Ok((ChainOutcome::Linear(chain), _)) => {
+            let Some(ControlBody::Genesis(body)) = chain.records.first().map(ControlRecord::body)
+            else {
+                return Err(Error::UnknownControlHead);
+            };
+            Ok(ValidGenesis {
+                resource_id: chain.head.resource_id,
+                owner: *body.owner.id(),
+                device_chain: body.device_chain.is_some(),
+            })
+        }
         Ok((ChainOutcome::Conflict(_), _)) => Err(Error::ControlConflict),
         Err(failure) => Err(failure.error),
     }

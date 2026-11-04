@@ -752,3 +752,103 @@ async fn control_writes_past_the_quota_are_bounded_by_the_reserve() {
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// identity-01 (WIRE-01 §39): a Genesis with field 5, uploaded by one of
+/// the owner's devices, is hosted for the owner. The device's session is
+/// not the host: the Resource counts against the owner's quota, the
+/// administrator sees it under the owner, and the device's own quota is
+/// untouched (LFCP-IDENTITY-TEST-VECTORS-01 `G1_genesis_by_dev_a`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_genesis_by_a_device_counts_against_its_owner() {
+    let v = support::identity::Identity::load();
+    let owner = v.principal("OWNER");
+    let dev_a = v.principal("DEV_A");
+    let dir = state_dir("quota-owner-key");
+    let server = start(
+        &dir,
+        with(AbuseLimits {
+            quota_resources_per_principal: 1,
+            hosts_per_ip_per_day: 0,
+            ..AbuseLimits::default()
+        }),
+    )
+    .await;
+
+    let mut device = client(&server, &dev_a).await;
+    assert!(matches!(
+        host(&mut device, v.cose("G1_genesis_by_dev_a")).await,
+        Body::ResourceHosted { .. }
+    ));
+    let hosted = server
+        .store
+        .resource(v.resource("Y"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hosted.hosting.host, *owner.descriptor().id());
+    let y_bytes = v.cose("G1_genesis_by_dev_a").len() as u64;
+    assert_eq!(
+        server
+            .store
+            .principal_usage(*owner.descriptor().id())
+            .await
+            .unwrap(),
+        (1, y_bytes)
+    );
+    assert_eq!(
+        server
+            .store
+            .principal_usage(*dev_a.descriptor().id())
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+
+    // The owner's one Resource is used: neither the owner nor its device
+    // hosts another one, but the device hosts a Resource of its own (it is
+    // a Principal with its own quota there).
+    let mut o = client(&server, &owner).await;
+    assert_eq!(
+        host(&mut o, v.cose("J0_genesis")).await,
+        quota_exceeded(refusal::RESOURCES)
+    );
+    assert!(matches!(
+        host(
+            &mut device,
+            genesis(&dev_a, ResourceId::from_bytes([7; 32]))
+        )
+        .await,
+        Body::ResourceHosted { .. }
+    ));
+    // Hosting Y again changes nothing, whoever uploads it.
+    assert!(matches!(
+        host(&mut o, v.cose("G1_genesis_by_dev_a")).await,
+        Body::ResourceHosted { .. }
+    ));
+
+    let admin = admin_token(&server, &PrincipalKeys::from_secrets(&[9; 32], [9; 32])).await;
+    for (principal, resources) in [(&owner, 1), (&dev_a, 1)] {
+        let path = format!("/admin/quotas/{}", principal.descriptor().id().to_hex());
+        let (status, body) = http(server.addr, "GET", &path, Some(&admin), None).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["usage"]["resources"], json!(resources), "{body}");
+    }
+    // An override for the owner (the human), not for the device, lets the
+    // owner's devices host more for it.
+    let path = format!("/admin/quotas/{}", owner.descriptor().id().to_hex());
+    let (status, body) = http(
+        server.addr,
+        "PUT",
+        &path,
+        Some(&admin),
+        Some(json!({ "resources": 2 })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(matches!(
+        host(&mut o, v.cose("J0_genesis")).await,
+        Body::ResourceHosted { .. }
+    ));
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
