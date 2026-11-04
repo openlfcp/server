@@ -227,3 +227,56 @@ pub async fn store_chain(store: &lfcp_server::store::Store, records: &[Record]) 
     }
     head
 }
+
+/// A WebSocket session of fixture Principal `label`.
+pub async fn session(
+    v: &Identity,
+    server: &super::lfcp::Running,
+    label: &str,
+) -> super::lfcp::Client {
+    let mut client = super::lfcp::Client::connect(server.addr).await;
+    client.handshake(&v.principal(label)).await;
+    client
+}
+
+/// Send `body`; the reply, correlated.
+pub async fn ask(
+    client: &mut super::lfcp::Client,
+    body: lfcp::wire::message::Body,
+) -> lfcp::wire::message::Body {
+    let id = client.request(body).await;
+    let reply = client.recv().await;
+    assert_eq!(reply.correlation_id, Some(id), "{:?}", reply.body);
+    reply.body
+}
+
+/// CONTROL_PUT of case `id`'s record at `expected`.
+pub fn put(v: &Identity, id: &str, expected: ControlRecordId) -> lfcp::wire::message::Body {
+    lfcp::wire::message::Body::ControlPut {
+        resource_id: v.context_resource(id).unwrap(),
+        expected_head: expected,
+        record: v.cose(id),
+    }
+}
+
+/// The ACK of a committed Control Record.
+pub fn control_ack(id: ControlRecordId) -> lfcp::wire::message::Body {
+    lfcp::wire::message::Body::Ack(lfcp::wire::message::AckBody {
+        request_type: 23,
+        object_ids: Some(vec![lfcp::base::Hash32::from_bytes(*id.as_bytes())]),
+        durable: Some(true),
+    })
+}
+
+/// The code of a NACK reply.
+pub fn nack_code(body: &lfcp::wire::message::Body) -> u64 {
+    match body {
+        lfcp::wire::message::Body::Nack(e) => e.code,
+        other => panic!("expected NACK, got {other:?}"),
+    }
+}
+
+/// The signer label of case `id`.
+pub fn signer(v: &Identity, id: &str) -> String {
+    v.case(id)["inputs"]["signer"].as_str().unwrap().to_owned()
+}
