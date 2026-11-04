@@ -21,6 +21,12 @@ cargo +nightly fuzz run session corpus/session -- \
   -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=30 -fork=3 -ignore_crashes=1
 ```
 
+The `session` seeds cover identity-01 too (a `DEVICE_GRANT`, a device's
+Data Unit, a `DEVICE_REVOKE`, the Control read after it and a Genesis with
+field 5 signed by the device; each is acknowledged). The seed-writing run
+exits from inside the target, so libFuzzer leaves an empty
+`artifacts/session/crash-da39a3ee...` behind: it is not a finding.
+
 `LFCP_FUZZ_TRACE=1` prints each request of a `session` run and the server's
 answer; `LFCP_FUZZ_KEEP_STORE=<dir>` keeps the database a run leaves (the
 `store_open` seeds start from one). Runs use fresh directories under
