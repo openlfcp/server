@@ -53,6 +53,7 @@ pub fn genesis(owner: &PrincipalKeys, resource: ResourceId, profile: &str) -> Ve
                 flags: None,
             }],
             coordinator: url,
+            device_chain: None,
         }),
         owner,
     )

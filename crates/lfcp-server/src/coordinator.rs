@@ -708,6 +708,7 @@ mod tests {
                     flags: None,
                 }],
                 coordinator: url,
+                device_chain: None,
             }),
             &owner,
         )
