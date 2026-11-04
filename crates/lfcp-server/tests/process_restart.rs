@@ -610,3 +610,173 @@ fn a_killed_test_process_takes_its_server_with_it() {
     }
     assert!(!config.exists());
 }
+
+/// identity-01 across a SIGKILL (LFCP-04-408 V2): the real binary
+/// announces identity-01; device records, a device-created Resource, a
+/// same-root Key Package and a device's unit acknowledged before the kill
+/// are all there after it, and the Control state rebuilt from the store
+/// gives the same answers: the revoked device reads only its prefix, the
+/// other human's device reads in full, and the next device record commits
+/// on the same head.
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_state_survives_a_kill() {
+    use support::identity::{ask, control_ack, nack_code, put, signer, Identity};
+    let v = Identity::load();
+    let dir = fresh("identity-kill");
+    let x = v.resource("X");
+    let first = spawn(&dir);
+    let mut sessions = std::collections::HashMap::new();
+    for label in ["OWNER", "DEV_A", "DEV_B", "BOB", "DEV_C", "DEV_E"] {
+        let mut client = support::lfcp::Client::connect(first.addr).await;
+        let (_, ready) = client.handshake(&v.principal(label)).await;
+        let Body::Ready(ready) = ready.body else {
+            unreachable!()
+        };
+        assert_eq!(ready.extensions, Some(vec!["identity-01".to_owned()]));
+        sessions.insert(label, client);
+    }
+    let host = |genesis: &str| Body::ResourceHost {
+        genesis: v.cose(genesis),
+        hosting_credential: None,
+    };
+    let reply = ask(
+        sessions.get_mut("DEV_A").unwrap(),
+        host("G1_genesis_by_dev_a"),
+    )
+    .await;
+    assert!(matches!(reply, Body::ResourceHosted { .. }), "{reply:?}");
+    let reply = ask(sessions.get_mut("OWNER").unwrap(), host("J0_genesis")).await;
+    assert!(matches!(reply, Body::ResourceHosted { .. }), "{reply:?}");
+    let mut head = v.record_id("J0_genesis");
+    let records = [
+        "J1_grant_bob",
+        "J2_grant_carol",
+        "I1_device_grant_dev_a",
+        "I2_device_grant_self_dev_b",
+        "I3_owner_action_by_dev_a",
+        "I4_device_grant_dev_c_bob",
+        "I5_device_grant_dev_e_by_dev_c",
+        "I6_grant_by_member_device",
+        "I7_revoke_covered_by_sibling",
+        "I8_bridge_grant",
+    ];
+    for id in records {
+        let client = sessions.get_mut(signer(&v, id).as_str()).unwrap();
+        assert_eq!(
+            ask(client, put(&v, id, head)).await,
+            control_ack(v.record_id(id)),
+            "{id}"
+        );
+        head = v.record_id(id);
+    }
+    let dev_b = sessions.get_mut("DEV_B").unwrap();
+    let reply = ask(
+        dev_b,
+        Body::KeyPackagePut {
+            resource_id: x,
+            packages: vec![v.cose("KP_dev_b_to_dev_a")],
+        },
+    )
+    .await;
+    assert!(matches!(reply, Body::Ack(_)), "{reply:?}");
+    let reply = ask(
+        sessions.get_mut("DEV_A").unwrap(),
+        Body::DataPut {
+            resource_id: x,
+            units: vec![v.cose("D_dev_a_seq1")],
+        },
+    )
+    .await;
+    assert!(matches!(reply, Body::Ack(_)), "{reply:?}");
+    let owner = sessions.get_mut("OWNER").unwrap();
+    let i9 = v.record_id("I9_device_revoke_dev_a");
+    assert_eq!(
+        ask(owner, put(&v, "I9_device_revoke_dev_a", head)).await,
+        control_ack(i9)
+    );
+    // SIGKILL right after the last ACK.
+    drop(sessions);
+    first.kill();
+
+    let second = spawn(&dir);
+    let open = Body::ResourceOpen {
+        resource_id: x,
+        control_heads: vec![],
+        have: vec![],
+        grant_ids: None,
+        flags: Some(0b011),
+    };
+    let i9_head = lfcp::wire::message::ControlHead {
+        sequence: 11,
+        id: i9,
+    };
+    let (mut dev_a, _) = session(second.addr, &v.principal("DEV_A")).await;
+    assert_eq!(
+        ask(&mut dev_a, open.clone()).await,
+        Body::ResourceOpened {
+            resource_id: x,
+            control_heads: vec![i9_head],
+            have: vec![],
+            snapshot: None,
+            route_version: None,
+            coordinator: None,
+        }
+    );
+    let Body::ControlBatch { records: got, .. } = ask(
+        &mut dev_a,
+        Body::ControlGet {
+            resource_id: x,
+            start: 0,
+            end: u64::MAX,
+        },
+    )
+    .await
+    else {
+        panic!("DEV_A's prefix");
+    };
+    assert_eq!(got.len(), 12);
+    let reply = ask(
+        &mut dev_a,
+        Body::KeyPackageGet {
+            resource_id: x,
+            recipient: v.principal_id("DEV_A"),
+            epochs: vec![0],
+        },
+    )
+    .await;
+    assert_eq!(nack_code(&reply), 4, "a revoked reader gets no keys");
+    let (mut dev_c, _) = session(second.addr, &v.principal("DEV_C")).await;
+    let Body::ResourceOpened {
+        control_heads,
+        have,
+        ..
+    } = ask(&mut dev_c, open).await
+    else {
+        panic!("DEV_C opens X");
+    };
+    assert_eq!(control_heads, vec![i9_head]);
+    assert_eq!(have.len(), 1, "DEV_A's unit");
+    let (mut owner, _) = session(second.addr, &v.principal("OWNER")).await;
+    assert_eq!(
+        ask(&mut owner, put(&v, "I10_recertify_dev_b", i9)).await,
+        control_ack(v.record_id("I10_recertify_dev_b"))
+    );
+    second.terminate();
+
+    let store = Store::open(&dir).unwrap();
+    let y = store.resource(v.resource("Y")).await.unwrap().unwrap();
+    assert_eq!(
+        y.hosting.host,
+        v.principal_id("OWNER"),
+        "hosted for the owner"
+    );
+    assert_eq!(
+        store
+            .key_packages_for(x, 0, v.principal_id("DEV_A"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(store);
+}
