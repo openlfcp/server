@@ -86,6 +86,7 @@ pub fn genesis(owner: &PrincipalKeys, resource: ResourceId) -> Vec<u8> {
                 flags: None,
             }],
             coordinator: url,
+            device_chain: None,
         }),
         owner,
     )
