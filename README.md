@@ -93,12 +93,10 @@ acknowledged after its transaction commits.
 - Hosting metadata (who hosted a Resource here, the promised durability)
   is infrastructure only. Resource authority always comes from the stored
   Control Chain.
-- Hosting key (migration 4, `identity-01`, WIRE-01 §39): for a Genesis
-  with field 5 (created by one of the owner's devices) the hosting policy,
-  the allow-list and the quotas are keyed by the Genesis owner (field 1),
-  not by the session that uploads it, so the Resource counts against the
-  human, whichever device or peer uploads it. A Genesis without field 5 is
-  hosted for the uploading session's Principal, as before. Every row also
+- Hosting key (migration 4, `identity-01`, WIRE-01 §39): for every new
+  hosting row the policy, allow-list and quotas are keyed by the Genesis
+  owner (field 1), with or without field 5. The Resource counts against
+  the human, whichever device or peer uploads or re-hosts it. Every row also
   records the Genesis owner (`hosting.owner`; rows of an older server get
   it from their Genesis issuer, which is the owner of every pre-identity
   Genesis, and keep their recorded host). A Principal's Resources for its

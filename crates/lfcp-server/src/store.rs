@@ -164,10 +164,10 @@ pub struct Head {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hosting {
     /// The Principal whose hosting policy and quota the Resource counts
-    /// against: the session Principal that hosted it, or for a Genesis
-    /// with field 5 its owner (WIRE-01 §39, identity-01). Rows recorded by
-    /// an older server keep the host they have. The store also records the
-    /// Genesis owner itself, from the Genesis bytes: a quota lookup counts
+    /// against: the Genesis owner for every new hosting row (WIRE-01 §39,
+    /// identity-01). Rows recorded by an older server keep their host,
+    /// which may be the uploading session's Principal. The store also
+    /// records the Genesis owner from the Genesis bytes: a quota lookup counts
     /// a Principal's Resources under either key ([`Store::principal_usage`]).
     pub host: PrincipalId,
     /// The durability level promised to it (WIRE-01 §37).

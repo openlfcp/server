@@ -852,3 +852,133 @@ async fn a_genesis_by_a_device_counts_against_its_owner() {
     server.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A legacy Genesis relayed by a device still consumes the owner's quota
+/// (WIRE-01 §39 / I12), just like a Genesis carrying field 5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_quota_cannot_be_bypassed_by_relaying_a_legacy_genesis() {
+    let v = support::identity::Identity::load();
+    let dir = state_dir("quota-legacy-relay");
+    let server = start(
+        &dir,
+        with(AbuseLimits {
+            quota_resources_per_principal: 1,
+            hosts_per_ip_per_day: 0,
+            ..AbuseLimits::default()
+        }),
+    )
+    .await;
+    let mut device = client(&server, &v.principal("DEV_A")).await;
+    assert!(matches!(
+        host(&mut device, v.cose("G1_genesis_by_dev_a")).await,
+        Body::ResourceHosted { .. }
+    ));
+    let owner = v.principal_id("OWNER");
+    let used = server.store.principal_usage(owner).await.unwrap();
+    assert_eq!(used.0, 1);
+    assert_eq!(
+        host(&mut device, v.cose("J0_genesis")).await,
+        quota_exceeded(refusal::RESOURCES)
+    );
+    assert!(server
+        .store
+        .resource(v.resource("X"))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(server.store.principal_usage(owner).await.unwrap(), used);
+    assert_eq!(
+        server
+            .store
+            .principal_usage(v.principal_id("DEV_A"))
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+
+    // Only raising the owner's quota admits the new row. Both owner-signed
+    // and device-signed Genesis bytes count once under the same principal.
+    let token = admin_token(&server, &v.principal("CAROL")).await;
+    let path = format!("/admin/quotas/{}", owner.to_hex());
+    let (status, body) = http(
+        server.addr,
+        "PUT",
+        &path,
+        Some(&token),
+        Some(json!({"resources": 2})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(matches!(
+        host(&mut device, v.cose("J0_genesis")).await,
+        Body::ResourceHosted { .. }
+    ));
+    let bytes = used.1 + v.cose("J0_genesis").len() as u64;
+    assert_eq!(
+        server.store.principal_usage(owner).await.unwrap(),
+        (2, bytes)
+    );
+    let usage = server.store.usage(v.resource("X")).await.unwrap().unwrap();
+    assert_eq!(usage.host, owner, "puts use the owner's quota too");
+    assert_eq!((usage.host_resources, usage.host_bytes), (2, bytes));
+    let (status, body) = http(server.addr, "GET", &path, Some(&token), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["usage"]["resources"], json!(2));
+    assert_eq!(body["usage"]["bytes"], json!(bytes));
+    server.stop().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Re-hosting exact pre-identity Genesis bytes uses the root's allow-list
+/// entry, regardless of which device supplies them (§41.1 / I12).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_allowlisted_owner_can_be_rehosted_by_its_device_without_field5() {
+    let v = support::identity::Identity::load();
+    let dir = state_dir("quota-legacy-allowlist");
+    let server = start(&dir, Options::default()).await;
+    let token = admin_token(&server, &v.principal("CAROL")).await;
+    let rule = |principal: lfcp::base::PrincipalId| {
+        json!({
+            "mode": "allow_list", "principals": [principal.to_hex()]
+        })
+    };
+    let (status, body) = http(
+        server.addr,
+        "PUT",
+        "/admin/hosting",
+        Some(&token),
+        Some(rule(v.principal_id("OWNER"))),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let mut device = client(&server, &v.principal("DEV_A")).await;
+    assert!(matches!(
+        host(&mut device, v.cose("J0_genesis")).await,
+        Body::ResourceHosted { .. }
+    ));
+    assert_eq!(
+        server
+            .store
+            .resource(v.resource("X"))
+            .await
+            .unwrap()
+            .unwrap()
+            .hosting
+            .host,
+        v.principal_id("OWNER")
+    );
+    // Listing only the uploader cannot admit a different Genesis owner.
+    let (status, body) = http(
+        server.addr,
+        "PUT",
+        "/admin/hosting",
+        Some(&token),
+        Some(rule(v.principal_id("DEV_A"))),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let reply = host(&mut device, v.cose("J0_genesis")).await;
+    assert!(matches!(reply, Body::Nack(e) if e.code == 20));
+    server.stop().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
