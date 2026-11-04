@@ -41,6 +41,15 @@ not claim full LFCP-WIRE-01 conformance.
 - `lfcp-admin` CLI (POST-014): pairing and signed admin calls.
 - Abuse limits (POST-003): quota hosting mode by default, client IP behind
   a trusted proxy, per-IP and rate limits, a global storage floor.
+- Multi-device root identity (LFCP-04-408, `mvp-0.4-baseline.1`): READY
+  lists the server extension `identity-01` (WIRE-01 §37). `DEVICE_GRANT`
+  and `DEVICE_REVOKE` (types 9, 10), Genesis field 5 and transfer commit
+  field 2 are validated by sdk-rs as a client validates them; Data Units,
+  Key Packages (with the same-root rule of §25.2) and Snapshots by
+  devices are authorized through §80.1; a device-created Resource is
+  hosted for its owner; a revoked device reads the Control prefix that
+  proves its revocation (§41). Clients and chains without devices see no
+  change.
 
 ## Store
 
@@ -371,7 +380,7 @@ server's random source; the server ID from `<state_dir>/server-id`.
 | Resource, Control, Data, Key or Snapshot message before READY | `NACK(AUTHORIZATION_FAILED)`, stays open |
 | PING / PONG / ERROR before READY | allowed |
 | a handshake message out of order, anything else before READY, or an undecodable message before READY | `ERROR(MALFORMED_MESSAGE)`, close |
-| READY | the profile, server ID, `max_message_bytes`, durability 2, `heartbeat_ms`, no extensions |
+| READY | the profile, server ID, `max_message_bytes`, durability 2, `heartbeat_ms`, the extension `identity-01` |
 
 After READY:
 

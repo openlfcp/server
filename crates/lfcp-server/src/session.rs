@@ -7,7 +7,7 @@
 //! | HELLO | descriptor decoded and its ID recomputed by sdk-rs; a bad descriptor or ID mismatch is `ERROR(AUTH_FAILED)`, close; no common wire profile is `ERROR(PROTOCOL_UNSUPPORTED)`, close | §34, §7, P2/P3, G-MSG7 |
 //! | CHALLENGE | selected profile, server nonce and session ID from [`Random`], the stable server ID | §35, §5.4 |
 //! | AUTH | sdk-rs `verify_auth` over this session's transcript; any failure is `ERROR(AUTH_FAILED)`, close | §36, G-MSG4 |
-//! | READY | profile, server ID, configured max message bytes, the store's durability (2), configured heartbeat, no extensions | §37 |
+//! | READY | profile, server ID, configured max message bytes, the store's durability (2), configured heartbeat, the extension `identity-01` ([`EXTENSIONS`]) | §37 |
 //! | before READY | Resource, Control, Data, Key and Snapshot messages: `NACK(AUTHORIZATION_FAILED)`, stay open; `PING`/`PONG`/`ERROR` allowed; any other out-of-order message (or an undecodable one) is `ERROR(MALFORMED_MESSAGE)`, close | §64, G-SM4 |
 //! | RESOURCE_HOST | Genesis validated by sdk-rs (structure, owner signature or, with field 5, the owner's device chain and leaf signature, ws/wss URLs), hosting policy keyed by the Genesis owner for a Genesis with field 5, else by the session Principal (`identity-01`; the storage floor, and a quota of Resources and bytes per hosting Principal, counted under the recorded host or the owner: `NACK(QUOTA_EXCEEDED)` with a diagnostic; new Resources per client IP per day: `NACK(RATE_LIMITED)` with a diagnostic), persisted, then `RESOURCE_HOSTED` with durability 2; another Genesis for the Resource is `NACK(CONTROL_CONFLICT)` | §39, §40, §13.2, §15, §16, §84 |
 //! | RESOURCE_OPEN | unknown Resource: `NACK(RESOURCE_NOT_HOSTED)`; the session Principal must hold `data/read` (a device through its root and mask, §80.1), or be an invitation subject, at the accepted Control Head; then `RESOURCE_OPENED` with every Control Head the server knows, its Have, a Snapshot summary, route version and coordinator. A revoked reader (identity-01): `RESOURCE_OPENED` with the record that revoked it as the only head, empty Have, nothing else, no subscription. Anyone else: `NACK(AUTHORIZATION_FAILED)` | §41, §42, §84, §73 |
@@ -98,6 +98,18 @@ impl HostingPolicy for OpenHosting {
         true
     }
 }
+
+/// The server extension of multi-device root identity (WIRE-01 §37): this
+/// server validates Control Records of types 9 and 10, Genesis field 5
+/// and transfer commit field 2 (sdk-rs, through `CONTROL_PUT` and
+/// `RESOURCE_HOST`), applies the same-root Key Package rule of §25.2
+/// (sdk-rs `key_package_policy`), keys the hosting policy of a Genesis with
+/// field 5 by its owner (§39) and implements the Control read for revoked
+/// readers (§41).
+pub const IDENTITY_01: &str = "identity-01";
+
+/// The server extensions READY lists (§37, field 5).
+pub const EXTENSIONS: &[&str] = &[IDENTITY_01];
 
 /// What READY advertises (§37) besides the profile and server ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,7 +485,7 @@ impl LfcpSession {
                 max_message_bytes: ready.max_message_bytes,
                 durability: u64::from(DURABILITY),
                 heartbeat_ms: ready.heartbeat_ms,
-                extensions: Some(Vec::new()),
+                extensions: Some(EXTENSIONS.iter().map(|&e| e.to_owned()).collect()),
             }),
         )
         .await
