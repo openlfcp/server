@@ -788,7 +788,7 @@ warns when the `lfcp` crate has uncommitted changes. Move the lock
 deliberately when the server needs newer sdk-rs code. A git or tag
 dependency replaces this at a release milestone.
 
-`spec.lock` pins `openlfcp/spec` (`mvp-0.4-baseline.2`: `mvp-0.2-baseline.12`
+`spec.lock` pins `openlfcp/spec` (`mvp-0.4-baseline.3`: `mvp-0.2-baseline.12`
 plus multi-device root identity, ADR 0011: Device Principals and
 certificate chains, Control Record types `9` and `10`, Genesis field `5`,
 transfer commit field `2`, the same-root Key Package rule, the `identity-01`
@@ -798,7 +798,9 @@ moved in baseline.1, `unknown_core_type_C1` now uses type `31`). Baseline.2
 clarifies the epoch-number validation order (§19, §62), owner-keyed hosting
 and re-hosting (§39, §41.1; I12), revoked-reader replies (§41) and identity
 profile admission, and corrects the complete `READY_identity_01` vector
-(type 3, `LFCP-WIRE-01`). Tests read vectors
+(type 3, `LFCP-WIRE-01`). Baseline.3 clarifies the depth of identity
+profile admission rule AI2 and adds profile vectors for it; no published
+value changes, and no vector the server runs changes. Tests read vectors
 from `../spec` (or `$LFCP_SPEC_DIR`) with `git show` at the locked commit.
 
 ## Build from a clean checkout
