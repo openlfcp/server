@@ -1,5 +1,6 @@
 //! The Control read for a revoked reader (WIRE-01 §41, identity-01;
-//! mvp-0.4-baseline.2) and the other session cases of
+//! mvp-0.4-baseline.2, with the request-specific cases of baseline.4) and
+//! the other session cases of
 //! LFCP-IDENTITY-TEST-VECTORS-01, over real WebSocket sessions.
 //!
 //! A registered device that held `data/read` immediately before the first
@@ -72,6 +73,20 @@ async fn ask(client: &mut Client, body: Body) -> Body {
     let reply = client.recv().await;
     assert_eq!(reply.correlation_id, Some(id));
     reply.body
+}
+
+/// Send `body`, which sdk-rs does not decode (an inverted CONTROL_GET range,
+/// W §45, refused by its decoder since 390ca1d): the reply is the
+/// session-level `ERROR(MALFORMED_MESSAGE)` of any undecodable message
+/// (G-MSG5, as in tests/control.rs), uncorrelated, and the session goes on.
+async fn ask_undecodable(client: &mut Client, body: Body) -> u64 {
+    client.request(body).await;
+    let reply = client.recv().await;
+    assert_eq!(reply.correlation_id, None);
+    match reply.body {
+        Body::Error(e) => e.code,
+        other => panic!("expected ERROR, got {other:?}"),
+    }
 }
 
 fn nack_code(body: &Body) -> u64 {
@@ -162,12 +177,34 @@ async fn refused_reads(client: &mut Client, resource: ResourceId, me: PrincipalI
     );
 }
 
+/// The extensions this server offers in READY (§37): `identity-01` only.
+const OFFERED: [&str; 1] = ["identity-01"];
+
+/// Whether case `id` assumes the extensions this server offers. The others
+/// (a server with `presence`, or without `identity-01`) describe another
+/// server; each is named in the test that skips it.
+fn offered_here(v: &Identity, id: &str) -> bool {
+    let wanted: Vec<&str> = v.case(id)["inputs"]["server_extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    wanted == OFFERED
+}
+
 /// A `session_read` case: RESOURCE_OPEN, CONTROL_GET or DATA_GET by its
 /// session on its context chain, as the case expects.
 async fn session_read(v: &Identity, id: &str) {
     let case = v.case(id);
     let inputs = &case["inputs"];
     assert_eq!(inputs["server_extensions"][0], "identity-01", "{id}");
+    if inputs["range"].is_object()
+        || inputs["request"] == "PRESENCE"
+        || case["expected"]["post_state"]["answer"] == "RESOURCE_OPENED"
+    {
+        return session_request(v, id).await;
+    }
     let (server, dir) = server_for(v, id).await;
     let resource = v.context_resource(id).unwrap();
     let label = inputs["session"].as_str().unwrap();
@@ -261,6 +298,103 @@ async fn session_read(v: &Identity, id: &str) {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A `session_read` case that names one request (mvp-0.4-baseline.4): a
+/// CONTROL_GET of a range, RESOURCE_OPEN or PRESENCE, answered as the case
+/// expects. Records the case says the server also holds (competing ones)
+/// are stored as evidence first.
+async fn session_request(v: &Identity, id: &str) {
+    let case = v.case(id);
+    let inputs = &case["inputs"];
+    let (server, dir) = server_for(v, id).await;
+    for held in inputs["server_also_holds"].as_array().into_iter().flatten() {
+        let bytes = v.cose(held["case"].as_str().unwrap());
+        server.store.put_control_record(bytes).await.unwrap();
+    }
+    let resource = v.context_resource(id).unwrap();
+    let label = inputs["session"].as_str().unwrap();
+    let mut client = session(&server, &v.principal(label)).await;
+    let body = match inputs["request"].as_str().unwrap() {
+        "CONTROL_GET" => control_get(
+            resource,
+            inputs["range"]["start"].as_u64().unwrap(),
+            inputs["range"]["end"].as_u64().unwrap(),
+        ),
+        "RESOURCE_OPEN" => open(resource),
+        "PRESENCE" => Body::Presence {
+            resource_id: resource,
+            principal: v.principal_id(label),
+            ttl_ms: 1000,
+            payload: vec![],
+        },
+        other => panic!("{id}: request {other}"),
+    };
+    let inverted = inputs["range"]["end"].as_u64() < inputs["range"]["start"].as_u64();
+    if inverted {
+        assert_eq!(
+            Some(ask_undecodable(&mut client, body).await),
+            v.expected_code(id),
+            "{id}"
+        );
+        // The session goes on: the prefix is still read.
+        assert!(matches!(
+            ask(&mut client, control_get(resource, 0, 0)).await,
+            Body::ControlBatch { .. }
+        ));
+        server.stop().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let reply = ask(&mut client, body).await;
+    if let Some(expected) = v.expected_code(id) {
+        assert_eq!(nack_code(&reply), expected, "{id}");
+    } else {
+        let post = &case["expected"]["post_state"];
+        match reply {
+            Body::ControlBatch { records, .. } => {
+                // The accepted records and the competing ones, in the §46 order:
+                // by sequence, then by record ID.
+                let mut want: Vec<&str> = post["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(post["competing_returned"].as_array().unwrap())
+                    .map(|r| r.as_str().unwrap())
+                    .collect();
+                want.sort_by_key(|r| {
+                    (
+                        v.case(r)["inputs"]["control_seq"].as_u64().unwrap(),
+                        *v.record_id(r).as_bytes(),
+                    )
+                });
+                let want: Vec<Vec<u8>> = want.iter().map(|r| v.cose(r)).collect();
+                assert_eq!(records, want, "{id}");
+            }
+            Body::ResourceOpened {
+                resource_id,
+                control_heads,
+                have,
+                snapshot,
+                route_version,
+                coordinator,
+            } => {
+                let head = head_of(v, post["control_head"].as_str().unwrap());
+                assert_eq!(resource_id, resource, "{id}");
+                assert_eq!(control_heads, vec![head], "{id}");
+                assert!(have.is_empty(), "{id}");
+                // Fields 3, 4 and 5 absent.
+                assert_eq!(
+                    (snapshot, route_version, coordinator),
+                    (None, None, None),
+                    "{id}"
+                );
+            }
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+    server.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A `session_upload` case: a revoked session uploads an object; it is
 /// checked by object (§84), the session's read authority aside.
 async fn session_upload(v: &Identity, id: &str) {
@@ -318,6 +452,16 @@ async fn the_session_vectors_hold_on_the_server() {
         .filter(|c| c["kind"] == "session_read")
         .map(|c| c["id"].as_str().unwrap().to_owned())
         .collect();
+    // The cases of a server that offers `presence` describe another server.
+    let (reads, elsewhere): (Vec<String>, Vec<String>) =
+        reads.into_iter().partition(|id| offered_here(&v, id));
+    assert_eq!(
+        elsewhere,
+        [
+            "PRESENCE_by_revoked_reader.supported",
+            "PRESENCE_by_reader.supported"
+        ]
+    );
     let uploads: Vec<String> = v
         .cases()
         .filter(|c| c["kind"] == "session_upload")
@@ -334,7 +478,15 @@ async fn the_session_vectors_hold_on_the_server() {
     ] {
         assert!(reads.iter().any(|id| id == required), "{required}");
     }
-    assert_eq!((reads.len(), uploads.len()), (11, 4));
+    for required in [
+        "RESOURCE_OPENED_for_revoked_reader",
+        "CONTROL_GET_by_revoked_reader.range_inverted",
+        "CONTROL_GET_by_revoked_reader.forked_range",
+        "PRESENCE_by_revoked_reader.unsupported",
+    ] {
+        assert!(reads.iter().any(|id| id == required), "{required}");
+    }
+    assert_eq!((reads.len(), uploads.len()), (20, 4));
     for id in &reads {
         session_read(&v, id).await;
     }
@@ -497,9 +649,10 @@ async fn the_prefix_is_the_accepted_chain_through_the_revocation() {
         PROTOCOL_UNSUPPORTED
     );
     refused_reads(&mut revoked, resource, v.principal_id("DEV_A"), 11).await;
-    // A reversed range stays malformed.
+    // A reversed range stays malformed (sdk-rs refuses to decode it, so the
+    // reply is the uncorrelated ERROR of an undecodable message).
     assert_eq!(
-        nack_code(&ask(&mut revoked, control_get(resource, 3, 2)).await),
+        ask_undecodable(&mut revoked, control_get(resource, 3, 2)).await,
         2
     );
     server.stop().await;

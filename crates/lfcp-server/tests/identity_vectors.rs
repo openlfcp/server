@@ -1,4 +1,4 @@
-//! LFCP-IDENTITY-TEST-VECTORS-01 (mvp-0.4-baseline.2) through the
+//! LFCP-IDENTITY-TEST-VECTORS-01 (mvp-0.4-baseline.5) through the
 //! server's own code paths, for every case a server decides (WIRE-01 §37
 //! `identity-01`, §41, §84; the corpus list is IDENTITY-PROFILE-01 §12):
 //!
@@ -11,7 +11,9 @@
 //! The session cases (`session_read`, `session_upload`) run over WebSocket
 //! in `tests/revoked_reader.rs`. The expected outcome is the case's
 //! `expected.valid` / `expected.error.code`; every case of these kinds is
-//! run, none is skipped as client-only.
+//! run, none is skipped as client-only. The only cases not run describe a
+//! server without `identity-01` (two KEY_PACKAGE_PUT cases), which this
+//! server never is; each test names them.
 
 mod support;
 
@@ -162,7 +164,7 @@ async fn control_records_through_control_put() {
         .filter(|c| c["kind"] == "control_record")
         .map(|c| c["id"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(ids.len(), 196, "baseline.2 Control Record cases");
+    assert_eq!(ids.len(), 215, "baseline.5 Control Record cases");
     // I9: epoch placement precedes dependencies, signatures and authority,
     // but follows structural validation (§19, §62).
     for required in [
@@ -196,10 +198,24 @@ async fn data_units_key_packages_and_snapshots_through_ingest() {
         })
         .map(|c| c["id"].as_str().unwrap().to_owned())
         .collect();
+    // KEY_PACKAGE_PUT on a server without identity-01 (W §25.2, §37)
+    // describes another server: this one always offers identity-01.
+    let (ids, elsewhere): (Vec<String>, Vec<String>) = ids.into_iter().partition(|id| {
+        v.case(id)["inputs"]["server_extensions"]
+            .as_array()
+            .is_none_or(|e| e.iter().any(|x| x == "identity-01"))
+    });
+    assert_eq!(
+        elsewhere,
+        [
+            "KEY_PACKAGE_PUT_same_root_without_identity_01",
+            "KEY_PACKAGE_PUT_key_distribute_without_identity_01"
+        ]
+    );
     assert_eq!(
         ids.len(),
-        72,
-        "baseline.2 Data Units, Key Packages and Snapshots"
+        74,
+        "baseline.5 Data Units, Key Packages and Snapshots"
     );
     let mut results = Vec::new();
     for id in ids {

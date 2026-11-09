@@ -14,7 +14,7 @@
 //! | RESOURCE_CLOSE | drops the session's subscription only; `ACK` | §43 |
 //! | CONTROL_PUT | the storage floor and quota as for puts, with the control reserve (revocation always gets through, [`crate::limits::WriteClass`]); [`crate::coordinator::Coordinator::put`]; `ACK` (type 23, the record ID, durable) after the commit | §47, §59 |
 //! | CONTROL_HAVE | read authority as for RESOURCE_OPEN; answered with every Control Head the server knows (a revoked reader: the record that revoked it) | §44, §41 |
-//! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range is `NACK(MALFORMED_MESSAGE)`. A revoked reader: the accepted records through the one that revoked it, the range cut there; a range after it is `NACK(AUTHORIZATION_FAILED)` | §45, §46, §41 |
+//! | CONTROL_GET | read authority; every stored record in the range, competing ones included, in as many CONTROL_BATCH replies as the size limit needs; a reversed range does not decode (sdk-rs, §45): the uncorrelated `ERROR(MALFORMED_MESSAGE)` of any undecodable message, the session goes on. A revoked reader: the accepted records through the one that revoked it, the range cut there; a range after it is `NACK(AUTHORIZATION_FAILED)` | §45, §46, §41 |
 //! | DATA_PUT / KEY_PACKAGE_PUT / SNAPSHOT_PUT | from any authenticated session: the object is authorized, not the uploader (relay, §84); every object validated by [`crate::ingest`] under the Resource lock (one failure refuses the put, nothing stored, one `NACK` without details); for DATA_PUT, equivocation (stored as evidence, `NACK(ACTOR_EQUIVOCATION)`), then each `previous` held, earlier in the put or covered by a stored Snapshot, else `NACK(UNKNOWN_PREVIOUS)` naming it (§51.1); then the storage floor ([`crate::limits::Floor`]) and the storage quota of the hosting Principal and of the Resource (`NACK(QUOTA_EXCEEDED)` with a diagnostic), then the ingest policy, then stored, then `ACK` (33/42/52, every object ID, durable) | §51, §54, §57, §60, §84 |
 //! | an equivocating Data Unit | only the equivocating units of the request are stored, as evidence; none is accepted or pushed; `NACK(ACTOR_EQUIVOCATION)` | §26.2, §51 |
 //! | DATA_HAVE | the client's Have must normalize; full read authority; answered with the server's | §48 |
@@ -895,6 +895,8 @@ impl LfcpSession {
         end: u64,
         out: &Outbound,
     ) -> Flow {
+        // The decoder already refuses a reversed range (sdk-rs, §45); kept in
+        // case a decoder ever lets one through.
         if end < start {
             return self.nack(out, request, WireCode::MalformedMessage).await;
         }

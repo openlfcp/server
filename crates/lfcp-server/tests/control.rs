@@ -811,7 +811,9 @@ async fn control_reads_need_read_authority_and_return_every_record() {
         ]
         .concat()
     );
-    // A reversed range is malformed.
+    // A reversed range is malformed (W §45). sdk-rs refuses to decode it
+    // (since 390ca1d), so the reply is the uncorrelated ERROR of an
+    // undecodable message (G-MSG5, above), and the session goes on.
     carol
         .request(Body::ControlGet {
             resource_id: v.resource(),
@@ -819,7 +821,11 @@ async fn control_reads_need_read_authority_and_return_every_record() {
             end: 5,
         })
         .await;
-    assert_eq!(code(&carol.recv().await), MALFORMED_MESSAGE);
+    let error = carol.recv().await;
+    assert!(matches!(error.body, Body::Error(_)));
+    assert_eq!(error.correlation_id, None);
+    assert_eq!(code(&error), MALFORMED_MESSAGE);
+    assert_eq!(heads(&v, &mut carol).await.len(), 2);
 
     // A Principal with no ability reads nothing.
     let stranger = PrincipalKeys::from_secrets(&[99; 32], [98; 32]);

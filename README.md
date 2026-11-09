@@ -788,7 +788,7 @@ warns when the `lfcp` crate has uncommitted changes. Move the lock
 deliberately when the server needs newer sdk-rs code. A git or tag
 dependency replaces this at a release milestone.
 
-`spec.lock` pins `openlfcp/spec` (`mvp-0.4-baseline.3`: `mvp-0.2-baseline.12`
+`spec.lock` pins `openlfcp/spec` (`mvp-0.4-baseline.5`: `mvp-0.2-baseline.12`
 plus multi-device root identity, ADR 0011: Device Principals and
 certificate chains, Control Record types `9` and `10`, Genesis field `5`,
 transfer commit field `2`, the same-root Key Package rule, the `identity-01`
@@ -800,7 +800,18 @@ and re-hosting (§39, §41.1; I12), revoked-reader replies (§41) and identity
 profile admission, and corrects the complete `READY_identity_01` vector
 (type 3, `LFCP-WIRE-01`). Baseline.3 clarifies the depth of identity
 profile admission rule AI2 and adds profile vectors for it; no published
-value changes, and no vector the server runs changes. Tests read vectors
+value changes, and no vector the server runs changes. Baseline.4 applies the
+final review of baseline.3 (reconciliation propagation, IDENTITY-PROFILE-01
+§7.1) and adds wire identity cases for server checks, among them the
+revoked reader's CONTROL_GET with an inverted range; 28 published values
+change, none in a reply the server makes. sdk-rs (since 390ca1d) refuses
+to decode a CONTROL_GET whose range is inverted, so the server answers it
+with the uncorrelated `ERROR(MALFORMED_MESSAGE)` of any undecodable message,
+and the session goes on. The two wire cases of a server without
+`identity-01` and the two presence cases of a server with `presence` are
+not run: this server always offers `identity-01` and never `presence`. Baseline.5 states the positions
+of identity admission rule AI3 and adds profile and pairing-link vectors;
+no published value changes, and no vector the server runs changes. Tests read vectors
 from `../spec` (or `$LFCP_SPEC_DIR`) with `git show` at the locked commit.
 
 ## Build from a clean checkout
